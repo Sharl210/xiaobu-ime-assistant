@@ -58,7 +58,14 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
         /** 剪贴板面板底部的计数控件与列表（搜索按钮挂在计数行最右侧）。 */
         private const val NAME_CLIP_COUNTER = "tv_clip_count"
-        private const val NAME_CLIP_LIST = "rvClipboard"
+
+        /**
+         * 剪贴板列表的资源名。注意是 **`rv_clipboard`**（资源表里的真实名字），
+         * 不是 dex 里那个 `rvClipboard` 字符串——后者是 Kotlin 惰性委托的**属性名**，
+         * 出现在 `f.n("rvClipboard")` 之类的空值检查里，用 `getIdentifier` 永远解析不出来。
+         * 1.8.0 之前把两者搞混，导致列表 id 恒为 0、整个搜索功能被跳过（按钮根本没建）。
+         */
+        private const val NAME_CLIP_LIST = "rv_clipboard"
 
         /** 搜索按钮上的两个字。 */
         private const val SEARCH_LABEL = "搜索"
@@ -163,12 +170,14 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 .onFailure { log("host-limits install failed: ${it.message}") }
 
             // 剪贴板面板：计数行最右侧加白底气泡「搜索」，点击按关键字过滤条目。
+            // 门槛只看计数控件：只要计数行在，按钮就一定能挂上去；
+            // 列表 id 只用于「重新加载」，取不到也不该让整个功能失效。
             val clipSearch = ClipSearch(
                 counterId = clipCounterId,
                 listId = clipListId,
                 label = SEARCH_LABEL,
             )
-            if (clipCounterId != 0 && clipListId != 0) {
+            if (clipCounterId != 0) {
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
                 runCatching { clipSearch.installRowFilter(bridge, hostClassLoader) }
@@ -180,6 +189,17 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                             (param.thisObject as? ViewGroup)?.let { clipSearch.attach(it) }
                         }
                     })
+                    // 构造函数里可能还没把子视图挂完；附加一次“上屏后”的挂载机会，
+                    // 保证计数行已经存在时按钮一定能插进去。
+                    XposedBridge.hookAllMethods(
+                        clipPanelClass,
+                        "onAttachedToWindow",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                (param.thisObject as? ViewGroup)?.let { clipSearch.attach(it) }
+                            }
+                        },
+                    )
                     log("clip-search: panel constructor hooked ${clipPanelClass.name}")
                 } else {
                     log("clip-search: clipboard panel class unresolved")

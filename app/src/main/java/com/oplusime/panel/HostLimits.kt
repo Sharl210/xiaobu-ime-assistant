@@ -1,5 +1,8 @@
 package com.oplusime.panel
 
+import android.view.View
+import android.view.ViewGroup
+import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
@@ -7,6 +10,8 @@ import org.luckypray.dexkit.query.FindMethod
 import org.luckypray.dexkit.query.enums.StringMatchType
 import org.luckypray.dexkit.result.MethodData
 import java.lang.reflect.Modifier
+import java.util.Collections
+import java.util.WeakHashMap
 
 /**
  * 解除宿主的几处“容量上限”，全部走 DexKit 结构/语义匹配，不写死任何混淆类名或方法名。
@@ -49,6 +54,12 @@ internal object HostLimits {
     /** 宿主用来表示这两张表容量上限的常量（换版本若改了数值，查询会自然落空并在日志里写明）。 */
     private const val RECORD_LIMIT = 500
 
+    /** 字数监听器里同时出现的两个字符串（计数控件名与超限告警色），用于结构命中。 */
+    private val CONTENT_WATCHER_STRINGS = listOf("contentNumber", "#DB382C")
+
+    /** 计数文本形状：`数字/`（例如 11/500、11/∞）。 */
+    private val COUNTER_PATTERN = Regex("""\d+\s*[/／]""")
+
     /** 事务 lambda 执行深度（按线程计数），只在这段区间内改写子 lambda 的数字返回。 */
     private val trimDepth = ThreadLocal<Int>()
 
@@ -56,6 +67,7 @@ internal object HostLimits {
         suppressRecordTrim(bridge, hostClassLoader)
         relieveContentLengthLimit(bridge, hostClassLoader)
         relieveContentLengthGuard(bridge, hostClassLoader)
+        neutralizeContentTruncation(bridge, hostClassLoader)
     }
 
     // ------------------------------------------------------------ 到顶裁剪
@@ -240,6 +252,133 @@ internal object HostLimits {
         }
         log("content-length-guard: candidates=${candidates.size} installed=$installed")
     }
+
+    // -------------------------------------------- 常用语正文的「变红 + 截断」
+
+    /**
+     * 常用语正文字数到达上限后「计数变红 + 文本被截断」的落点。
+     *
+     * 这是输入被吞掉的真正原因：上一个版本只解除了输入过滤器（输入被放行），
+     * 但字数的 TextWatcher 随后又做三件事：
+     *
+     * ```text
+     * contentNumber.setTextColor(Color.parseColor("#DB382C"))   <- 变红
+     * contentEditText.setText(s.subSequence(0, 500))            <- 截断
+     * contentEditText.setSelection(500)                         <- 光标钉在 500
+     * ```
+     *
+     * 结果是「输入能进来、又被立刻截回去」，用户看到的就是「变红后怎么打都不增长」。
+     *
+     * 命中方式纯结构：一个方法同时使用数字 500、同时使用字符串 `contentNumber` 与
+     * `#DB382C`，并且调用 `CharSequence.subSequence` 与 `TextView.setText`。
+     * 不写死任何类名、方法名、字段名。
+     *
+     * 处理方式：**只在本次文本确实超过上限时**拦下宿主这段逻辑（不再变红、不再截断），
+     * 并由模块自己把计数文本写成 `当前字数/∞`；未超限时原样交给宿主动作，
+     * 因此正常字数统计、颜色与其它校验全都不受影响。
+     */
+    private fun neutralizeContentTruncation(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = findMethods(bridge, "content-truncation") {
+            matcher {
+                usingNumbers(listOf(RECORD_LIMIT))
+                usingStrings(CONTENT_WATCHER_STRINGS, StringMatchType.Equals, false)
+                addInvoke("Ljava/lang/CharSequence;->subSequence(II)Ljava/lang/CharSequence;")
+                addInvoke("Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V")
+            }
+        }
+        if (candidates.isEmpty()) {
+            log("content-truncation: no truncating watcher matched; host limit stays")
+            return
+        }
+        var installed = 0
+        candidates.forEach { data ->
+            val method = runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val text = firstCharSequence(param.thisObject) ?: return
+                        if (text.length <= RECORD_LIMIT) return
+                        // 跳过宿主这一段：既不变红，也不截断、不移动光标。
+                        param.result = Unit
+                        refreshCounter(param.thisObject, text.length)
+                    }
+                })
+                installed++
+                log("content-truncation: hooked ${data.descriptor} -> truncation disabled")
+            }.onFailure { log("content-truncation: hook failed: ${it.message}") }
+        }
+        log(
+            "content-truncation: candidates=${candidates.size} installed=$installed " +
+                "limit=$RECORD_LIMIT"
+        )
+    }
+
+    /** 合成 lambda 把「本次文本」放在一个 `CharSequence` 字段里；按类型取，不按名字取。 */
+    private fun firstCharSequence(owner: Any?): CharSequence? {
+        val target = owner ?: return null
+        var current: Class<*>? = target.javaClass
+        while (current != null && current != Any::class.java) {
+            current.declaredFields.forEach { field ->
+                if (field.type == CharSequence::class.java) {
+                    val value = runCatching {
+                        field.isAccessible = true
+                        field.get(target) as? CharSequence
+                    }.getOrNull()
+                    if (value != null) return value
+                }
+            }
+            current = current.superclass
+        }
+        return null
+    }
+
+    /** 合成 lambda 上的宿主视图字段（宿主界面类本身是 View）。 */
+    private fun hostViewOf(owner: Any?): View? {
+        val target = owner ?: return null
+        var current: Class<*>? = target.javaClass
+        while (current != null && current != Any::class.java) {
+            current.declaredFields.forEach { field ->
+                if (View::class.java.isAssignableFrom(field.type)) {
+                    val value = runCatching {
+                        field.isAccessible = true
+                        field.get(target)
+                    }.getOrNull()
+                    if (value is View) return value
+                }
+            }
+            current = current.superclass
+        }
+        return null
+    }
+
+    /** 把计数文本写成「当前字数/∞」，字号与颜色沿用宿主当前值。 */
+    private fun refreshCounter(owner: Any?, length: Int) {
+        val host = hostViewOf(owner) ?: return
+        val counter = counterCache[host] ?: findCounter(host)?.also { counterCache[host] = it } ?: return
+        runCatching { counter.text = "$length/∞" }
+    }
+
+    /** 计数控件按「文本形状 `数字/`」识别，不依赖任何 id 或字段名。 */
+    private fun findCounter(host: View): TextView? {
+        val stack = ArrayDeque<View>()
+        stack.addLast(host)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 500) {
+            val view = stack.removeLast()
+            visited++
+            if (view is TextView && COUNTER_PATTERN.containsMatchIn(view.text?.toString().orEmpty())) {
+                return view
+            }
+            if (view is ViewGroup) {
+                for (i in 0 until view.childCount) stack.addLast(view.getChildAt(i))
+            }
+        }
+        return null
+    }
+
+    private val counterCache: MutableMap<View, TextView> =
+        Collections.synchronizedMap(WeakHashMap())
 
     private fun findMethods(
         bridge: DexKitBridge,

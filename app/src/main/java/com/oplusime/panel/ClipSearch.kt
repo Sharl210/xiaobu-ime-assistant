@@ -48,7 +48,10 @@ internal class ClipSearch(
 
     /** 面板每次排布后调用；按钮只在第一次创建。 */
     fun attach(panel: ViewGroup) {
-        val counter = panel.findViewById<View>(counterId) ?: return
+        val counter = panel.findViewById<View>(counterId) ?: run {
+            log("clip-search: counter 0x${Integer.toHexString(counterId)} not found in panel")
+            return
+        }
         val existing = panels[panel]
         if (existing != null && existing.parent === panel) {
             alignToCounter(existing, counter)
@@ -115,9 +118,14 @@ internal class ClipSearch(
         Reflect.writeInt(lp, "leftToLeft", UNSET)
         Reflect.writeInt(lp, "rightToRight", UNSET)
         if (lp is ViewGroup.MarginLayoutParams) {
+            // 必须显式给尺寸：约束布局的参数默认宽高可能是 0dp（MATCH_CONSTRAINT），
+            // 那样按钮会被算成 0 宽而完全看不见。
+            lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
+            lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
             lp.marginEnd = (8 * counter.resources.displayMetrics.density).toInt()
         }
         button.layoutParams = lp
+        button.requestLayout()
     }
 
     // -------------------------------------------------------------- 关键字输入
