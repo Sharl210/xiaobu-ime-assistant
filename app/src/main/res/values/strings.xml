@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">小布输入法助手</string>
+    <string name="xposed_desc">小布输入法助手：重排文本编辑面板、给剪贴板面板加搜索、解除剪贴板与常用语容量上限、并让剪切/粘贴按条件返回键盘。</string>
+    <string name="module_title">小布输入法助手</string>
+    <string name="module_body">本模块作用域：小布输入法（com.oplus.keyboard）。
+
+功能：
+1. 文本编辑面板重排：左列 全选／复制／粘贴，右列 删除／回车／剪贴板。
+2. 左列第一格为双态：无选中显示「全选」，有选中显示「剪切」。
+3. 剪贴板面板计数行右侧新增「搜索」按钮。
+4. 剪贴板与常用语的容量上限解除。
+5. 剪切／粘贴按条件返回键盘主界面。
+
+使用方式：在 LSPosed 中启用本模块，作用域勾选「小布输入法」，然后重启输入法进程（或重启手机）即可生效。</string>
+</resources>

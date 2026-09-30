@@ -1,0 +1,76 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.oplusime.panel'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.oplusime.panel'
+        minSdk 23
+        targetSdk 34
+        versionCode 9
+        versionName '1.7.0'
+    }
+
+    // 本模块自带的签名库（自建，与宿主无关）。如要换成自己的，替换下面四项即可。
+    signingConfigs {
+        selfbuilt {
+            storeFile rootProject.file('keystore/oplusime-panel.jks')
+            storePassword 'oplusime-panel'
+            keyAlias 'oplusime'
+            keyPassword 'oplusime-panel'
+            enableV1Signing true
+            enableV2Signing true
+            enableV3Signing true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            signingConfig signingConfigs.selfbuilt
+        }
+        release {
+            // 模块大量使用反射与 DexKit 原生库，关闭 R8 以免误裁剪。
+            minifyEnabled false
+            shrinkResources false
+            signingConfig signingConfigs.selfbuilt
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            // DexKit 的 libdexkit.so 直接由 APK 映射，不做 legacy 解压。
+            useLegacyPackaging false
+        }
+        resources {
+            excludes += ['/META-INF/{AL2.0,LGPL2.1}']
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // DexKit：宿主定位的唯一来源（结构特征 + 语义锚点）。
+    implementation 'org.luckypray:dexkit:2.2.0'
+
+    // Xposed API 仅编译期使用，绝不打进模块 APK。
+    compileOnly files('libs/api-82.jar')
+}

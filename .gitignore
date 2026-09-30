@@ -1,0 +1,10 @@
+# Gradle / IDE
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
