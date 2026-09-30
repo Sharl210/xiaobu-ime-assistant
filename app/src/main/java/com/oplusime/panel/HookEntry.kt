@@ -1,10 +1,12 @@
 package com.oplusime.panel
 
+import android.content.Context
 import android.content.res.AssetManager
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.util.DisplayMetrics
 import android.view.View
+import android.widget.EditText
 import android.view.ViewGroup
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
@@ -136,6 +138,11 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         )
 
         DexKitBridge.create(apkPath).use { bridge ->
+            // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
+            // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
+            runCatching { QuotePairSuppressor.attachHostImplementations(bridge, hostClassLoader) }
+                .onFailure { log("quote-pair host impl failed: ${it.message}") }
+
             val onClick = resolvePanelOnClick(bridge, ids)
             if (onClick == null) {
                 log("panel onclick unresolved, abort")
@@ -176,6 +183,20 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 counterId = clipCounterId,
                 listId = clipListId,
                 label = SEARCH_LABEL,
+                createInputField = resolveHostEditTextClass(bridge, hostClassLoader)?.let { cls ->
+                    { context: Context ->
+                        cls.constructors
+                            .firstOrNull {
+                                it.parameterTypes.size == 1 &&
+                                    it.parameterTypes[0] == Context::class.java
+                            }
+                            ?.let { ctor ->
+                                runCatching { ctor.newInstance(context) as EditText }.getOrNull()
+                            }
+                            ?: EditText(context)
+                    }
+                },
+                registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
             )
             if (clipCounterId != 0) {
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
@@ -247,6 +268,66 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 log("panel layout method hooked: ${layoutMethod.declaringClass.name}#${layoutMethod.name}")
             } else {
                 log("panel layout method not found; arrangement will only run once per panel")
+            }
+        }
+    }
+
+    /**
+     * 宿主自己的 EditText 类。
+     *
+     * 判据：谁产出 `InputConnection`，谁就是宿主接输入用的编辑框类型
+     * （它的 `onCreateInputConnection` 就是这条链的入口）。搜索弹窗用同款控件，
+     * 输入行为才与宿主自己的编辑界面一致。
+     */
+    private fun resolveHostEditTextClass(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+    ): Class<*>? {
+        val candidates = findMethods(bridge, "host-edit-text") {
+            matcher {
+                name("onCreateInputConnection")
+                paramTypes("android.view.inputmethod.EditorInfo")
+                returnType("android.view.inputmethod.InputConnection")
+            }
+        }
+        return candidates
+            .mapNotNull { runCatching { it.declaredClass?.getInstance(hostClassLoader) }.getOrNull() }
+            .distinct()
+            .firstOrNull { EditText::class.java.isAssignableFrom(it) }
+            ?.also { log("host-edit-text: selected ${it.name}") }
+    }
+
+    /**
+     * 宿主「把某个 EditText 设成当前输入目标」的方法：静态 + `(EditText, boolean)` + 返回 void。
+     *
+     * 宿主自己的编辑界面（常用语新增）就是靠它拿到 IME 内的键盘输入；搜索弹窗复用同一条链，
+     * 才能在输入法进程里真正输入文字。取不到时返回 null，搜索弹窗退回"只显示/可选择"的形态。
+     */
+    private fun resolveInputTargetRegistrar(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+    ): ((EditText) -> Boolean)? {
+        val candidates = findMethods(bridge, "input-target") {
+            matcher {
+                paramTypes("android.widget.EditText", "boolean")
+                returnType("void")
+            }
+        }
+        val method = candidates
+            .mapNotNull { runCatching { it.getMethodInstance(hostClassLoader) }.getOrNull() }
+            .firstOrNull { Modifier.isStatic(it.modifiers) }
+            ?: run {
+                log("input-target: unresolved; search field keeps host default behaviour")
+                return null
+            }
+        log("input-target: selected ${method.declaringClass.name}#${method.name}")
+        return { field ->
+            runCatching {
+                method.invoke(null, field, true)
+                true
+            }.getOrElse {
+                log("input-target: invoke failed: ${it.message}")
+                false
             }
         }
     }

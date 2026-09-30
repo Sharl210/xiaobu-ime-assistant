@@ -68,6 +68,76 @@ internal object HostLimits {
         relieveContentLengthLimit(bridge, hostClassLoader)
         relieveContentLengthGuard(bridge, hostClassLoader)
         neutralizeContentTruncation(bridge, hostClassLoader)
+        suppressRawSelectedLength(bridge, hostClassLoader)
+    }
+
+    // ------------------------------------------------ 保存前的 500 字清零（保存失败根因）
+
+    /**
+     * 常用语「添加失败」的根因（宿主侧事实）。
+     *
+     * `Kernel` 里有一个把输入内容收进内核上下文的方法，smali 原文：
+     *
+     * ```text
+     * Kernel.context.set(0, "")
+     * v = words
+     * if (words.length() > 500) v = ""          <- 超限就直接换成空串
+     * Kernel.context.set(1, v)
+     * ```
+     *
+     * 也就是说：正文一旦超过 500 字，**送进内核的内容会变成空字符串**，随后保存到数据库的自然
+     * 是空内容 → 界面上表现为「添加常用语失败」。这解释了为什么解掉前两处「显示/截断」之后，
+     * 输入不再被拦、也能过 500，但一点保存就失败。
+     *
+     * 处理方式：方法执行完后，若传入正文确实超限，就把内核上下文里的那一项**写回原始正文**。
+     * 只在超限时动手，正常长度一律不碰。
+     */
+    private fun suppressRawSelectedLength(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = findMethods(bridge, "raw-selected") {
+            matcher {
+                paramTypes("java.lang.String")
+                returnType("void")
+                usingNumbers(listOf(RECORD_LIMIT))
+                addInvoke("Ljava/util/List;->set(ILjava/lang/Object;)Ljava/lang/Object;")
+            }
+        }
+        var installed = 0
+        candidates.forEach { data ->
+            val method = runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            val owner = method.declaringClass
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val words = param.args.getOrNull(0) as? String ?: return
+                        if (words.length <= RECORD_LIMIT) return
+                        val list = contextListOf(owner) ?: return
+                        runCatching {
+                            @Suppress("UNCHECKED_CAST")
+                            (list as MutableList<Any>)[1] = words
+                            log("raw-selected: over-limit content restored (len=${words.length})")
+                        }.onFailure { log("raw-selected: restore failed: ${it.message}") }
+                    }
+                })
+                installed++
+                log("raw-selected: hooked ${method.declaringClass.name}#${method.name}")
+            }.onFailure { log("raw-selected: hook failed: ${it.message}") }
+        }
+        log("raw-selected: candidates=${candidates.size} installed=$installed")
+    }
+
+    /** 取类上那个承载内核上下文的静态 List 字段（宿主为 Kotlin object 的静态属性）。 */
+    private fun contextListOf(owner: Class<*>): List<*>? {
+        owner.declaredFields
+            .filter { Modifier.isStatic(it.modifiers) && List::class.java.isAssignableFrom(it.type) }
+            .forEach { field ->
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(null) as? List<*>
+                }.getOrNull()
+                if (value != null && value.size >= 2) return value
+            }
+        return null
     }
 
     // ------------------------------------------------------------ 到顶裁剪

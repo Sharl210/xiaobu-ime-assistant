@@ -7,6 +7,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
@@ -37,6 +38,10 @@ internal class ClipSearch(
     private val counterId: Int,
     private val listId: Int,
     private val label: String,
+    /** 创建宿主同款输入框（拿不到时退回普通输入框）。 */
+    private val createInputField: ((android.content.Context) -> EditText)? = null,
+    /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
+    private val registerInputTarget: ((EditText) -> Boolean)? = null,
 ) {
     @Volatile
     private var keyword: String? = null
@@ -55,19 +60,16 @@ internal class ClipSearch(
         val existing = panels[panel]
         if (existing != null && existing.parent === panel) {
             alignToCounter(existing, counter)
+            bindCounter(counter, existing)
+            applyActiveStyle(existing)
             return
         }
         val button = createButton(counter) ?: return
         panel.addView(button)
         alignToCounter(button, counter)
-        // 计数文本让出右端：改为锚在搜索按钮左侧
-        val counterLp = counter.layoutParams
-        if (counterLp != null) {
-            Reflect.writeInt(counterLp, "endToEnd", UNSET)
-            Reflect.writeInt(counterLp, "endToStart", button.id)
-            counter.layoutParams = counterLp
-        }
+        bindCounter(counter, button)
         panels[panel] = button
+        applyActiveStyle(button)
         log("clip-search: button attached id=0x${Integer.toHexString(button.id)}")
     }
 
@@ -81,25 +83,14 @@ internal class ClipSearch(
             (ctor?.newInstance(context) as? TextView)
         }.getOrNull() ?: runCatching { TextView(context) }.getOrNull() ?: return null
 
-        val density = context.resources.displayMetrics.density
         button.id = View.generateViewId()
         button.text = label
         button.gravity = Gravity.CENTER
         button.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        button.setTextColor(Color.parseColor("#E5000000"))
-        val padH = (10 * density).toInt()
-        val padV = (4 * density).toInt()
-        button.setPadding(padH, padV, padH, padV)
-        // 白底气泡：圆角矩形，纯白填充
-        val bubble = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            setColor(Color.WHITE)
-            cornerRadius = (10 * density)
-        }
-        button.background = bubble
         button.isClickable = true
         button.isFocusable = true
-        button.setOnClickListener { showInput(it) }
+        applyButtonStyle(button, active = false)
+        button.setOnClickListener { onButtonClicked(it) }
         val lp = template.layoutParams
         if (lp != null) {
             runCatching { button.layoutParams = lp.javaClass.getConstructor().newInstance() as ViewGroup.LayoutParams }
@@ -128,51 +119,152 @@ internal class ClipSearch(
         button.requestLayout()
     }
 
-    // -------------------------------------------------------------- 关键字输入
+    // -------------------------------------------------------------- 搜索开关与弹窗
 
+    /**
+     * 点一次：进入搜索（弹窗输入关键字）。
+     * 再点一次：退出搜索，恢复全部条目，按钮回到未激活样式。
+     */
+    private fun onButtonClicked(anchor: View) {
+        if (keyword != null) {
+            applyKeyword("")
+            applyActiveStyle(anchor)
+            log("clip-search: search cleared by second tap")
+            return
+        }
+        showInput(anchor)
+    }
+
+    /** 未激活＝白底气泡黑字；激活＝浅蓝气泡蓝字（可一眼看出正在过滤）。 */
+    private fun applyButtonStyle(button: TextView, active: Boolean) {
+        val density = button.resources.displayMetrics.density
+        val padH = (10 * density).toInt()
+        val padV = (4 * density).toInt()
+        button.setPadding(padH, padV, padH, padV)
+        button.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(if (active) ACTIVE_BG else Color.WHITE)
+            cornerRadius = 10 * density
+        }
+        button.setTextColor(if (active) ACTIVE_FG else INACTIVE_FG)
+    }
+
+    private fun applyActiveStyle(button: View) {
+        val text = button as? TextView ?: return
+        applyButtonStyle(text, active = keyword != null)
+    }
+
+    /**
+     * 计数行与按钮「左右护法」：计数留在左端（它自身的 start 锚在 parent 上），
+     * 搜索按钮贴右边缘，计数器的右端让给按钮。
+     *
+     * **每次排布都重写一次**：宿主的布局流程会自己重算计数控件的约束，只写一次会被覆盖回去，
+     * 表现为按钮位置乱跑。写入是幂等的（目标状态唯一），不会反复触发重排放大。
+     */
+    private fun bindCounter(counter: View, button: View) {
+        val lp = counter.layoutParams ?: return
+        runCatching {
+            var dirty = false
+            if (Reflect.readInt(lp, "endToEnd") != UNSET) {
+                Reflect.writeInt(lp, "endToEnd", UNSET)
+                dirty = true
+            }
+            if (Reflect.readInt(lp, "rightToRight") != UNSET) {
+                Reflect.writeInt(lp, "rightToRight", UNSET)
+                dirty = true
+            }
+            if (Reflect.readInt(lp, "endToStart") != button.id) {
+                Reflect.writeInt(lp, "endToStart", button.id)
+                dirty = true
+            }
+            if (dirty) counter.layoutParams = lp
+        }.onFailure { log("clip-search: bind counter failed: ${it.message}") }
+    }
+
+    /**
+     * 搜索弹窗：点按钮弹出 → 输入关键字 → 点「搜索」才开始过滤。
+     *
+     * 为什么不能只丢一个输入框就完事：输入法本身就是"输入源"，系统不会为输入法进程的窗口
+     * 弹出软键盘，所以"光标放上去键盘自己出来"在 IME 进程内走不通。这里的做法是——弹窗显示后
+     * 把输入框**注册成宿主自己的输入目标**（宿主自带一套 IME 内编辑框的输入链路，它自己的
+     * 常用语编辑界面用的就是这条链路），注册成功后键盘输入就会进入这个输入框。
+     * 注册失败时如实记日志，弹窗上的「取消 / 搜索」与后续过滤不受影响。
+     */
     private fun showInput(anchor: View) {
         runCatching {
             val context = anchor.context
             val density = context.resources.displayMetrics.density
-            val edit = EditText(context).apply {
-                hint = "输入关键字后回车"
-                setSingleLine()
+            val field = createInputField?.invoke(context) ?: EditText(context)
+            field.hint = "输入要搜索的关键字"
+            field.setSingleLine()
+            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            field.setText(keyword ?: "")
+            field.setPaddingRelative(
+                (12 * density).toInt(), (10 * density).toInt(),
+                (12 * density).toInt(), (10 * density).toInt(),
+            )
+            val confirm = TextView(context).apply {
+                text = "搜索"
+                gravity = Gravity.CENTER
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                setText(keyword ?: "")
-                setPaddingRelative(
-                    (12 * density).toInt(), (8 * density).toInt(),
-                    (12 * density).toInt(), (8 * density).toInt(),
+                setTextColor(ACTIVE_FG)
+                setPadding(
+                    (18 * density).toInt(), (10 * density).toInt(),
+                    (18 * density).toInt(), (10 * density).toInt(),
                 )
+                isClickable = true
+            }
+            val cancel = TextView(context).apply {
+                text = "取消"
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(INACTIVE_FG)
+                setPadding(
+                    (18 * density).toInt(), (10 * density).toInt(),
+                    (18 * density).toInt(), (10 * density).toInt(),
+                )
+                isClickable = true
+            }
+            val actions = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                addView(cancel)
+                addView(confirm)
+            }
+            val column = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(
+                    (14 * density).toInt(), (12 * density).toInt(),
+                    (14 * density).toInt(), (8 * density).toInt(),
+                )
+                addView(field)
+                addView(actions)
             }
             val popup = PopupWindow(
-                edit,
-                (anchor.width.coerceAtLeast((160 * density).toInt())),
-                (44 * density).toInt(),
+                column,
+                (260 * density).toInt(),
+                ViewGroup.LayoutParams.WRAP_CONTENT,
                 true,
             )
-            popup.inputMethodMode = PopupWindow.INPUT_METHOD_NEEDED
             popup.isOutsideTouchable = true
-            popup.setBackgroundDrawable(GradientDrawable().apply {
-                setColor(Color.WHITE)
-                cornerRadius = 10 * density
-            })
-            edit.setOnEditorActionListener { _, _, _ ->
-                applyKeyword(edit.text?.toString().orEmpty())
+            popup.setBackgroundDrawable(
+                GradientDrawable().apply {
+                    setColor(Color.WHITE)
+                    cornerRadius = 12 * density
+                },
+            )
+            confirm.setOnClickListener {
+                applyKeyword(field.text?.toString().orEmpty())
+                applyActiveStyle(anchor)
                 popup.dismiss()
-                true
             }
-            // 边输边过滤：关键字一变就重算，不必等回车。
-            edit.addTextChangedListener(object : android.text.TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
-                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
-                override fun afterTextChanged(s: android.text.Editable?) {
-                    applyKeyword(s?.toString().orEmpty())
-                }
-            })
-            popup.setOnDismissListener { applyKeyword(edit.text?.toString().orEmpty()) }
-            popup.showAsDropDown(anchor, 0, -(anchor.height + (48 * density).toInt()))
-            edit.requestFocus()
-        }.onFailure { log("clip-search: input popup failed: ${it.message}") }
+            cancel.setOnClickListener { popup.dismiss() }
+            popup.showAsDropDown(anchor, 0, -(anchor.height + (72 * density).toInt()))
+            field.requestFocus()
+            val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
+                .getOrDefault(false)
+            log("clip-search: dialog shown, host-input-registered=$registered")
+        }.onFailure { log("clip-search: input dialog failed: ${it.message}") }
     }
 
     private fun applyKeyword(raw: String) {
@@ -396,5 +488,12 @@ internal class ClipSearch(
 
         /** 行级过滤用来暂存「原始行高」的 tag key。 */
         val ROW_HEIGHT_TAG: Int = "oplusime_panel_row_height".hashCode()
+
+        /** 搜索未激活：白底黑字。 */
+        val INACTIVE_FG: Int = Color.parseColor("#E5000000")
+
+        /** 搜索激活：浅蓝气泡底 + 蓝字。 */
+        const val ACTIVE_BG: Int = 0x1A0A59F7
+        val ACTIVE_FG: Int = Color.parseColor("#0A59F7")
     }
 }

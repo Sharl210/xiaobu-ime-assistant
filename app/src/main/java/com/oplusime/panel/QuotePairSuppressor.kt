@@ -5,6 +5,7 @@ import android.os.Looper
 import android.view.inputmethod.InputConnection
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
+import org.luckypray.dexkit.DexKitBridge
 
 /**
  * 引号「成对补全」抑制。
@@ -82,12 +83,15 @@ internal object QuotePairSuppressor {
      * 在宿主进程内安装。输入法进程里承载编辑框调用的代理类可能不止一个名字，
      * 逐个尝试，命中即装；全部不可用时如实记日志（功能退化为原生行为，不会崩）。
      */
-    fun install(hostClassLoader: ClassLoader) {
+    fun install(hostClassLoader: ClassLoader, extraClasses: List<Class<*>> = emptyList()) {
         if (installed) return
         val candidates = listOf(
+            // 框架侧的代理实现：native 引擎与 Java 代码最终都经过它。
             "com.android.internal.view.IInputConnectionWrapper",
             "com.android.internal.view.InputConnectionWrapper",
             "android.view.inputmethod.InputConnectionWrapper",
+            // 框架基类：宿主自定义的 InputConnection 一般继承它。
+            "android.view.inputmethod.BaseInputConnection",
         )
         var hooked = 0
         candidates.forEach { name ->
@@ -98,6 +102,15 @@ internal object QuotePairSuppressor {
             }
             hooked += hookAll(cls)
         }
+        // 宿主自己实现的 InputConnection（由入口用 DexKit 查出后传进来），
+        // 逐一挂上——这类实现不会经过框架代理，必须单独覆盖。
+        extraClasses.forEach { cls ->
+            val added = hookAll(cls)
+            if (added > 0) {
+                hooked += added
+                log("quote-pair: host InputConnection hooked ${cls.name} points=$added")
+            }
+        }
         if (hooked == 0) {
             log("quote-pair: no InputConnection proxy hooked; quotes keep host behaviour")
         } else {
@@ -106,10 +119,57 @@ internal object QuotePairSuppressor {
         }
     }
 
+    /**
+     * 把「宿主自己实现的 InputConnection」也挂上。
+     *
+     * 宿主用 `onCreateInputConnection` 返回它自己的实现类（不是框架的包装类），
+     * 这类实现完全绕过框架代理，前面那批候选类一个都覆盖不到——这正是上一版"hook 装上了
+     * 但引号照样成对"的最可能原因。这里按方法返回值把实现类找出来，逐一挂载：
+     * 只要宿主的输入连接还是由 `onCreateInputConnection` 产出的，这条链就能被重新找到。
+     */
+    fun attachHostImplementations(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val methods = runCatching {
+            bridge.findMethod {
+                matcher {
+                    name("onCreateInputConnection")
+                    paramTypes("android.view.inputmethod.EditorInfo")
+                }
+            }.toList()
+        }.onFailure { log("quote-pair: host IC query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+
+        val names = methods.mapNotNull { it.returnTypeName }.distinct()
+        var hooked = 0
+        names.forEach { name ->
+            if (name.isEmpty() || name == "android.view.inputmethod.InputConnection") return@forEach
+            val cls = runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            if (cls.isInterface) return@forEach
+            val added = hookAll(cls)
+            if (added > 0) {
+                hooked += added
+                log("quote-pair: host IC hooked ${cls.name} points=$added")
+            }
+        }
+        log("quote-pair: host IC classes=${names.size} hooks=$hooked")
+    }
+
     private fun hookAll(cls: Class<*>): Int {
         var count = 0
         count += runCatching {
             XposedBridge.hookAllMethods(cls, "commitText", object : XC_MethodHook() {
+                /**
+                 * 形态一：宿主/native **一次性提交成对的两个字符**（`“”`）。
+                 * 这不需要事后删除，直接在参数上把右半边去掉，交给宿主自己的流程提交单个引号——
+                 * 比"提交完再删"少一次编辑往返，也不会让光标先跳到中间再跳回来。
+                 */
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    val single = unwrapPair(text) ?: return
+                    param.args[0] = single
+                    log("quote-pair: pair commit trimmed to single '" + describe(single[0]) + "'")
+                }
+
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
                     if (!mentionsQuote(text)) return
@@ -129,6 +189,20 @@ internal object QuotePairSuppressor {
         }.onFailure { log("quote-pair: setSelection hook failed on ${cls.name}: ${it.message}") }
             .getOrDefault(0)
         return count
+    }
+
+    /**
+     * 若整段提交内容正好是「一个可配对的左符号 + 它的右符号」（允许前后带空白），
+     * 返回只含左符号的内容；否则返回 null。
+     *
+     * 这是宿主"成对补全"最常见的形态：一次 commitText 把两个字符一起送上屏，
+     * 再 setSelection 到中间。在参数上直接砍掉右半边即可，不需要任何事后删除。
+     */
+    private fun unwrapPair(text: CharSequence): CharSequence? {
+        if (text.length != 2) return null
+        val right = PAIRS[text[0]] ?: return null
+        if (text[1] != right) return null
+        return text.subSequence(0, 1)
     }
 
     /** 本次提交的文本是否涉及引号（含"一次提交成对"与"提交单个左引号"两种形态）。 */
