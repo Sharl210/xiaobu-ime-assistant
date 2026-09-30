@@ -153,6 +153,14 @@ internal class ClipSearch(
                 popup.dismiss()
                 true
             }
+            // 边输边过滤：关键字一变就重算，不必等回车。
+            edit.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    applyKeyword(s?.toString().orEmpty())
+                }
+            })
             popup.setOnDismissListener { applyKeyword(edit.text?.toString().orEmpty()) }
             popup.showAsDropDown(anchor, 0, -(anchor.height + (48 * density).toInt()))
             edit.requestFocus()
@@ -161,21 +169,39 @@ internal class ClipSearch(
 
     private fun applyKeyword(raw: String) {
         val next = raw.trim().ifEmpty { null }
+        if (next == keyword) return
         keyword = next
         log("clip-search: keyword=${next ?: "<cleared>"}")
         reloadLists()
     }
 
+    /**
+     * 让列表按新关键字重新走一遍：
+     *  1. `refresh()` 让分页层重新取数（关键字变化后分页过滤才会重新生效）；
+     *  2. 再触发一次重新绑定，让行级过滤对当前已加载的行重算。
+     * PagingDataAdapter 禁用了 `notifyDataSetChanged`，只能用 `notifyItemRangeChanged`。
+     */
     private fun reloadLists() {
         synchronized(panels) {
             panels.keys.forEach { panel ->
                 val recycler = runCatching { panel.findViewById<ViewGroup>(listId) }.getOrNull()
                     ?: return@forEach
+                val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
+                    ?: return@forEach
                 runCatching {
-                    val adapter = Reflect.readObject(recycler, "mAdapter")
-                    adapter?.javaClass?.getMethod("refresh")?.invoke(adapter)
+                    adapter.javaClass.getMethod("refresh").invoke(adapter)
                     log("clip-search: adapter refreshed")
                 }.onFailure { log("clip-search: refresh failed: ${it.message}") }
+                runCatching {
+                    val count = adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int ?: 0
+                    adapter.javaClass
+                        .getMethod(
+                            "notifyItemRangeChanged",
+                            Int::class.javaPrimitiveType,
+                            Int::class.javaPrimitiveType,
+                        )
+                        .invoke(adapter, 0, count)
+                }.onFailure { log("clip-search: rebind failed: ${it.message}") }
             }
         }
     }
@@ -218,6 +244,78 @@ internal class ClipSearch(
         log("clip-search: convert candidates=${candidates.size} filterHooks=$installed")
     }
 
+    // ------------------------------------------------------ 行级过滤（兜底保证）
+
+    /**
+     * 行级过滤：直接挂在列表适配器的 `onBindViewHolder` 上。
+     *
+     * 分页源那一层（[installPagingFilter]）是「真过滤」，但依赖宿主分页实现的具体形态；
+     * 这一层不关心数据从哪来——绑定时拿到条目，不命中就把这一行收成 0 高度并隐藏，
+     * 命中则还原原始高度。两层叠加：分页层生效时这里基本无事可做，分页层没接上时这里保证搜得动。
+     *
+     * 适配器用继承链判定（链上出现 paging 包名即认为成立），条目的取用通过反射调用其
+     * `getItem(int)`，因此不写死任何宿主混淆名。
+     */
+    fun installRowFilter(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = findMethods(bridge, "paging-adapter") {
+            matcher {
+                name("onBindViewHolder")
+                paramTypes("androidx.recyclerview.widget.RecyclerView\$ViewHolder", "int")
+            }
+        }
+        var installed = 0
+        candidates.forEach { bind ->
+            val owner = runCatching { bind.declaredClass?.getInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            if (!isPagingSource(owner)) return@forEach
+            val method = runCatching { bind.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val holder = param.args.getOrNull(0) ?: return
+                        val position = param.args.getOrNull(1) as? Int ?: return
+                        val view = runCatching {
+                            holder.javaClass.getMethod("getItemView").invoke(holder) as? View
+                        }.getOrNull() ?: return
+                        val item = runCatching {
+                            param.thisObject.javaClass
+                                .getMethod("getItem", Int::class.javaPrimitiveType)
+                                .invoke(param.thisObject, position)
+                        }.getOrNull()
+                        val current = keyword
+                        applyRowVisibility(view, current == null || matches(item, current))
+                    }
+                })
+                installed++
+                log("clip-search: row filter hooked ${bind.declaredClassName}")
+            }.onFailure { log("clip-search: row hook failed: ${it.message}") }
+        }
+        log("clip-search: adapter candidates=${candidates.size} rowHooks=$installed")
+    }
+
+    /**
+     * 命中 → 还原原始高度；未命中 → 收成 0 高度并隐藏。
+     * 原始高度记在 itemView 的 tag 上，避免行被回收复用后还原失真。
+     */
+    private fun applyRowVisibility(view: View, visible: Boolean) {
+        val lp = view.layoutParams ?: return
+        if (visible) {
+            val saved = view.getTag(ROW_HEIGHT_TAG) as? Int ?: return
+            view.setTag(ROW_HEIGHT_TAG, null)
+            lp.height = saved
+            view.layoutParams = lp
+            if (view.visibility != View.VISIBLE) view.visibility = View.VISIBLE
+        } else {
+            if (view.getTag(ROW_HEIGHT_TAG) == null) view.setTag(ROW_HEIGHT_TAG, lp.height)
+            if (lp.height != 0) {
+                lp.height = 0
+                view.layoutParams = lp
+            }
+            if (view.visibility != View.GONE) view.visibility = View.GONE
+        }
+    }
+
     /** 继承链上出现分页包名即为分页源；只做判定，不改任何行为。 */
     private fun isPagingSource(cls: Class<*>): Boolean {
         var current: Class<*>? = cls
@@ -230,7 +328,7 @@ internal class ClipSearch(
         return false
     }
 
-    /** 条目的任一字符串字段包含关键字即命中（不依赖任何混淆字段名）。 */
+    /** 条目的任一字符串字段 / 字符串 getter 包含关键字即命中（不依赖任何混淆字段名）。 */
     private fun matches(item: Any?, kw: String): Boolean {
         if (item == null) return false
         var current: Class<*>? = item.javaClass
@@ -240,6 +338,17 @@ internal class ClipSearch(
                     val value = runCatching {
                         field.isAccessible = true
                         field.get(item) as? String
+                    }.getOrNull()
+                    if (value != null && value.contains(kw, ignoreCase = true)) return true
+                }
+            }
+            // 条目大多是 Kotlin data class，正文可能只暴露成 getter（getContent / getLabel 等），
+            // 因此无参 String getter 一并纳入判定。
+            current.declaredMethods.forEach { method ->
+                if (method.parameterCount == 0 && method.returnType == String::class.java) {
+                    val value = runCatching {
+                        method.isAccessible = true
+                        method.invoke(item) as? String
                     }.getOrNull()
                     if (value != null && value.contains(kw, ignoreCase = true)) return true
                 }
@@ -276,5 +385,8 @@ internal class ClipSearch(
 
         /** Room 分页包装查询的固定前缀（库层字符串，非宿主混淆名）。 */
         const val PAGING_WRAPPER_SQL = "SELECT * FROM ("
+
+        /** 行级过滤用来暂存「原始行高」的 tag key。 */
+        val ROW_HEIGHT_TAG: Int = "oplusime_panel_row_height".hashCode()
     }
 }

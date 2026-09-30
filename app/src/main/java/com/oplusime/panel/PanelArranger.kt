@@ -133,6 +133,8 @@ internal class PanelArranger(
         var lastSelecting: Boolean? = null
         var watcher: ViewTreeObserver.OnPreDrawListener? = null
         var watcherOwner: ViewTreeObserver? = null
+        /** 每个格子「宿主写进来的原始宽度」。放大以它为基准，保证缩放幂等、不累乘。 */
+        val baseWidths: MutableMap<View, Int> = HashMap()
     }
 
     private class Box(val name: String, val left: Int, val top: Int, val right: Int, val bottom: Int) {
@@ -142,10 +144,26 @@ internal class PanelArranger(
 
     private val states: MutableMap<View, State> = Collections.synchronizedMap(WeakHashMap())
 
+    /**
+     * 重入保护。
+     *
+     * 本模块改写 `layoutParams` 会再次触发宿主那条被钩住的 `setLayoutParams`，从而再次回调本对象。
+     * 没有这层守卫时，`scaleCellWidths` 会在每一轮里再乘一次 1.2（1.2 的 n 次方），
+     * 按钮最终被撑到互相重叠——这正是「粘贴与剪贴板贴在一起」的直接成因。
+     */
+    private val applying: MutableSet<View> =
+        Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<View, Boolean>()))
+
     fun apply(panel: View) {
         if (panel !is ViewGroup) return
-        runCatching { applyInternal(panel) }
-            .onFailure { log("arrange failed: ${it.stackTraceToString()}") }
+        if (applying.contains(panel)) return
+        applying.add(panel)
+        try {
+            runCatching { applyInternal(panel) }
+                .onFailure { log("arrange failed: ${it.stackTraceToString()}") }
+        } finally {
+            applying.remove(panel)
+        }
     }
 
     private fun applyInternal(panel: ViewGroup) {
@@ -198,10 +216,22 @@ internal class PanelArranger(
         targets.forEach { view ->
             val lp = view.layoutParams ?: return@forEach
             if (lp.width <= 0) return@forEach
-            lp.width = (lp.width * WIDTH_SCALE).toInt()
+            val previousBase = state.baseWidths[view]
+            val base = when {
+                previousBase == null -> lp.width
+                // 宿主重算过基准宽度（旋转 / 单手 / 悬浮形态），以新值重新取基准
+                lp.width != previousBase && lp.width != scaled(previousBase) -> lp.width
+                else -> previousBase
+            }
+            state.baseWidths[view] = base
+            val target = scaled(base)
+            if (lp.width == target) return@forEach
+            lp.width = target
             view.layoutParams = lp
         }
     }
+
+    private fun scaled(width: Int): Int = (width * WIDTH_SCALE).toInt()
 
     // ---------------------------------------------------------------- 置换
 

@@ -4,6 +4,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.query.FindMethod
+import org.luckypray.dexkit.query.enums.StringMatchType
 import org.luckypray.dexkit.result.MethodData
 import java.lang.reflect.Modifier
 
@@ -54,6 +55,7 @@ internal object HostLimits {
     fun install(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         suppressRecordTrim(bridge, hostClassLoader)
         relieveContentLengthLimit(bridge, hostClassLoader)
+        relieveContentLengthGuard(bridge, hostClassLoader)
     }
 
     // ------------------------------------------------------------ 到顶裁剪
@@ -175,8 +177,12 @@ internal object HostLimits {
                         if (start < 0 || end > source.length || start > end) return
                         // 与宿主同式复算：仅当“剩余可输入字数已不足”时放行本次输入。
                         val destLength = dest?.length ?: 0
+                        val addLength = end - start
                         val remaining = RECORD_LIMIT - (destLength - (destEnd - destStart))
-                        if (remaining <= 0) {
+                        // 只要「按宿主算式本次输入装不下」就整段放行，宿主此后不再截断。
+                        // 对照：搜索框那条更小的上限用 500 复算时永远装得下（搜索框自身被 100 卡住，
+                        // 到不了 500），所以本分支只会命中常用语正文这条 500 上限。
+                        if (remaining < addLength) {
                             param.result = source.subSequence(start, end)
                             log("content-length-filter: over-limit input allowed (limit=$RECORD_LIMIT)")
                         }
@@ -189,6 +195,50 @@ internal object HostLimits {
             "content-length-filter: candidates=${candidates.size} installed=$installed " +
                 "limit=$RECORD_LIMIT"
         )
+    }
+
+    // ------------------------------------------------------ 正文长度预检
+
+    /**
+     * 常用语正文的「提交前长度预检」。
+     *
+     * 宿主除输入过滤器外，还有一个静态无参 boolean 预检：内部同时读「搜索框 100 字」与
+     * 「常用语正文 500 字」两条上限，超限时弹提示并返回 true。它比过滤器更早拦住下一次输入，
+     * 因此必须一并解除。
+     *
+     * 形状锚点（不写死混淆名）：静态 + 无参 + 返回 boolean + 使用字面量 500 +
+     * 使用语义串 `contentEditText`（宿主自己的 Kotlin 空值检查文案，始终保留）。
+     * 命中后直接令其返回 false（= 未超限）。
+     */
+    private fun relieveContentLengthGuard(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = findMethods(bridge, "content-length-guard") {
+            matcher {
+                returnType("boolean")
+                paramCount(0)
+                usingNumbers(listOf(RECORD_LIMIT))
+                usingStrings(listOf("contentEditText"), StringMatchType.Equals, false)
+            }
+        }
+        if (candidates.isEmpty()) {
+            log("content-length-guard: no pre-check matched; host pre-check stays")
+            return
+        }
+        var installed = 0
+        candidates.forEach { data ->
+            val method = runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            if (!Modifier.isStatic(method.modifiers)) return@forEach
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = false
+                    }
+                })
+                installed++
+                log("content-length-guard: hooked ${data.descriptor} -> always false")
+            }.onFailure { log("content-length-guard: hook failed: ${it.message}") }
+        }
+        log("content-length-guard: candidates=${candidates.size} installed=$installed")
     }
 
     private fun findMethods(

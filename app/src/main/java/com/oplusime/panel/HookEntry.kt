@@ -171,6 +171,8 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             if (clipCounterId != 0 && clipListId != 0) {
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
+                runCatching { clipSearch.installRowFilter(bridge, hostClassLoader) }
+                    .onFailure { log("clip-search row install failed: ${it.message}") }
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)
                 if (clipPanelClass != null) {
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {
