@@ -137,30 +137,25 @@ internal class ClipSearch(
      * （[ensureSnapshot] 在缓存未就绪时也不会强行现算），所以不会出现"空白一帧"。
      */
     private fun prebuildSnapshotAsync(adapter: Any) {
-        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
-        runCatching {
-            worker.execute {
-                runCatching { buildSnapshot(adapter) }
-                    .onFailure { log("paging-data: prebuild failed: ${it.message}") }
-                // 快照算好后**必须再通知列表一次**：此前那次通知发生在快照就绪之前，
-                // 列表问到的还是原始条目数。少了这一步，用户会看到"搜了但列表没变"。
-                val pageOfAdapter = runCatching {
-                    synchronized(dataAdaptersLock) { dataAdapterPages[adapter] }
-                }.getOrNull()
-                if (pageOfAdapter != null) {
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        runCatching { notifyRebind(adapter, pageOfAdapter, "snapshot-ready") }
-                            .onFailure { log("paging-data: post-prebuild notify failed: ${it.message}") }
-                    }
-                }
-            }
-        }.onFailure { log("paging-data: prebuild schedule failed: ${it.message}") }
-        worker.shutdown()
+        // 统一走"去重排队"的那条路（见 [scheduleSnapshotBuild]）：常驻线程池 + 只排一次。
+        scheduleSnapshotBuild(adapter)
     }
 
     /** 上一次锚点校验的结果，只在变化时打日志（避免每帧刷屏）。 */
     @Volatile
     private var lastAnchorReported: Boolean? = null
+
+    /**
+     * 快照构建线程（**常驻**，全模块一个）。
+     *
+     * 用常驻单线程而不是"每次新建再关掉"：后者会让提交进去的任务被直接丢弃
+     * （见 [prebuildSnapshotAsync] 的说明），是 1.30.0 搜索完全无效的直接原因。
+     * 单线程也顺带串行化了快照构建，避免多个适配器同时遍历条目抢 CPU。
+     */
+    private val snapshotWorker: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "oplusime-panel-snapshot").apply { isDaemon = true }
+        }
 
     /** 面板 → 我们新建的搜索按钮。 */
     private val buttons: MutableMap<ViewGroup, View> =
@@ -548,17 +543,40 @@ internal class ClipSearch(
         }.onFailure { log("clip-search: search bar failed: ${it.message}") }
     }
 
-    /** 输入条上的小按钮（与搜索按钮同一套气泡样式）。 */
-    private fun buildBarButton(context: android.content.Context, label: String, onClick: () -> Unit): TextView {
+    /**
+     * 输入条上的小按钮（与搜索按钮同一套气泡样式）。
+     *
+     * ## 间距（用户截图反馈"取消 / 搜索 两个按钮贴在一起、像叠住了"）
+     *
+     * 1.30.0 之前按钮是**紧挨着**加的：每个按钮的左右内边距各 12dp，而两个气泡之间
+     * 一点外边距都没有，圆角又都是 10dp —— 视觉上两个气泡直接连成一块、边界糊在一起。
+     *
+     * 现在给每个按钮左右各留 8dp 外边距，并把圆角收到 18dp（更接近胶囊形，边界清楚），
+     * 输入框与按钮之间也因此自然隔开。间距按密度换算，不写死像素。
+     */
+    private fun buildBarButton(
+        context: android.content.Context,
+        label: String,
+        onClick: () -> Unit,
+    ): TextView {
         val density = context.resources.displayMetrics.density
         val button = TextView(context)
         button.text = label
-        button.setPadding((12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt(), (8 * density).toInt())
+        button.setPadding((14 * density).toInt(), (8 * density).toInt(), (14 * density).toInt(), (8 * density).toInt())
         button.setTextColor(ACTIVE_FG)
+        button.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        button.gravity = Gravity.CENTER
         button.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             setColor(0x1A0A59F7)
-            cornerRadius = 10 * density
+            cornerRadius = 18 * density
+        }
+        // 气泡之间留出明确空隙，避免两个按钮看起来"粘在一起"。
+        button.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            marginStart = (8 * density).toInt()
         }
         button.isClickable = true
         // 触摸留证：1.22/1.23 的日志里从未出现过"确认"这一步，无法判断是"按钮没被点到"
@@ -1322,12 +1340,65 @@ internal class ClipSearch(
         val kw = dataKeywordFor(adapter) ?: return null
         synchronized(dataAdaptersLock) {
             val cached = dataSnapshots[adapter]
-            // 只认已经算好的快照：关键字/版本一变就在后台重建（见 prebuildSnapshotAsync），
-            // 这里**绝不现算** —— 本方法处于列表布局路径上，现算会直接把那一帧拖住。
-            if (cached == null || cached.version != dataVersion || cached.keyword != kw) return null
-            return cached
+            // 只认已经算好的快照：这里**绝不现算** —— 本方法处于列表布局路径上，
+            // 现算会直接把那一帧拖住（一次遍历全部条目 + 递归取正文）。
+            if (cached != null && cached.version == dataVersion && cached.keyword == kw) return cached
         }
+        // 缓存没就绪（关键字刚变、或这个适配器刚登记）→ 补一次后台构建并放行原行为。
+        //
+        // 这是 1.30.0 "搜索没有任何效果"的第二个结构性原因：预构建只在**关键字变化**时触发，
+        // 而那个时刻适配器往往**还没登记**（登记发生在随后的一次列表通知里），于是快照永远
+        // 算不出来、列表也永远问不到过滤结果。现在改成"谁在问、谁兜底"：只要有人来问而缓存
+        // 未就绪，就把构建排进后台队列（去重，不重复排队）。下一次列表来问时快照已就绪。
+        scheduleSnapshotBuild(adapter)
+        return null
     }
+
+    /** 把快照构建排进后台队列；同一适配器只排一次，避免每次询问都重复入队。 */
+    private fun scheduleSnapshotBuild(adapter: Any) {
+        val first = synchronized(snapshotInFlight) { snapshotInFlight.add(adapter) }
+        if (!first) return
+        runCatching {
+            snapshotWorker.execute {
+                try {
+                    runCatching { buildSnapshot(adapter) }
+                        .onFailure { log("paging-data: build failed: ${it.message}") }
+                    // 兜底：如果这次构建没能产出快照（取不到原始条目数、或关键字为空），
+                    // 就放一个"放弃改写"的标记进缓存。否则下一次列表来问又会排队、
+                    // 又失败，形成"无限重建"——那会持续占着后台线程，反过来又变成卡顿。
+                    val kw = dataKeywordFor(adapter)
+                    if (kw != null) {
+                        synchronized(dataAdaptersLock) {
+                            if (dataSnapshots[adapter] == null) {
+                                dataSnapshots[adapter] =
+                                    DataSnapshot(dataVersion, kw, 0, emptyList(), degraded = true)
+                            }
+                        }
+                    }
+                    val pageOfAdapter = runCatching {
+                        synchronized(dataAdaptersLock) { dataAdapterPages[adapter] }
+                    }.getOrNull()
+                    if (pageOfAdapter != null) {
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                            runCatching { notifyRebind(adapter, pageOfAdapter, "snapshot-ready") }
+                                .onFailure { log("paging-data: post-build notify failed: ${it.message}") }
+                        }
+                    }
+                } finally {
+                    snapshotInFlight.remove(adapter)
+                }
+            }
+        }.onFailure { log("paging-data: snapshot schedule failed: ${it.message}") }
+    }
+
+    /**
+     * 同一适配器"正在构建快照"的标记。
+     *
+     * 用 IdentityHashMap 支撑的集合：这里比较的必须是**同一个实例**（适配器身份），
+     * 而不是 equals 语义 —— 否则两个不同的列表可能被误当成同一个而漏掉构建。
+     */
+    private val snapshotInFlight: MutableSet<Any> =
+        java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
 
     /** 真正遍历条目、构造过滤快照（只在后台线程调用）。 */
     private fun buildSnapshot(adapter: Any): DataSnapshot? {
