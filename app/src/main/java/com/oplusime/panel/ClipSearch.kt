@@ -6,11 +6,13 @@ import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -75,6 +77,10 @@ internal class ClipSearch(
     private val createInputField: ((android.content.Context) -> EditText)? = null,
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
+    /** 宿主自己的「收起面板回键盘」链（与 HostTweaks 用的是同一条）。 */
+    private val closePanel: (() -> Boolean)? = null,
+    /** 按 BoxEnums 常量名重新打开面板（搜索结果要看得到，就必须回到面板）。 */
+    private val openPanel: ((String) -> Boolean)? = null,
 ) {
     private enum class Page { CLIPBOARD, PHRASE }
 
@@ -320,6 +326,14 @@ internal class ClipSearch(
         runCatching {
             val context = anchor.context
             val density = context.resources.displayMetrics.density
+            val page = currentPage
+            // 先收起面板：`res/IB.xml` 的根布局是 match_parent，剪贴板/常用语面板**占满整个
+            // 键盘区域**（面板里只有标题栏 + 列表 + 底栏，没有任何按键）。面板开着的时候屏幕上一个
+            // 键都没有 —— 所以"键盘弹不出来"的直接原因不是弹窗的窗口标志，而是面板把键盘的位置占了。
+            // 收起面板走宿主自己的返回键链路（与 HostTweaks 关闭面板用的是同一条），键盘立刻回来，
+            // 弹窗里的输入框才有键可按。搜索结果仍然正常：确认后重新打开面板即见到过滤后的列表。
+            val closed = runCatching { closePanel?.invoke() }.getOrNull()
+            log("clip-search: panel closed before input=$closed page=$page")
             val builderClass = Class.forName("com.coui.appcompat.dialog.COUIAlertDialogBuilder", false, context.classLoader)
             val builder = builderClass.getConstructor(android.content.Context::class.java).newInstance(context)
             val field = createInputField?.invoke(context) ?: EditText(context)
@@ -327,6 +341,13 @@ internal class ClipSearch(
             field.isFocusableInTouchMode = true
             field.setShowSoftInputOnFocus(true)
             field.setSingleLine(true)
+            // 与宿主自己的搜索框 `input.view.head.h0`（SearchView / emoji 搜索）逐字一致的三件事：
+            //   setImeOptions(3)                    → IME_ACTION_SEARCH
+            //   setOnEditorActionListener(...)      → 回车=发起搜索（这里由内部焦点链处理）
+            //   input/manager/h;->l(editText,true)  → 注册成输入法内部输入目标（见构造参数）
+            // 前两件决定"看起来像搜索框"，第三件才是"键盘上的按键进到这个输入框"的开关。
+            field.imeOptions = EditorInfo.IME_ACTION_SEARCH
+            field.inputType = InputType.TYPE_CLASS_TEXT
             field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             field.setText(currentKeyword() ?: "")
             field.setSelectAllOnFocus(false)
@@ -349,6 +370,8 @@ internal class ClipSearch(
                 if (method.name == "onClick") {
                     applyKeyword(field.text?.toString().orEmpty())
                     dialogBox[0]?.dismiss()
+                    // 结果要看得见：过滤已生效，把面板重新打开就是过滤后的列表。
+                    reopenPanel(page)
                 }
                 null
             } as DialogInterface.OnClickListener
@@ -356,7 +379,11 @@ internal class ClipSearch(
                 listenerType.classLoader,
                 arrayOf(listenerType),
             ) { _, method, _ ->
-                if (method.name == "onClick") dialogBox[0]?.dismiss()
+                if (method.name == "onClick") {
+                    dialogBox[0]?.dismiss()
+                    // 取消也要回到面板，不能把用户丢在空键盘上。
+                    reopenPanel(page)
+                }
                 null
             } as DialogInterface.OnClickListener
 
@@ -377,23 +404,43 @@ internal class ClipSearch(
                 // 文字改由宿主的内部焦点切换送进输入框（见 registerInputTarget）。
                 attrs.type = 0x3eb
                 window.attributes = attrs
-                window.addFlags(0x20002)
+                // 与宿主「添加常用语」弹窗（body/D;->q）唯一的差别：**不要 0x20000**。
+                // 0x20000 = FLAG_ALT_FOCUSABLE_IM，含义是"这个窗口不要让输入法弹出来"。
+                // 宿主那个弹窗里没有输入框，所以它加上没问题；我们这个弹窗是要打字的，
+                // 带上这个标志系统就会把输入法窗口收下去 —— 实测表现就是"只有一个光标，键盘不出来"。
+                // 因此这里只保留 FLAG_DIM_BEHIND（0x2），并显式清掉 0x20000。
+                window.clearFlags(0x20000)
+                window.addFlags(0x2)
                 window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
                 window.setDimAmount(0.3f)
             }
             dialog.show()
+            // show() 之后窗口标志才是最终值，这里再清一次并留证。
+            runCatching { dialog.window?.clearFlags(0x20000) }
             runCatching { builderClass.getMethod("updateViewAfterShown").invoke(builder) }
             field.requestFocus()
             field.setSelection(field.text?.length ?: 0)
             val registered = registerInputTarget?.invoke(field) == true
+            // 宿主自己的流程（比如面板重建）可能把内部输入目标换回它自己的编辑框，
+            // 所以稍后再确认一次；成功与否都如实写日志，不靠"应该没问题"。
             field.postDelayed({
-                runCatching {
-                    val imm = context.getSystemService(InputMethodManager::class.java)
-                    imm?.showSoftInput(field, InputMethodManager.SHOW_IMPLICIT)
-                }
-            }, 120L)
-            log("clip-search: host dialog shown, input-registered=$registered windowType=${window?.attributes?.type}")
+                val again = runCatching { registerInputTarget?.invoke(field) == true }.getOrDefault(false)
+                log("clip-search: input target re-register=$again")
+            }, 250L)
+            log(
+                "clip-search: host dialog shown, input-registered=$registered" +
+                    " windowType=${window?.attributes?.type}" +
+                    " flags=0x${window?.attributes?.flags?.let { Integer.toHexString(it) }}" +
+                    " imeOptions=${field.imeOptions} inputType=${field.inputType}"
+            )
         }.onFailure { log("clip-search: host dialog failed: ${it.message}") }
+    }
+
+    /** 搜索结束后回到面板：过滤结果只有面板里才看得到。 */
+    private fun reopenPanel(page: Page) {
+        val box = if (page == Page.CLIPBOARD) BOX_CLIP else BOX_PHRASE
+        val ok = runCatching { openPanel?.invoke(box) }.getOrDefault(false)
+        log("clip-search: panel reopened=$ok box=$box page=$page")
     }
 
     private fun invokeDialogButton(
@@ -617,6 +664,10 @@ internal class ClipSearch(
         .also { log("$label candidates=${it.size}") }
 
     private companion object {
+        /** 宿主 BoxEnums 里两张页的常量名（语义串，不写死混淆名）。 */
+        const val BOX_CLIP = "BOX_CLIP"
+        const val BOX_PHRASE = "BOX_PHRASE"
+
         /** ConstraintLayout.LayoutParams.PARENT_ID */
         const val PARENT_ID = 0
 

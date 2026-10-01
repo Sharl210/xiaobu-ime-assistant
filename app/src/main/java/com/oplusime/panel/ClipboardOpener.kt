@@ -34,7 +34,24 @@ internal class ClipboardOpener private constructor(
     private val dispatcherOwner: Any?,
     private val clipBoxEnum: Any?,
     private val legacy: LegacyPath?,
+    private val enumClass: Class<*>? = null,
 ) {
+
+    /**
+     * 按 BoxEnums 常量名打开任意一个面板（`BOX_CLIP` / `BOX_PHRASE` …）。
+     * 常量名是语义串，不是混淆名；只在这一个入口用名字，其余仍走结构匹配。
+     */
+    fun openByName(boxName: String): Boolean = runCatching {
+        val d = dispatcher ?: error("dispatcher unresolved")
+        val owner = dispatcherOwner ?: error("dispatcher singleton unresolved")
+        val value = enumClass?.enumConstants?.firstOrNull { (it as? Enum<*>)?.name == boxName }
+            ?: error("box enum $boxName unresolved")
+        d.invoke(owner, value, false, null)
+        true
+    }.getOrElse { error ->
+        log("panel open ($boxName) failed: ${error.message}")
+        false
+    }
 
     fun open(context: Context) {
         val primary = runCatching {
@@ -92,6 +109,7 @@ internal class ClipboardOpener private constructor(
                 dispatcherOwner = dispatcherOwner,
                 clipBoxEnum = enumValue,
                 legacy = LegacyPath(hostClassLoader),
+                enumClass = enumClass,
             )
         }
 

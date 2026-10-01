@@ -131,6 +131,16 @@ internal object QuotePairSuppressor {
     @Volatile
     private var fixCount: Int = 0
 
+    /** 最近一次"单独提交了一个成对左符号"的记录：字符与时刻。 */
+    @Volatile
+    private var lastLeftChar: Char? = null
+
+    @Volatile
+    private var lastLeftAt: Long = 0L
+
+    /** 自动补全的右符号必须紧跟在左符号之后，时间窗放到很短，避免误伤用户自己点的右符号。 */
+    private const val AUTO_PAIR_WINDOW_MS = 130L
+
     /** 引擎提交证据去重用的两个字段，避免连续按键刷屏。 */
     @Volatile
     private var lastObserveAt: Long = 0L
@@ -463,6 +473,16 @@ internal object QuotePairSuppressor {
                  */
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    // 形态零（本版新增，也是 1.19.0 真机失败的直接原因）：
+                    // 上一拍刚落下一个左符号，紧接着又送来"正好配对"的右符号 —— 这就是宿主/引擎
+                    // 的自动补全**第二步**。1.19.0 只做事后删除，而删除发生在它之后又被它补回，
+                    // 于是用户看到的一直是成对。这里直接在提交入口把它拦成一次空提交。
+                    if (dropAutoClosing(text, param.thisObject as? InputConnection)) {
+                        param.setResult(true)
+                        log("quote-pair: dropped auto closing '" + describe(text[0]) + "'")
+                        return
+                    }
+                    rememberLeftSymbol(text)
                     val single = unwrapPair(text) ?: return
                     param.args[0] = single
                     lastPairCommitAt = System.currentTimeMillis()
@@ -471,6 +491,7 @@ internal object QuotePairSuppressor {
 
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    rememberLeftSymbol(text)
                     if (!mentionsPair(text)) return
                     lastPairCommitAt = System.currentTimeMillis()
                     inspect(param.thisObject, "commitText")
@@ -528,6 +549,35 @@ internal object QuotePairSuppressor {
         return text.subSequence(0, 1)
     }
 
+    /** 记录"刚刚单独提交了一个成对左符号"，为下一步的自动补全判定留下依据。 */
+    private fun rememberLeftSymbol(text: CharSequence) {
+        if (text.length != 1) return
+        val c = text[0]
+        if (!PAIRS.containsKey(c)) return
+        lastLeftChar = c
+        lastLeftAt = System.currentTimeMillis()
+    }
+
+    /**
+     * 这次提交是不是"自动补出的右符号"。
+     *
+     * 判据三条同时成立才认，缺一不可：
+     * 1. 提交内容是单个字符，且正好是上一个左符号的配对右符号；
+     * 2. 距那个左符号提交不超过 [AUTO_PAIR_WINDOW_MS]（自动补全跟在同一次按键里，
+     *    用户自己再点一次右符号通常不会这么快）；
+     * 3. 光标此刻就贴在刚提交的左符号后面（说明编辑器里是 `"…左符号` 末尾，
+     *    这一笔就是宿主补出来的那一半）。
+     */
+    private fun dropAutoClosing(text: CharSequence, ic: InputConnection?): Boolean {
+        if (text.length != 1) return false
+        val left = lastLeftChar ?: return false
+        val now = System.currentTimeMillis()
+        if (now - lastLeftAt > AUTO_PAIR_WINDOW_MS) return false
+        if (text[0] != PAIRS[left]) return false
+        val before = ic?.let { runCatching { it.getTextBeforeCursor(1, 0) }.getOrNull() } ?: return false
+        return before.length == 1 && before[0] == left
+    }
+
     /** 本次提交的文本是否涉及成对符号（含"一次提交成对"与"提交单个左符号"两种形态）。 */
     private fun mentionsPair(text: CharSequence): Boolean {
         if (text.isEmpty()) return false
@@ -580,34 +630,42 @@ internal object QuotePairSuppressor {
         val after = runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull() ?: return
         if (now - lastFixAt < MIN_INTERVAL_MS) return
 
+        val branch: String
+        val target: Char
         val removed: Boolean
-        val removedSymbol: Char
         if (expected != null && after.length == 1 && after[0] == expected) {
             // 光标位于左右符号之间，例如 “|”；删除右侧自动补出的符号。
+            branch = "sandwich(" + describe(before[0]) + "|" + describe(after[0]) + ")"
+            target = expected
             removed = deleteSurrounding(ic, 0, 1)
-            removedSymbol = expected
         } else {
             // 另一种宿主时序：成对文本已提交，光标位于末尾，例如 “”|。
             val beforeTwo = runCatching { ic.getTextBeforeCursor(2, 0) }.getOrNull()
             if (beforeTwo == null || beforeTwo.length != 2) return
             val pairRight = PAIRS[beforeTwo[0]]
             if (pairRight == null || beforeTwo[1] != pairRight) return
+            branch = "tail(..." + describe(beforeTwo[0]) + describe(beforeTwo[1]) + ")"
+            target = beforeTwo[1]
             removed = deleteSurrounding(ic, 1, 0)
-            removedSymbol = beforeTwo[1]
         }
-        if (removed) {
-            lastFixAt = System.currentTimeMillis()
-            // 修正完成即关闭时间窗，避免同一状态被反复处理。
-            lastPairCommitAt = 0L
-            fixCount++
-            log(
-                "quote-pair: removed auto-inserted closing symbol '" + describe(removedSymbol) +
-                    "' (source=" + source +
-                    ", total=" + fixCount + ")"
-            )
-        } else {
-            log("quote-pair: editor rejected deleteSurroundingText (source=$source)")
+        if (!removed) {
+            log("quote-pair: editor rejected deleteSurroundingText (source=$source branch=$branch)")
+            return
         }
+        lastFixAt = System.currentTimeMillis()
+        fixCount++
+        // 复读验证：`deleteSurroundingText` 返回 true 只代表"命令发出去了"，不代表真的删掉了
+        // （组合态、只读编辑器、编辑连接指向别处都会静默失败）。1.19.0 就是在这里只看了返回值就
+        // 关掉时间窗，于是删除没生效、后续时间点也不再重试，用户看到的仍然是成对符号。
+        // 现在只有复读确认目标字符消失才算成功；没删掉就保留时间窗继续试。
+        val stillAfter = runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull()
+        val gone = stillAfter == null || stillAfter.isEmpty() || stillAfter[0] != target
+        log(
+            "quote-pair: removed auto-inserted closing symbol '" + describe(target) +
+                "' (source=" + source + ", branch=" + branch +
+                ", total=" + fixCount + ", verifiedGone=" + gone + ")"
+        )
+        if (gone) lastPairCommitAt = 0L
     }
 
     private fun deleteSurrounding(ic: InputConnection, before: Int, after: Int): Boolean =

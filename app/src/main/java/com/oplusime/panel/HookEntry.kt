@@ -220,6 +220,8 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     }
                 },
                 registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
+                closePanel = closePath,
+                openPanel = { boxName -> opener.openByName(boxName) },
             )
             if (clipCounterId != 0) {
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }

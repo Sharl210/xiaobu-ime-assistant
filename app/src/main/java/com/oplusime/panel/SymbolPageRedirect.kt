@@ -62,6 +62,16 @@ internal object SymbolPageRedirect {
     @Volatile
     private var promoteCount: Int = 0
 
+    /** 第一次真正进到切换方法时记一行，用来证明"钩子确实被调用了"（挂点选错时这一行不会出现）。 */
+    @Volatile
+    private var firstSwitchLogged = false
+
+    /** 当前档位字段的可读值，仅用于日志取证。 */
+    private fun describeField(target: Any, fields: List<Field>): String =
+        fields.mapNotNull { field ->
+            runCatching { (field.get(target) as? Enum<*>)?.name }.getOrNull()
+        }.joinToString(",")
+
     fun install(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         val enumClass = findSymbolEnum(bridge, hostClassLoader)
         if (enumClass == null) {
@@ -89,10 +99,27 @@ internal object SymbolPageRedirect {
         }
         fields.forEach { runCatching { it.isAccessible = true } }
 
-        // 视图切换方法：静态、返回 void、参数是 (管理器自身, boolean, 键盘类型枚举)。
-        // 参数 0 是管理器实例这一点，把它和普通静态工具方法区分开；
-        // 参数 2 是"另一个枚举"（键盘类型），把它和符号档位本身区分开。
-        val switches = holder.declaredMethods.filter { method ->
+        // 视图切换方法（1.19.0 就挂错在这里，这次按宿主真实形状挂）：
+        //
+        //   `h0(boolean)` 里每一个"写 SYMBOL1"的分支，紧接着调用的是
+        //       static void k0(管理器自身, KeyboardType, boolean, boolean, int)   ← 5 个参数
+        //   参数 0 是管理器实例、参数 1 是"另一个枚举"（键盘类型），这两点把 k0 和普通静态工具方法分开。
+        //
+        //   1.19.0 挂的是 3 参数形状 (管理器, boolean, KeyboardType) 的 `f0`；符号键根本不走它，
+        //   所以真机日志里连一次 `view-switch-before` 都没有出现 —— 挂点选错，等于没改。
+        val fiveArg = holder.declaredMethods.filter { method ->
+            Modifier.isStatic(method.modifiers) &&
+                method.returnType == Void.TYPE &&
+                method.parameterTypes.size == 5 &&
+                method.parameterTypes[0] == holder &&
+                method.parameterTypes[1].isEnum &&
+                method.parameterTypes[1] != enumClass &&
+                method.parameterTypes[2] == Boolean::class.javaPrimitiveType &&
+                method.parameterTypes[3] == Boolean::class.javaPrimitiveType &&
+                method.parameterTypes[4] == Int::class.javaPrimitiveType
+        }
+        // 兼容形状：少数分支走 3 参数版本，一并挂上，避免某条分支漏掉。
+        val threeArg = holder.declaredMethods.filter { method ->
             Modifier.isStatic(method.modifiers) &&
                 method.returnType == Void.TYPE &&
                 method.parameterTypes.size == 3 &&
@@ -101,6 +128,7 @@ internal object SymbolPageRedirect {
                 method.parameterTypes[2].isEnum &&
                 method.parameterTypes[2] != enumClass
         }
+        val switches = fiveArg + threeArg
 
         var hooked = 0
         switches.forEach { method ->
@@ -108,24 +136,41 @@ internal object SymbolPageRedirect {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val target = param.args?.getOrNull(0) ?: return
-                        val keyboardType = param.args?.getOrNull(2) ?: return
+                        if (!firstSwitchLogged) {
+                            firstSwitchLogged = true
+                            log(
+                                "symbol-page: switch hook fired ${method.declaringClass.simpleName}#" +
+                                    "${method.name} args=" + method.parameterTypes.size +
+                                    " current=" + describeField(target, fields)
+                            )
+                        }
+                        val keyboardType = param.args?.firstOrNull {
+                            it is Enum<*> && it.javaClass != enumClass
+                        }
                         // h0 刚刚写下 SYMBOL1；在这里抬到 SYMBOL2，本次切换就建完整页。
                         promote(
                             target,
                             fields,
                             simple,
                             full,
-                            "view-switch-before[" + (keyboardType as? Enum<*>)?.name + "]",
+                            "switch-before[" + (keyboardType as? Enum<*>)?.name +
+                                "@" + method.parameterTypes.size + "]",
                         )
                     }
                 })
                 hooked++
             }.onFailure { log("symbol-page: view switch hook failed: ${it.message}") }
         }
+        switches.forEach {
+            log(
+                "symbol-page: switch hooked ${it.declaringClass.simpleName}#${it.name}" +
+                    "(" + it.parameterTypes.joinToString { p -> p.simpleName } + ")"
+            )
+        }
 
         log(
             "symbol-page: installed holder=${holder.name} fields=${fields.size}" +
-                " switches=${switches.size} hooks=$hooked"
+                " switches=${switches.size}(5arg=${fiveArg.size},3arg=${threeArg.size}) hooks=$hooked"
         )
     }
 
