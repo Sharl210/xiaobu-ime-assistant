@@ -110,10 +110,13 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         // 避免阻塞输入法进程启动。面板类在用户打开文本编辑面板时才会实例化，
         // 正常情况下解析早已完成。
         Thread({
+            // 先刷新一次跨进程开关：日志是否开启由用户在 App 界面控制，
+            // 不刷这一下会沿用编译期默认值最多 5 秒。
+            val logOn = runCatching { ModuleSwitches.refreshNow() }.getOrDefault(true)
             val startedAt = System.currentTimeMillis()
             runCatching { install(apkPath, hostClassLoader) }
                 .onFailure { log("install failed: ${it.stackTraceToString()}") }
-            log("install finished in ${System.currentTimeMillis() - startedAt} ms")
+            log("install finished in ${System.currentTimeMillis() - startedAt} ms (logEnabled=$logOn)")
         }, "oplusime-panel-install").start()
     }
 

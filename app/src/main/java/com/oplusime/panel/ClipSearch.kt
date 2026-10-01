@@ -976,27 +976,48 @@ internal class ClipSearch(
     }
 
     /**
-     * 让列表按新关键字重新走一遍：**三条路依次尝试**，只要有一条成功，屏幕上就会看到过滤结果。
+     * 让列表按新关键字重新走一遍。
      *
-     *  1. 宿主自己的 `refresh()` —— 1.23.0 真机日志显示这个签名在这版宿主上不存在
-     *     （`refresh failed: ...adapter.Q.refresh []`），保留但它已经不是主路；
-     *  2. 用同一个 adapter 再 `setAdapter` 一次 —— 强制所有可见行重走 `onBindViewHolder`，
-     *     行级过滤因此立即生效。这一条不依赖宿主任何混淆方法名，是当前的主路；
-     *  3. `notifyItemRangeChanged` 兜底。
+     * ## 1.28.0 的关键纠正：只允许通过适配器通知重绑，不许再去动列表本身
      *
-     * 三条各自写日志（`rebind(...) refresh=? setAdapter=? notify=?`），下次一眼就能看出
-     * 是哪一条真正在起作用。
+     * 1.27.0 真机日志（20:05:33–20:06:07）暴露的现场是：
+     *
+     * ```text
+     * live rows pass=6  kw=6 hidden=0 shown=2 total=0/2      ← 150ms
+     * live rows pass=9  kw=6 hidden=0 shown=2 total=0/2      ← 400ms，同一批行再改一次
+     * live rows pass=11 kw=6 hidden=0 shown=2 total=0/6      ← 800ms
+     * live rows pass=29 hidden=2 shown=0 total=2/0           ← 滚动中继续改
+     * ```
+     *
+     * 那时同时在用三种手段：`setAdapter(同一实例)`（RecyclerView 会重布局并重置滚动位置）、
+     * `notifyItemRangeChanged`，以及**在列表已经完成布局之后**直接改写已上屏行的
+     * `layoutParams.height` 与 `visibility`（还分 4 个时间点各来一遍）。
+     *
+     * 最后这一种是**破坏性的**：RecyclerView 的布局缓存与回收池假设 itemView 的布局参数由
+     * 适配器绑定流程决定；在布局之外改写它，会让"位置 ↔ 视图"的对应关系错乱 ——
+     * 用户看到的就是"滑一下数据就窜行"。也就是说：**数据没乱，是行乱了。**
+     *
+     * 现在只保留一种手段：`notifyItemRangeChanged`。它是 RecyclerView 的正规通知 API，
+     * 会让可见行重新走 `onBindViewHolder`，而过滤逻辑正好挂在绑定钩子里
+     * （见 [installRowFilter]）—— 时机正确、随回收自动刷新、行被复用时不会留下脏状态。
+     *
+     * 另外两个**不再使用**：`setAdapter`（重置滚动+全部回收，观感上就是列表跳）与
+     * `filterLiveRows`（布局外改行，即上面那个紊乱根因）。
      */
     private fun reloadLists(page: Page = currentPage) {
+        rowHidden = 0
+        rowShown = 0
         synchronized(buttons) {
             buttons.keys.forEach { panel -> rebindList(panel, page, "keyword") }
         }
-        // 关键补充（1.26.0 的教训）：rebind 只能作用在**缓存里那个面板实例**上，而面板
-        // 重建后缓存里那个已经脱离屏幕 —— 1.26.0 日志里 `row filter summary … hidden=0 shown=0`
-        // 就是这么来的。因此这里再对**屏幕上真正显示着的那个列表**直接施加一次过滤。
-        runCatching { filterLiveRows(page, "reload") }
-            .onFailure { log("clip-search: reload live rows failed: ${it.message}") }
-        scheduleLiveFilter(page, "reload")
+        // 面板会被宿主重建，缓存里的实例可能已经脱离屏幕；因此再用**屏幕上的那个列表**
+        // 的适配器补通知一次（只通知，不碰视图）。
+        val targetId = if (page == Page.CLIPBOARD) listId else phraseListId
+        if (targetId != 0) {
+            val live = findLiveList(targetId)
+            val adapter = live?.let { runCatching { Reflect.readObject(it, "mAdapter") }.getOrNull() }
+            if (adapter != null) notifyRebind(adapter, page, "live")
+        }
     }
 
     private fun rebindList(panel: View, page: Page, reason: String) {
@@ -1005,29 +1026,20 @@ internal class ClipSearch(
             ?: return
         val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
             ?: return
+        notifyRebind(adapter, page, reason)
+    }
 
-        // 从 0 开始统计这次重绑的过滤结果，收尾日志里会写"藏了几行、留了几行"。
-        rowHidden = 0
-        rowShown = 0
-
-        val refreshed = runCatching {
-            adapter.javaClass.getMethod("refresh").invoke(adapter)
-            true
-        }.getOrElse { false }
-
-        val rebound = runCatching {
-            val loader = recycler.javaClass.classLoader
-            val rvClass = Class.forName("androidx.recyclerview.widget.RecyclerView", false, loader)
-            val adapterClass = Class.forName("androidx.recyclerview.widget.RecyclerView\$Adapter", false, loader)
-            rvClass.getMethod("setAdapter", adapterClass).invoke(recycler, adapter)
-            true
-        }.getOrElse {
-            log("clip-search: rebind($reason) setAdapter failed: ${it.message}")
-            false
-        }
-
+    /**
+     * 唯一被允许的重绑手段：`notifyItemRangeChanged(0, itemCount)`。
+     *
+     * 不碰视图、不碰适配器实例、不改滚动位置。宿主适配器的 `itemCount` 是公开方法，
+     * 拿不到就退化为"通知一个足够大的窗口"（RecyclerView 会自行按实际条目数截断）。
+     */
+    private fun notifyRebind(adapter: Any, page: Page, reason: String) {
+        val count = runCatching {
+            adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int
+        }.getOrNull() ?: 0
         val notified = runCatching {
-            val count = adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int ?: 0
             adapter.javaClass
                 .getMethod(
                     "notifyItemRangeChanged",
@@ -1036,33 +1048,11 @@ internal class ClipSearch(
                 )
                 .invoke(adapter, 0, count)
             true
-        }.getOrElse { false }
-
-        log(
-            "clip-search: rebind($reason) page=$page refresh=$refreshed" +
-                " setAdapter=$rebound notify=$notified adapter=${adapter.javaClass.name}"
-        )
-        // 过滤必须落到「屏幕上那个列表」上。
-        //
-        // 1.26.0 真机日志（19:27:22 / 19:28:58）显示 rebind 之后跟着的是
-        // `row filter summary … hidden=0 shown=0` —— 一次行绑定都没有发生。原因是重绑时
-        // 只按 `buttons` 里缓存的**面板实例**去找列表：面板重建后缓存里那个已经是
-        // **脱离屏幕的旧实例**，于是"重绑"发生在没人看的列表上，行级过滤从未执行。
-        //
-        // 现在不再依赖"重绑一定触发绑定"这一假设：直接对**屏幕上的可见行**做收放，
-        // 并在数据异步到达后分几个时间点各重复一次（分页数据是异步提交的）。
-        scheduleLiveFilter(page, "rebind($reason)")
-    }
-
-    /** 在若干时间点对屏幕上的可见行重复施加过滤（分页数据异步到达，单次不够）。 */
-    private fun scheduleLiveFilter(page: Page, reason: String) {
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        listOf(150L, 400L, 800L, 1400L).forEach { delay ->
-            handler.postDelayed({
-                runCatching { filterLiveRows(page, reason) }
-                    .onFailure { log("clip-search: live rows failed: ${it.message}") }
-            }, delay)
+        }.getOrElse {
+            log("clip-search: notify($reason) failed: ${it.message}")
+            false
         }
+        log("clip-search: rebind($reason) page=$page notify=$notified count=$count adapter=${adapter.javaClass.name}")
     }
 
     /**
@@ -1087,77 +1077,6 @@ internal class ClipSearch(
             if (fallback == null) fallback = view
         }
         return fallback
-    }
-
-    /**
-     * 对可见行直接施加过滤：命中 → 还原行高；未命中 → 收成 0 高度并隐藏。
-     *
-     * 这一层不依赖适配器的绑定时机，也不依赖任何混淆方法名（只用到框架公开的
-     * `getChildAdapterPosition` 与分页适配器的取值口），因此"重绑没触发绑定"不再是故障点。
-     */
-    private fun filterLiveRows(page: Page, reason: String) {
-        val targetId = if (page == Page.CLIPBOARD) listId else phraseListId
-        if (targetId == 0) return
-        val kw = keywordFor(page)
-        val list = findLiveList(targetId)
-        rowPass++
-        val pass = rowPass
-        if (list == null || list !is ViewGroup) {
-            log("clip-search: live rows pass=$pass reason=$reason page=$page list not found id=0x${Integer.toHexString(targetId)}")
-            return
-        }
-        val adapter = runCatching { Reflect.readObject(list, "mAdapter") }.getOrNull()
-        var hidden = 0
-        var shown = 0
-        var unreadable = 0
-        for (i in 0 until list.childCount) {
-            val child = list.getChildAt(i) ?: continue
-            val position = adapterPositionOf(list, child)
-            if (position < 0) continue
-            if (kw == null) {
-                applyRowVisibility(child, true)
-                shown++
-                continue
-            }
-            val item = if (adapter != null) readItem(adapter, position) else null
-            if (item == null) {
-                // 读不到条目时保持可见：宁可漏过滤，也不能把整屏清空。
-                applyRowVisibility(child, true)
-                unreadable++
-                continue
-            }
-            val hit = matches(item, kw)
-            applyRowVisibility(child, hit)
-            if (hit) shown++ else hidden++
-        }
-        rowHidden += hidden
-        rowShown += shown
-        log(
-            "clip-search: live rows pass=$pass reason=$reason page=$page" +
-                " kw=${kw ?: "<none>"} hidden=$hidden shown=$shown unreadable=$unreadable" +
-                " total=$rowHidden/$rowShown"
-        )
-    }
-
-    /** 取某一子行在适配器里的位置（框架公开方法，不涉及宿主混淆名）。 */
-    private fun adapterPositionOf(list: View, child: View): Int {
-        var current: Class<*>? = list.javaClass
-        var depth = 0
-        while (current != null && current != Any::class.java && depth < 12) {
-            val method = runCatching {
-                current!!.getDeclaredMethod(
-                    "getChildAdapterPosition",
-                    View::class.java,
-                )
-            }.getOrNull()
-            if (method != null) {
-                method.isAccessible = true
-                return runCatching { (method.invoke(list, child) as? Int) ?: -1 }.getOrDefault(-1)
-            }
-            current = current.superclass
-            depth++
-        }
-        return -1
     }
 
     // -------------------------------------------------------------- 分页过滤
@@ -1325,17 +1244,30 @@ internal class ClipSearch(
         return null
     }
 
-    /** 继承链上出现分页包名即为分页源；只做判定，不改任何行为。 */
+    /** 继承链（含接口）上出现分页包名即为分页源；只做判定，不改任何行为。 */
     private fun isPagingSource(cls: Class<*>): Boolean {
+        if (nameMentionsPaging(cls.name)) return true
+        // 关键补充（1.27.0 日志 `convert candidates=29 filterHooks=0` 的教训）：
+        // 宿主的分页源往往是**匿名内部类**，类名里根本不含 "paging"；真正的分页身份
+        // 写在它的父类或 `implements` 列表里（`androidx.paging.PagingSource` 等）。
+        // 只看类名会一个都命中不了 —— 这正是数据层过滤一直没装上的原因。
+        // 因此这里沿父类链 + 全部接口 (递归一层) 一起找。
         var current: Class<*>? = cls
         var depth = 0
-        while (current != null && current != Any::class.java && depth < 12) {
-            if (current.name.contains("paging", ignoreCase = true)) return true
+        while (current != null && current != Any::class.java && depth < 16) {
+            if (nameMentionsPaging(current.name)) return true
+            current.interfaces.forEach { iface ->
+                if (nameMentionsPaging(iface.name)) return true
+                iface.interfaces.forEach { sub -> if (nameMentionsPaging(sub.name)) return true }
+            }
             current = current.superclass
             depth++
         }
         return false
     }
+
+    private fun nameMentionsPaging(name: String): Boolean =
+        name.contains("paging", ignoreCase = true)
 
     /** 条目的任一字符串字段 / 字符串 getter 包含关键字即命中（不依赖任何混淆字段名）。 */
     private fun matches(item: Any?, kw: String): Boolean {
@@ -1391,10 +1323,6 @@ internal class ClipSearch(
          */
         @Volatile
         var lastRoot: java.lang.ref.WeakReference<ViewGroup>? = null
-
-        /** 重绑轮次（只用于日志对照，避免"藏了几行"被后续轮次覆盖后看不出是哪一轮）。 */
-        @Volatile
-        var rowPass: Int = 0
 
         /** 当前活动输入条里的输入框：确认/收尾时取它的文字，不依赖视图引用是否还在。 */
         @Volatile

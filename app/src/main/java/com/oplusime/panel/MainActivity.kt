@@ -25,6 +25,9 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         title = getString(R.string.module_title)
+        // 放开开关文件的读权限，宿主进程（输入法）才读得到日志开关。
+        // 放在建界面之前，保证"打开本页"这一动作本身就已经让开关对输入法可用。
+        runCatching { SwitchStore.makeReadable(this) }
         setContentView(buildContent())
     }
 
@@ -37,6 +40,8 @@ class MainActivity : Activity() {
 
         root.addView(header())
         root.addView(caption())
+        root.addView(switchCard())
+        root.addView(rememberedCard())
 
         addGroup(
             root, "文本编辑面板",
@@ -99,6 +104,85 @@ class MainActivity : Activity() {
         setPadding(0, dp(6), 0, dp(4))
     }
 
+    /**
+     * 日志开关卡片。
+     *
+     * 说明为什么放在界面上而不是写死在代码里：这个模块的日志是排查宿主问题的唯一手段，
+     * 但日志本身有代价（跨进程写文件、在 LSPosed 日志里占行）。调试期要开着，
+     * 正式使用时要能一键关掉。做成界面开关后，用户排障时打开、日常关掉，都不必重新装包。
+     */
+    private fun switchCard(): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(CARD, 14f)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        card.addView(TextView(this).apply {
+            text = "日志开关"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextColor(FG)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        card.addView(TextView(this).apply {
+            text = "开启后本模块会在 LSPosed 日志里记录诊断信息，用于排查问题；" +
+                "关闭后完全不产生日志，减少性能开销，也不会干扰其它模块的日志分析。" +
+                "改动立即生效（输入法进程最多 5 秒后跟随）。"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(FG_MUTED)
+            setPadding(0, dp(6), 0, dp(12))
+        })
+
+        val toggleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val stateText = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(FG)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val pill = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            isClickable = true
+            isFocusable = true
+        }
+
+        fun render() {
+            val on = SwitchStore.logEnabled(this)
+            stateText.text = if (on) "当前：已开启" else "当前：已关闭"
+            pill.text = if (on) "关闭日志" else "开启日志"
+            pill.setTextColor(if (on) FG else Color.WHITE)
+            pill.background = rounded(if (on) TOGGLE_OFF else ACCENT, 18f)
+        }
+
+        pill.setOnClickListener {
+            val next = !SwitchStore.logEnabled(this)
+            SwitchStore.setLogEnabled(this, next)
+            render()
+        }
+        render()
+
+        toggleRow.addView(stateText)
+        toggleRow.addView(pill)
+        card.addView(toggleRow)
+        return card
+    }
+
+    /** 提示卡片：告诉用户"没手动设置过时用的是哪个默认值"。 */
+    private fun rememberedCard(): View = TextView(this).apply {
+        val customized = SwitchStore.logEnabledCustomized(this@MainActivity)
+        text = if (customized) {
+            "当前取值由你在本页设置决定，会一直保持，直到你再次修改。"
+        } else {
+            "你还没有手动设置过：当前使用的是本版本的默认值（" +
+                if (ModuleSwitches.DEFAULT_LOG_ENABLED) "默认开启）" else "默认关闭）"
+        }
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setTextColor(FG_MUTED)
+        setPadding(dp(4), dp(10), dp(4), 0)
+    }
+
     private fun addGroup(root: LinearLayout, title: String, items: List<String>) {
         root.addView(sectionTitle(title))
         val card = LinearLayout(this).apply {
@@ -159,5 +243,6 @@ class MainActivity : Activity() {
         val FG: Int = Color.parseColor("#E5000000")
         val FG_MUTED: Int = Color.parseColor("#99000000")
         val ACCENT: Int = Color.parseColor("#0A59F7")
+        val TOGGLE_OFF: Int = Color.parseColor("#E8E8ED")
     }
 }
