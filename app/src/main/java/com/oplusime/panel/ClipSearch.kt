@@ -69,6 +69,10 @@ internal class ClipSearch(
     @Volatile
     private var keyword: String? = null
 
+    /** 上一次锚点校验的结果，只在变化时打日志（避免每帧刷屏）。 */
+    @Volatile
+    private var lastAnchorReported: Boolean? = null
+
     /** 面板 → 我们新建的搜索按钮。 */
     private val buttons: MutableMap<ViewGroup, View> =
         Collections.synchronizedMap(WeakHashMap())
@@ -83,16 +87,11 @@ internal class ClipSearch(
         }
         val existing = buttons[panel]
         if (existing != null && existing.parent === panel) {
-            // 宿主用「计数控件是否可见」表达当前是不是剪贴板页
-            // （`D.j(IZ)`：剪贴板页让计数可见、常用语页把它设成 INVISIBLE）。
-            // 这个面板是两页共用的，因此按钮只在剪贴板页显示。
-            val onClipboardPage = counter.visibility == View.VISIBLE
-            val want = if (onClipboardPage) View.VISIBLE else View.GONE
-            if (existing.visibility != want) existing.visibility = want
-            if (onClipboardPage) {
-                place(existing, counter)
-                applyActiveStyle(existing)
-            }
+            // 每次都重申「文字 = 搜索」与锚点。重申文字这一步是必须的：交给宿主自己维护的话，
+            // 任何一次它自己的 setText 都会把我们的字样冲掉（上一版抢宿主槽位就是这么坏的）。
+            place(existing, counter)
+            if (existing.visibility != View.VISIBLE) existing.visibility = View.VISIBLE
+            applyActiveStyle(existing)
             return
         }
         val button = createButton(panel, counter) ?: return
@@ -100,7 +99,6 @@ internal class ClipSearch(
         buttons[panel] = button
         place(button, counter)
         applyActiveStyle(button)
-        if (counter.visibility != View.VISIBLE) button.visibility = View.GONE
         log(
             "clip-search: button created id=0x" + Integer.toHexString(button.id) +
                 " class=${button.javaClass.name} anchored to counter=0x" +
@@ -122,15 +120,42 @@ internal class ClipSearch(
         view.setOnClickListener { onButtonClicked(view) }
 
         // 与计数控件同族的 LayoutParams（约束布局的参数类型必须一致，否则写入的锚点字段无效）。
-        val lp = runCatching {
-            counter.layoutParams?.javaClass?.getConstructor()?.newInstance() as? ViewGroup.LayoutParams
-        }.getOrNull() ?: ViewGroup.LayoutParams(
+        view.layoutParams = newConstraintLp(counter)
+        applyButtonStyle(view, active = false)
+        return view
+    }
+
+    /**
+     * 造一个与计数控件同族的 `LayoutParams`。
+     *
+     * **这是按钮前两版飘到左上角的真正原因，可以静态证明，不需要真机：**
+     * `androidx.constraintlayout.widget.LayoutParams`（本版被 R8 改名为
+     * `androidx.constraintlayout.widget.d`）只公开了
+     * `(int width, int height)` 与 `(Context, AttributeSet)` 两个构造器，
+     * **没有无参构造器**。上一版写的 `lp.javaClass.getConstructor()` 必然抛
+     * `NoSuchMethodException`，被 `runCatching` 吞掉后退回普通
+     * `ViewGroup.LayoutParams` —— 那个类里**根本没有** `topToTop` / `endToEnd` 这些字段，
+     * 于是所有锚点写入静默失败，ConstraintLayout 只能把这个没有任何约束的子 View 摆在 (0,0)，
+     * 表现就是「搜索」压在返回箭头上。
+     *
+     * 更糟的是：写入失败时日志照样打 "anchored to counter=…"，等于在骗人。
+     * 本版一并修掉这两点：用 `(int,int)` 构造器造 LP，并且写入后**回读校验**。
+     */
+    private fun newConstraintLp(counter: View): ViewGroup.LayoutParams {
+        val cls = counter.layoutParams?.javaClass
+        if (cls != null) {
+            runCatching {
+                cls.getConstructor(Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .newInstance(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    )
+            }.getOrNull()?.let { return it as ViewGroup.LayoutParams }
+        }
+        return ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         )
-        view.layoutParams = lp
-        applyButtonStyle(view, active = false)
-        return view
     }
 
     /**
@@ -140,6 +165,13 @@ internal class ClipSearch(
      * 目标状态唯一，重写不会引发新的重排。
      */
     private fun place(button: View, counter: View) {
+        // 文字由我们自己写死；宿主不认识这个控件，因此这里不该出现第二个写入者。
+        (button as? TextView)?.let {
+            if (it.text?.toString() != label) {
+                log("clip-search: label restored '${it.text}' -> '$label'")
+                it.text = label
+            }
+        }
         val lp = button.layoutParams ?: return
         runCatching {
             // 水平：贴父容器右端（与宿主自己的右端槽位同位置），不参与计数的锚点链。
@@ -162,6 +194,21 @@ internal class ClipSearch(
             }
             button.layoutParams = lp
             button.requestLayout()
+
+            // 回读校验：锚点写不进去时（LP 类型不对、字段名对不上）必须当场看见，
+            // 不能让"位置没放对"变成一个只有用户才能发现的哑故障。
+            val gotTop = Reflect.readInt(lp, "topToTop")
+            val gotEnd = Reflect.readInt(lp, "endToEnd")
+            val ok = gotTop == counter.id && gotEnd == PARENT_ID
+            if (!ok || lastAnchorReported != ok) {
+                lastAnchorReported = ok
+                log(
+                    "clip-search: anchor verify ${if (ok) "PASS" else "FAIL"}" +
+                        " topToTop=$gotTop(want ${counter.id})" +
+                        " endToEnd=$gotEnd(want $PARENT_ID)" +
+                        " lp=${lp.javaClass.name}"
+                )
+            }
         }.onFailure { log("clip-search: place button failed: ${it.message}") }
     }
 
