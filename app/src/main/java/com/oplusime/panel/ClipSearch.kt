@@ -393,7 +393,15 @@ internal class ClipSearch(
             field.isFocusableInTouchMode = true
             field.setShowSoftInputOnFocus(true)
             field.setSingleLine(true)
-            field.imeOptions = EditorInfo.IME_ACTION_SEARCH
+            // **不给"搜索/完成"动作键**（这是 1.25.0 的关键改动）。
+            // 宿主 `input/manager/h;->g(EditorInfo)` 会读 actionType；只要读到 SEARCH，
+            // 键盘上就会出现「搜索」键，而那一按由宿主自己处理，走的是"结束内部输入"的路径，
+            // 顺手把输入法窗口收下去。1.24.0 真机日志（18:58:46
+            // `ime window hidden while bar shown`）就是这个：收尾虽然跑完了，但窗口已经没了，
+            // 用户看到的就是"一点搜索整个界面垮掉、输入法被收起来"。
+            // 改成普通回车后，宿主不再把它当动作处理；回车仍会以 UNSPECIFIED 送到下面的
+            // `setOnEditorActionListener`，成为除输入条按钮之外的第二个确认入口。
+            field.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_ENTER_ACTION
             field.inputType = InputType.TYPE_CLASS_TEXT
             field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             field.setText(currentKeyword() ?: "")
@@ -433,6 +441,7 @@ internal class ClipSearch(
             row.bringToFront()
             activeBar = row
             activeField = field
+            activeInstance = this
 
             // 输入条被摘掉时同步"忘记"它。宿主此刻把内部输入目标指向了这个输入框，
             // 如果只摘视图、不解除指向，宿主会对着一个已脱离视图树的输入框继续操作，
@@ -562,38 +571,98 @@ internal class ClipSearch(
     }
 
     /**
-     * 输入法窗口被系统收起时的收尾。
-     *
-     * 触发场景（真机日志已复现）：输入框带 `IME_ACTION_SEARCH`，键盘上因此出现「搜索」键；
-     * 那一按由**宿主自己**处理（不会走我们的监听器），宿主按常规行为把键盘收了下去，
-     * 于是屏幕上只剩一条没人清理的输入条。
-     *
-     * 这里把该做的事补齐：关键字生效 → 摘输入条 → 重新打开面板看过滤结果。
+     * 取消搜索（返回键或输入条上的「取消」）：清空关键字、摘输入条、回面板看全部条目。
      */
-    fun onImeWindowHidden() {
+    fun cancelSearch() {
+        val page = currentPage
+        liveFilterHandler.removeCallbacks(liveFilterRunnable)
+        applyKeyword("")
+        log("clip-search: cancel requested page=$page")
+        finishSearch(page, "cancel")
+    }
+
+    /**
+     * 输入法窗口被收起时的收尾。
+     *
+     * 1.24.0 真机日志（18:58:46）复现的现场：输入框带 `IME_ACTION_SEARCH`，键盘上因此出现
+     * 「搜索」键；那一按由**宿主自己**处理（不会走我们的监听器），宿主按常规行为把输入法窗口
+     * 收了下去。收尾动作确实跑了（关键字生效、面板重开），但**窗口已经没了** ——
+     * 用户看到的就是"一点搜索整个界面垮掉、输入法被收起来"。
+     *
+     * 所以本版分两层处理：
+     *  1. **挡住**（见 [installImeWindowHook] 的第一层）：条还在，就不让窗口被收走；
+     *  2. **兜底**（本方法）：万一还是被收了，把该做的补齐 ——
+     *     关键字生效 → 摘输入条 → 重新打开面板看过滤结果。
+     */
+    fun onImeWindowHidden(reason: String = "ime-window-hidden") {
         val bar = activeBar ?: return
         val page = currentPage
         val kw = activeField?.text?.toString().orEmpty()
         liveFilterHandler.removeCallbacks(liveFilterRunnable)
         applyKeyword(kw)
-        log("clip-search: ime window hidden while bar shown -> apply kw='$kw' page=$page bar=$bar")
+        log("clip-search: $reason -> apply kw='$kw' page=$page bar=$bar")
         removeSearchBar()
         reopenPanel(page)
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             reloadLists(page)
-            log("clip-search: window-hidden cleanup done page=$page")
+            log("clip-search: window-hidden cleanup done page=$page reason=$reason")
         }, 220L)
     }
 
-    /** 挂住输入法窗口隐藏事件；只在这一个进程内、只影响本模块自己。 */
+    /**
+     * 输入法窗口守卫：只在这一个进程内、只影响本模块自己。
+     *
+     * ## 第一层：挡住"收窗口"
+     *
+     * 搜索输入条显示期间，窗口一旦被隐藏，后面再怎么补救都晚了。因此直接挂在框架的
+     * `hideWindow()` / `requestHideSelf(int)` 入口上：只要输入条还在（就说明搜索还没结束），
+     * 就不让这次隐藏生效，并把这次"想收窗口"当成用户按下确认的信号，立刻走收尾。
+     *
+     * 只拦"条还在"的那段极短窗口，正常使用输入法时的收键盘不受影响。
+     *
+     * ## 第二层：兜底
+     *
+     * 万一窗口还是被收掉了（例如其它路径直接隐藏窗口），在 `onWindowHidden` 后把收尾补齐，
+     * 避免屏幕上留下一条没人清理的输入条。
+     */
     fun installImeWindowHook() {
+        runCatching {
+            XposedBridge.hookAllMethods(
+                android.inputmethodservice.InputMethodService::class.java,
+                "hideWindow",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (activeBar == null) return
+                        param.result = null
+                        log("clip-search: hideWindow blocked while bar shown")
+                        runCatching { onImeWindowHidden("hide-blocked") }
+                            .onFailure { log("clip-search: hide-blocked cleanup failed: ${it.message}") }
+                    }
+                },
+            )
+            XposedBridge.hookAllMethods(
+                android.inputmethodservice.InputMethodService::class.java,
+                "requestHideSelf",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (activeBar == null) return
+                        param.result = null
+                        log("clip-search: requestHideSelf blocked while bar shown")
+                        runCatching { onImeWindowHidden("hide-request-blocked") }
+                            .onFailure { log("clip-search: hide-request cleanup failed: ${it.message}") }
+                    }
+                },
+            )
+            log("clip-search: ime window guard installed (hideWindow/requestHideSelf blocked while bar shown)")
+        }.onFailure { log("clip-search: ime window guard failed: ${it.message}") }
+
         runCatching {
             XposedBridge.hookAllMethods(
                 android.inputmethodservice.InputMethodService::class.java,
                 "onWindowHidden",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        runCatching { onImeWindowHidden() }
+                        runCatching { onImeWindowHidden("window-hidden") }
                             .onFailure { log("clip-search: window-hidden cleanup failed: ${it.message}") }
                     }
                 },
@@ -1000,7 +1069,7 @@ internal class ClipSearch(
         .getOrDefault(emptyList())
         .also { log("$label candidates=${it.size}") }
 
-    private companion object {
+    internal companion object {
         /** 当前显示中的搜索输入条（模块级：任何路径都能把它清掉，防止变成屏幕上的孤儿）。 */
         @Volatile
         var activeBar: View? = null
@@ -1008,6 +1077,18 @@ internal class ClipSearch(
         /** 当前活动输入条里的输入框：确认/收尾时取它的文字，不依赖视图引用是否还在。 */
         @Volatile
         var activeField: EditText? = null
+
+        /** 当前输入条所属的实例：返回键「取消搜索」要用（视图上拿不到实例）。 */
+        @Volatile
+        var activeInstance: ClipSearch? = null
+
+        /** 搜索输入条是否正显示（供返回键接管判断）。 */
+        fun isSearchBarShown(): Boolean = activeBar != null
+
+        /** 让当前输入条执行「取消搜索」；没有活动条时什么都不做。 */
+        fun cancelActiveSearch() {
+            activeInstance?.cancelSearch()
+        }
 
         /** 输入条根视图上的标记，用于"引用丢了也能扫出来清掉"。 */
         val BAR_TAG: Int = "oplusime_panel_search_bar".hashCode()

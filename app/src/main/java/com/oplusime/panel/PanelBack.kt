@@ -87,6 +87,16 @@ internal object PanelBackRouter {
         override fun beforeHookedMethod(param: MethodHookParam) {
             val keyCode = param.args?.getOrNull(0) as? Int ?: return
             if (keyCode != KeyEvent.KEYCODE_BACK) return
+            // 搜索输入条显示中：返回 = 取消搜索，回到面板看全部条目。
+            // （顺序必须在面板判断之前：输入条显示时面板是收起的，否则这一按会落到宿主手里。）
+            if (ClipSearch.isSearchBarShown()) {
+                param.result = true
+                handledCount++
+                runCatching { ClipSearch.cancelActiveSearch() }
+                    .onFailure { log("panel-back: cancel search failed: ${it.message}") }
+                log("panel-back: back consumed while search bar shown (total=$handledCount) -> cancel search")
+                return
+            }
             // 只在面板真的显示着的时候接管；否则原样放行，不影响正常收起键盘。
             if (!PanelState.anyShown()) return
             param.result = true
