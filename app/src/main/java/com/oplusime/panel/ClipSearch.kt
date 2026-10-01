@@ -15,6 +15,7 @@ import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
@@ -319,7 +320,147 @@ internal class ClipSearch(
      * 3. 键盘本来就是输入法窗口的一部分，它一直在下面，卡片不会把它盖住。
      */
     private fun showInput(anchor: View) {
-        showDialog(anchor)
+        showSearchBar(anchor)
+    }
+
+    /** 当前显示中的搜索输入条（长在输入法窗口内部，不是叠加窗口）。 */
+    @Volatile
+    private var searchBar: View? = null
+
+    /**
+     * 搜索输入条：**在输入法窗口内部、键盘正上方**插入一条输入条。
+     *
+     * ## 为什么不再做叠加窗口（Dialog / PopupWindow）
+     *
+     * 输入法进程自己就是输入源。任何叠在输入法窗口之上的**可获焦**窗口，都会让系统认为
+     * 「当前焦点窗口不是输入法要输入的目标」，于是把输入法窗口收下去 —— 1.16~1.21 反复实测到的
+     * 「只有一个光标、键盘不出来」就是这个机制。
+     *
+     * 这跟窗口标志无关：1.21.0 真机日志里
+     * `clip-search: host dialog shown, input-registered=true windowType=1003 flags=0x1800002`
+     * 已经**不含** `FLAG_ALT_FOCUSABLE_IM(0x20000)`，键盘照样不出来。所以问题不在标志。
+     *
+     * ## 宿主自己的做法（两条独立证据）
+     *
+     * 宿主把输入框做成**输入法窗口内部的普通 View**，再交给它的内部焦点切换
+     * （`input/manager/h;->l(editText, true)`），让键盘按键直接进到那个输入框：
+     *
+     * ```text
+     * input/view/head/O;->o(CustomEditText)   「编辑常用语」
+     *     setImeOptions(1) → h.l(editText, true)
+     * input/view/head/h0;->d()                「搜索框」emoji 搜索
+     *     setImeOptions(3) → setOnEditorActionListener → h.l(editText, true)
+     * ```
+     *
+     * ## 本版流程
+     *
+     * 1. 先收起面板（`res/IB.xml` 根是 match_parent，面板会占满整个键盘区域，键盘在里面没有位置）；
+     * 2. 把输入条加到**输入法窗口根视图**（`anchor.rootView`，也就是 IME 窗口自己的 DecorView）
+     *    顶部 —— 键盘仍在下方可见可用，输入条只是压在它上面的一条；
+     * 3. 注册内部输入目标，键盘按键因此进入这个输入框；
+     * 4. 确认 → 应用关键字、移除输入条、重新打开面板看过滤结果；取消 → 移除输入条、重新打开面板。
+     *
+     * 拿不到根视图时**不硬来**：记一行日志并退回旧的弹窗实现，避免"静默失效"。
+     */
+    private fun showSearchBar(anchor: View) {
+        runCatching {
+            val context = anchor.context
+            val density = context.resources.displayMetrics.density
+            val page = currentPage
+            val root = anchor.rootView as? ViewGroup
+            if (root == null) {
+                log("clip-search: ime root view unavailable; falling back to dialog")
+                showDialog(anchor)
+                return
+            }
+            removeSearchBar()
+            val closed = runCatching { closePanel?.invoke() }.getOrNull()
+            log("clip-search: panel closed before input=$closed page=$page")
+
+            val field = createInputField?.invoke(context) ?: EditText(context)
+            field.hint = "输入要搜索的关键字"
+            field.isFocusableInTouchMode = true
+            field.setShowSoftInputOnFocus(true)
+            field.setSingleLine(true)
+            field.imeOptions = EditorInfo.IME_ACTION_SEARCH
+            field.inputType = InputType.TYPE_CLASS_TEXT
+            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            field.setText(currentKeyword() ?: "")
+            field.setSelectAllOnFocus(false)
+            field.setPadding(
+                (12 * density).toInt(), (10 * density).toInt(),
+                (12 * density).toInt(), (10 * density).toInt(),
+            )
+
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setBackgroundColor(Color.WHITE)
+                setPadding((8 * density).toInt(), (6 * density).toInt(), (8 * density).toInt(), (6 * density).toInt())
+            }
+            row.addView(
+                field,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            row.addView(buildBarButton(context, "取消") {
+                removeSearchBar()
+                reopenPanel(page)
+            })
+            row.addView(buildBarButton(context, "搜索") {
+                applyKeyword(field.text?.toString().orEmpty())
+                removeSearchBar()
+                reopenPanel(page)
+            })
+
+            val lp = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            lp.gravity = Gravity.TOP
+            root.addView(row, lp)
+            row.bringToFront()
+            searchBar = row
+
+            field.requestFocus()
+            field.setSelection(field.text?.length ?: 0)
+            val registered = registerInputTarget?.invoke(field) == true
+            field.postDelayed({
+                val again = runCatching { registerInputTarget?.invoke(field) == true }.getOrDefault(false)
+                log("clip-search: search bar input re-register=$again")
+            }, 250L)
+            log(
+                "clip-search: search bar shown in ime window root=" + root.javaClass.name +
+                    " input-registered=" + registered +
+                    " imeOptions=" + field.imeOptions + " inputType=" + field.inputType
+            )
+        }.onFailure { log("clip-search: search bar failed: ${it.message}") }
+    }
+
+    /** 输入条上的小按钮（与搜索按钮同一套气泡样式）。 */
+    private fun buildBarButton(context: android.content.Context, label: String, onClick: () -> Unit): TextView {
+        val density = context.resources.displayMetrics.density
+        val button = TextView(context)
+        button.text = label
+        button.setPadding((12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt(), (8 * density).toInt())
+        button.setTextColor(ACTIVE_FG)
+        button.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(0x1A0A59F7)
+            cornerRadius = 10 * density
+        }
+        button.isClickable = true
+        button.setOnClickListener { onClick() }
+        return button
+    }
+
+    /** 移除输入条；可重复调用。 */
+    private fun removeSearchBar() {
+        val bar = searchBar ?: return
+        searchBar = null
+        runCatching {
+            (bar.parent as? ViewGroup)?.removeView(bar)
+            log("clip-search: search bar removed")
+        }.onFailure { log("clip-search: search bar remove failed: ${it.message}") }
     }
 
     private fun showDialog(anchor: View) {

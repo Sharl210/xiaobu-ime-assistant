@@ -87,16 +87,22 @@ internal object SymbolPageRedirect {
     @Volatile
     private var entryMethod: Method? = null
 
-    /** 完整符号页对应的键盘类型常量；为 null 时退回原来的"抬档"兜底。 */
-    @Volatile
-    private var symbolsPage: Any? = null
-
     @Volatile
     private var backCount: Int = 0
 
-    /** 第一次真正进到切换方法时记一行，用来证明"钩子确实被调用了"（挂点选错时这一行不会出现）。 */
+    /**
+     * 已记录多少条「切换方法被调用」的观察日志。
+     *
+     * 本版**只观察、不改行为**：1.21.0 曾把参数里的键盘类型换成 `SYMBOLS`，导致宿主
+     * `k0` 走进一条需要 T9 键盘实例的分支，抛出
+     * `lateinit property t9PinYin has not been initialized`，点「符号」直接闪退。
+     * 也就是说宿主不接受从外部把符号键盘换成通用符号页类型。这里退回纯留证。
+     */
     @Volatile
-    private var firstSwitchLogged = false
+    private var switchLogCount: Int = 0
+
+    /** 观察日志上限，避免每次按键刷屏。 */
+    private const val SWITCH_LOG_LIMIT = 20
 
     /** 当前档位字段的可读值，仅用于日志取证。 */
     private fun describeField(target: Any, fields: List<Field>): String =
@@ -131,13 +137,11 @@ internal object SymbolPageRedirect {
         }
         fields.forEach { runCatching { it.isAccessible = true } }
         holderClass = holder
-        symbolsPage = findSymbolsPageType(bridge, hostClassLoader)
         entryMethod = findEntryMethod(bridge, hostClassLoader, holder)
         log(
-            "symbol-page: fullPageType=" + ((symbolsPage as? Enum<*>)?.name ?: "unresolved") +
-                " entryMethod=" + (
-                    entryMethod?.let { "${it.declaringClass.simpleName}#${it.name}" } ?: "unresolved"
-                    )
+            "symbol-page: entryMethod=" + (
+                entryMethod?.let { "${it.declaringClass.simpleName}#${it.name}" } ?: "unresolved"
+                )
         )
 
         // 视图切换方法（1.19.0 就挂错在这里，这次按宿主真实形状挂）：
@@ -180,36 +184,24 @@ internal object SymbolPageRedirect {
                         val keyboardType = param.args?.firstOrNull {
                             it is Enum<*> && it.javaClass != enumClass
                         }
-                        if (!firstSwitchLogged) {
-                            firstSwitchLogged = true
+                        // 1.21.0 的教训（真机崩溃栈，不是推断）：
+                        //   把参数里的键盘类型替换成 SYMBOLS 会让宿主 k0 走进需要 T9 键盘实例的分支，
+                        //   抛 `lateinit property t9PinYin has not been initialized`，点「符号」即闪退。
+                        //   结论：宿主不接受从外部把符号键盘替换成通用符号页类型。
+                        //
+                        // 1.20.0 的教训（真机日志）：
+                        //   改档位字段 SYMBOL1 -> SYMBOL2 确实执行成功（有 promoted 行），但界面仍是简洁页。
+                        //
+                        // 两条合起来说明：这条"从外部改状态"的路走不通。本版**只观察、不改行为**，
+                        // 把宿主行为完整交还（不闪退、返回箭头恢复原样），同时把真实调用链留成证据，
+                        // 供下一轮按证据定位宿主自己那个「更多」按钮到底做了什么。
+                        switchLogCount++
+                        if (switchLogCount <= SWITCH_LOG_LIMIT) {
                             log(
-                                "symbol-page: switch hook fired ${method.declaringClass.simpleName}#" +
+                                "symbol-page: switch observed ${method.declaringClass.simpleName}#" +
                                     "${method.name} args=" + method.parameterTypes.size +
                                     " current=" + describeField(target, fields) +
                                     " target=" + (keyboardType as? Enum<*>)?.name
-                            )
-                        }
-                        // 1.20.0 的教训（来自真机日志，不是推断）：
-                        //   把档位字段 SYMBOL1 -> SYMBOL2 确实执行成功了（日志有 promoted 行），
-                        //   但界面仍是简洁页。原因是"建哪一页"由这个 KeyboardType 参数决定，
-                        //   档位字段只影响按键行为。所以本版直接把目标类型换成完整符号页类型。
-                        val swapped = swapToFullPage(param.args, symbolsPage)
-                        if (swapped) {
-                            log(
-                                "symbol-page: switch target '" + (keyboardType as? Enum<*>)?.name +
-                                    "' -> " + NAME_SYMBOLS_PAGE + " (full page)"
-                            )
-                        } else if (keyboardType is Enum<*> &&
-                            keyboardType.name.contains("SYMBOL", ignoreCase = true)
-                        ) {
-                            // 认得出来是符号类键盘，但完整页类型不可用：退回原来的抬档兜底。
-                            promote(
-                                target,
-                                fields,
-                                simple,
-                                full,
-                                "switch-before[" + keyboardType.name +
-                                    "@" + method.parameterTypes.size + "]",
                             )
                         }
                     }
@@ -231,51 +223,13 @@ internal object SymbolPageRedirect {
     }
 
     /**
-     * 把参数里的「简洁符号键盘类型」换成完整符号页类型。
+     * 已删除：1.21.0 在这里把参数里的「简洁符号键盘类型」替换成通用符号页类型 `SYMBOLS`，
+     * 结果是宿主 `k0` 抛出 `lateinit property t9PinYin has not been initialized`，
+     * 点「符号」当场闪退。本模块不再从外部改写宿主参数。
      *
-     * 只在参数确实是一个名字里含 `SYMBOL` 的键盘类型、且目标类型可用时才换；
-     * 非符号键盘（普通拼音/英文等）一律不碰，因此不会影响日常输入。
+     * 同理也删除了「把档位字段 SYMBOL1 抬成 SYMBOL2」的做法：1.20.0 真机日志证明它执行成功
+     * 但界面不变（`promoted SYMBOL1 -> SYMBOL2` 出现两次，画面仍是简洁页），属于无效且多余的改动。
      */
-    private fun swapToFullPage(args: Array<Any?>?, symbols: Any?): Boolean {
-        if (args == null || symbols == null) return false
-        val typeName = symbols.javaClass.name
-        val index = args.indexOfFirst { it is Enum<*> && it.javaClass.name == typeName }
-        if (index < 0) return false
-        val current = args[index] as? Enum<*> ?: return false
-        if (current === symbols) return false
-        if (!current.name.contains("SYMBOL", ignoreCase = true)) return false
-        args[index] = symbols
-        return true
-    }
-
-    /** 找键盘类型枚举里的完整符号页常量：先按语义串定位枚举类，再点名 `SYMBOLS`。 */
-    private fun findSymbolsPageType(
-        bridge: DexKitBridge,
-        hostClassLoader: ClassLoader,
-    ): Any? {
-        val candidates = runCatching {
-            bridge.findClass {
-                matcher {
-                    usingStrings(listOf(KEYBOARD_TYPE_ANCHOR), StringMatchType.Equals)
-                }
-            }.toList()
-        }.onFailure { log("symbol-page: keyboard type query failed: ${it.message}") }
-            .getOrDefault(emptyList())
-
-        candidates.forEach { data ->
-            val cls = runCatching { data.getInstance(hostClassLoader) }.getOrNull() ?: return@forEach
-            if (!cls.isEnum) return@forEach
-            val names = runCatching { cls.enumConstants.map { (it as Enum<*>).name } }.getOrNull()
-                ?: return@forEach
-            if (!names.contains(KEYBOARD_TYPE_ANCHOR)) return@forEach
-            val full = cls.enumConstants.firstOrNull { (it as Enum<*>).name == NAME_SYMBOLS_PAGE }
-            if (full != null) {
-                log("symbol-page: keyboardType=${cls.name} has $NAME_SYMBOLS_PAGE")
-                return full
-            }
-        }
-        return null
-    }
 
     /**
      * 管理器里的「符号页总入口」方法。

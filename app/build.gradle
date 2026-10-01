@@ -12,8 +12,8 @@ android {
         minSdk 23
         targetSdk 34
         // 版本：1.20.0（versionCode 24）
-        versionCode 25
-        versionName '1.21.0'
+        versionCode 26
+        versionName '1.21.1'
     }
 
     // 本模块自带的签名库（自建，与宿主无关）。如要换成自己的，替换下面四项即可。
