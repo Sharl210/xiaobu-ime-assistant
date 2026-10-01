@@ -107,8 +107,8 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
     // ---------------------------------------------------------------- install
 
     private fun install(apkPath: String, hostClassLoader: ClassLoader) {
-        // 与面板无关的独立功能：引号「成对补全」抑制。
-        // 先于面板解析安装，因此即使面板定位失败，引号行为也照常生效。
+        // 与面板无关的独立功能：成对符号「自动补全」抑制。
+        // 先于面板解析安装，因此即使面板定位失败，符号行为也照常生效。
         runCatching { QuotePairSuppressor.install(hostClassLoader) }
             .onFailure { log("quote-pair install failed: ${it.message}") }
 
@@ -141,6 +141,11 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
             runCatching { QuotePairSuppressor.attachHostImplementations(bridge, hostClassLoader) }
                 .onFailure { log("quote-pair host impl failed: ${it.message}") }
+
+            // 「符号」键直达完整符号页：在旁边把符号分档抬到最高档，
+            // 于是键盘上的「符号」键一按就是完整符号页，不再先落简洁页。
+            runCatching { SymbolPageRedirect.install(bridge, hostClassLoader) }
+                .onFailure { log("symbol-page install failed: ${it.message}") }
 
             val onClick = resolvePanelOnClick(bridge, ids)
             if (onClick == null) {

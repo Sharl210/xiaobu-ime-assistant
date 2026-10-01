@@ -57,21 +57,68 @@ import org.luckypray.dexkit.DexKitBridge
  */
 internal object QuotePairSuppressor {
 
-    /** 左引号 → 与它配对的右引号。中英文各一对（英文左右同形）。 */
+    /**
+     * 左符号 → 配对的右符号。
+     *
+     * 范围按用户要求放到**全量成对符号**：引号、圆括号、方括号、花括号、尖括号，
+     * 以及中文/全角与各语言变体。半角引号左右同形，因此映射到自身。
+     *
+     * 这张表只用于两件事：①识别「一次提交上来的正好是一对」；
+     * ②识别「光标正夹在一对中间」。都不涉及对用户输入的额外改写。
+     */
     private val PAIRS: Map<Char, Char> = mapOf(
-        '\u201C' to '\u201D', // 中文双引号 “ ”
-        '\u2018' to '\u2019', // 中文单引号 ‘ ’
+        // 引号
+        '\u201C' to '\u201D', // “ ”
+        '\u2018' to '\u2019', // ‘ ’
+        '\u201E' to '\u201C', // „ “（德语式低引号）
+        '\u00AB' to '\u00BB', // « »
+        '\u2039' to '\u203A', // ‹ ›
+        '\u201A' to '\u2018', // ‚ ‘
+        '\u300C' to '\u300D', // 「 」
+        '\u300E' to '\u300F', // 『 』
+        '\u301D' to '\u301E', // 〝 〞
         '"' to '"',           // 英文双引号
         '\'' to '\'',         // 英文单引号
+        // 圆括号
+        '(' to ')',
+        '\uFF08' to '\uFF09', // （ ）
+        // 方括号
+        '[' to ']',
+        '\u3010' to '\u3011', // 【 】
+        '\uFF3B' to '\uFF3D', // ［ ］
+        // 花括号
+        '{' to '}',
+        '\uFF5B' to '\uFF5D', // ｛ ｝
+        // 尖括号 / 书名号
+        '<' to '>',
+        '\u3008' to '\u3009', // 〈 〉
+        '\u300A' to '\u300B', // 《 》
+        '\uFF1C' to '\uFF1E', // ＜ ＞
     )
 
     /** 光标两侧都是引号时，两次删除之间的最小间隔，避免同一状态被连续处理。 */
     private const val MIN_INTERVAL_MS = 60L
 
+    /**
+     * 「夹在中间」修正的**有效时间窗**。
+     *
+     * 这是本文件最重要的一道安全闸。原因：`setSelection` 挂在输入连接的每次光标移动上，
+     * 而用户手动把光标点到一段已有文字里的「（）」中间时，光标同样会呈现"被一对符号夹住"
+     * 的状态——若不加限制，就会**误删用户自己的右括号**。
+     *
+     * 因此只有在"刚刚确实有一次成对符号的提交"之后的极短时间内才允许修正：
+     * 那才是宿主自动补全产生的状态；其余时刻一律只观察、不动手。
+     */
+    private const val SANDWICH_WINDOW_MS = 400L
+
     private val main = Handler(Looper.getMainLooper())
 
     @Volatile
     private var lastFixAt: Long = 0L
+
+    /** 最近一次"提交里含成对符号"的时刻；夹缝修正必须发生在这个时刻之后的时间窗内。 */
+    @Volatile
+    private var lastPairCommitAt: Long = 0L
 
     @Volatile
     private var installed = false
@@ -167,12 +214,14 @@ internal object QuotePairSuppressor {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
                     val single = unwrapPair(text) ?: return
                     param.args[0] = single
+                    lastPairCommitAt = System.currentTimeMillis()
                     log("quote-pair: pair commit trimmed to single '" + describe(single[0]) + "'")
                 }
 
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
-                    if (!mentionsQuote(text)) return
+                    if (!mentionsPair(text)) return
+                    lastPairCommitAt = System.currentTimeMillis()
                     inspect(param.thisObject, "commitText")
                 }
             }).size
@@ -180,9 +229,32 @@ internal object QuotePairSuppressor {
             .getOrDefault(0)
 
         count += runCatching {
+            XposedBridge.hookAllMethods(cls, "setComposingText", object : XC_MethodHook() {
+                /**
+                 * 组合文本同样会出现「一次送来一对」的形态（不少输入法把成对符号
+                 * 先作为组合文本推上去，再决定是否提交）。这里做与 commitText 相同的处理。
+                 */
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    val single = unwrapPair(text) ?: return
+                    param.args[0] = single
+                    lastPairCommitAt = System.currentTimeMillis()
+                    log("quote-pair: composing pair trimmed to single '" + describe(single[0]) + "'")
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    if (!mentionsPair(text)) return
+                    lastPairCommitAt = System.currentTimeMillis()
+                }
+            }).size
+        }.onFailure { log("quote-pair: setComposingText hook failed on ${cls.name}: ${it.message}") }
+            .getOrDefault(0)
+
+        count += runCatching {
             XposedBridge.hookAllMethods(cls, "setSelection", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    // setSelection 是高频调用，只有"左右两侧都是引号"这种极窄状态才继续
+                    // setSelection 是高频调用，只有"左右两侧都是成对符号"这种极窄状态才继续
                     check(param.thisObject as? InputConnection)
                 }
             }).size
@@ -205,8 +277,8 @@ internal object QuotePairSuppressor {
         return text.subSequence(0, 1)
     }
 
-    /** 本次提交的文本是否涉及引号（含"一次提交成对"与"提交单个左引号"两种形态）。 */
-    private fun mentionsQuote(text: CharSequence): Boolean {
+    /** 本次提交的文本是否涉及成对符号（含"一次提交成对"与"提交单个左符号"两种形态）。 */
+    private fun mentionsPair(text: CharSequence): Boolean {
         if (text.isEmpty()) return false
         if (text.length > 4) return false
         for (i in 0 until text.length) {
@@ -226,30 +298,36 @@ internal object QuotePairSuppressor {
     }
 
     /**
-     * 检测"光标夹在一对引号中间"并拆掉右引号。
+     * 检测"光标夹在一对符号中间"并拆掉右边那个。
      *
-     * 成功条件必须同时满足，缺一不可：
-     *  1. 光标前恰好一个字符，且它是某个左引号；
-     *  2. 光标后恰好一个字符，且它是该左引号的配对右引号；
-     *  3. 距离上次修正超过 [MIN_INTERVAL_MS]（防止同一状态被重复处理）。
+     * 成功条件必须**同时**满足，缺一不可：
+     * 1. 上一次成对符号提交发生在 [SANDWICH_WINDOW_MS] 之内（这是唯一允许修正的时机，
+     *    否则用户手动把光标点进已有的「（）」中间也会被误删）；
+     * 2. 光标前恰好一个字符，且它是某个左符号；
+     * 3. 光标后恰好一个字符，且它是该左符号的配对右符号；
+     * 4. 距离上次修正超过 [MIN_INTERVAL_MS]。
      *
-     * 任一条不满足即不做任何事——因此不会触碰普通文本。
+     * 任一条不满足即不做任何事——因此不会触碰任何非"刚被补全"的文本。
      */
     private fun check(ic: InputConnection?, source: String = "setSelection") {
         if (ic == null) return
+        val now = System.currentTimeMillis()
+        if (now - lastPairCommitAt > SANDWICH_WINDOW_MS) return
         val before = runCatching { ic.getTextBeforeCursor(1, 0) }.getOrNull() ?: return
         if (before.length != 1) return
         val expected = PAIRS[before[0]] ?: return
         val after = runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull() ?: return
         if (after.length != 1 || after[0] != expected) return
-        if (System.currentTimeMillis() - lastFixAt < MIN_INTERVAL_MS) return
+        if (now - lastFixAt < MIN_INTERVAL_MS) return
 
         val removed = runCatching { ic.deleteSurroundingText(0, 1) }.getOrDefault(false)
         if (removed) {
             lastFixAt = System.currentTimeMillis()
+            // 修正完成即关闭时间窗，避免同一状态被反复处理。
+            lastPairCommitAt = 0L
             fixCount++
             log(
-                "quote-pair: removed auto-inserted closing quote '" + describe(expected) +
+                "quote-pair: removed auto-inserted closing symbol '" + describe(expected) +
                     "' after '" + describe(before[0]) + "' (source=" + source +
                     ", total=" + fixCount + ")"
             )

@@ -66,7 +66,6 @@ internal class ClipSearch(
     private val createInputField: ((android.content.Context) -> EditText)? = null,
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
-    /** 宿主自己的对话框构建器类（`COUIAlertDialogBuilder`）；拿不到时退回浮层。 */
 ) {
     @Volatile
     private var keyword: String? = null
