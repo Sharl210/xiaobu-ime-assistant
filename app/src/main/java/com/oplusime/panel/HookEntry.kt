@@ -54,6 +54,15 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         private const val NAME_PASTE = "btn_paste"
         private const val NAME_DELETE_LAYOUT = "ll_delete"
         private const val NAME_RETURN_LAYOUT = "ll_return"
+
+        /**
+         * 文本编辑面板左上角的返回箭头。
+         *
+         * 取证（宿主 `res/bL.xml` 反编译 + 面板 onClick 的 id 分支）：它是该面板里唯一的返回控件，
+         * 点击落在面板自身 `onClick` 里那条 `resource-id + framework-call` 分支上。
+         * 名字取资源表里的真实名字（`iv_back`），不是 dex 里的属性名。
+         */
+        private const val NAME_BACK_IV = "iv_back"
         private const val NAME_CLIPBOARD_LABEL = "clipboard"
 
         /** 剪贴板计数的格式化串（`%1$d/%2$d`），用于把上限显示改成 ∞。 */
@@ -134,6 +143,8 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             log("resource id resolution incomplete, abort this build")
             return
         }
+        val backId = resolveIdentifier(apkPath, "id", NAME_BACK_IV)
+        log("resolved panel back id=$backId")
         val labelId = resolveIdentifier(apkPath, "string", NAME_CLIPBOARD_LABEL)
         val clipLengthId = resolveIdentifier(apkPath, "string", NAME_CLIP_LENGTH)
         val clipCounterId = resolveIdentifier(apkPath, "id", NAME_CLIP_COUNTER)
@@ -290,6 +301,15 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                             panelIds = ids,
                             panel = param.thisObject as? View,
                         )
+                        // 文本编辑面板的返回箭头（iv_back）：宿主只做「隐藏当前容器」，
+                        // 用户实测按完之后输入法一路退了出去。这里等宿主动作落地，再借宿主
+                        // 自己的「重置键盘」入口把键盘恢复成主键盘页 —— 即「返回 = 回键盘主页面」。
+                        if (backId != 0 && clicked.id == backId) {
+                            clicked.postDelayed({
+                                log("panel back tapped -> restoring main keyboard")
+                                SymbolPageRedirect.backToMainKeyboard()
+                            }, 180L)
+                        }
                     }
                 })
                 log("panel onClick hooked for conditional close: ${onClickMethod.declaringClass.name}")

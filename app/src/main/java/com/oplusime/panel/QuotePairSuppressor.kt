@@ -149,6 +149,20 @@ internal object QuotePairSuppressor {
     private var lastObservedText: String = ""
 
     /**
+     * `InputConnection` 提交留证用的字段。
+     *
+     * 1.20.0 的真机日志里，三条成对符号分支（源头拦截 / 事后删除 / 引擎回调）**一条都没出现**，
+     * 说明我们这个版本的钩子根本没走到用户那条路径上。因此本版对「短文本提交」一律留证
+     * （节流 150ms、相同文本跳过），下一轮就能直接看到引号到底是走 commitText、
+     * setComposingText 还是纯 native 通道。
+     */
+    @Volatile
+    private var lastCommitTraceAt: Long = 0L
+
+    @Volatile
+    private var lastCommitTraceText: String = ""
+
+    /**
      * 在宿主进程内安装。输入法进程里承载编辑框调用的代理类可能不止一个名字，
      * 逐个尝试，命中即装；全部不可用时如实记日志（功能退化为原生行为，不会崩）。
      */
@@ -432,19 +446,24 @@ internal object QuotePairSuppressor {
      * 由 [check] 的时间窗负责拆掉。
      */
     private fun observeEngineCommit(text: String, source: String) {
-        if (!mentionsPair(text)) return
-        val now = System.currentTimeMillis()
-        if (now - lastObserveAt < 200L && text == lastObservedText) return
-        lastObserveAt = now
-        lastObservedText = text
-        log(
-            "quote-pair: engine commit text='" +
-                text.map { describe(it) }.joinToString("") +
-                "' len=" + text.length + " source=" + source
-        )
+        // 诊断口径：短文本（符号、单字）一律留证；长文本只在确实含成对符号时记录。
+        // 这是为了在不刷屏的前提下，把"引号究竟从哪条链提交"这件事钉死。
+        val interesting = text.length <= 4 || mentionsPair(text)
+        if (interesting) {
+            val now = System.currentTimeMillis()
+            if (now - lastObserveAt >= 150L || text != lastObservedText) {
+                lastObserveAt = now
+                lastObservedText = text
+                log(
+                    "quote-pair: engine commit text='" +
+                        text.map { describe(it) }.joinToString("") +
+                        "' len=" + text.length + " source=" + source
+                )
+            }
+        }
         if (text.length == 1 && PAIRS.containsKey(text[0])) {
             // 单个左符号提交同样是"刚发生一次成对符号动作"，要打开修正时间窗。
-            lastPairCommitAt = now
+            lastPairCommitAt = System.currentTimeMillis()
         }
     }
 
@@ -473,6 +492,7 @@ internal object QuotePairSuppressor {
                  */
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    traceCommit(text, cls.simpleName + ".commitText")
                     // 形态零（本版新增，也是 1.19.0 真机失败的直接原因）：
                     // 上一拍刚落下一个左符号，紧接着又送来"正好配对"的右符号 —— 这就是宿主/引擎
                     // 的自动补全**第二步**。1.19.0 只做事后删除，而删除发生在它之后又被它补回，
@@ -508,6 +528,7 @@ internal object QuotePairSuppressor {
                  */
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    traceCommit(text, cls.simpleName + ".setComposingText")
                     val single = unwrapPair(text) ?: return
                     param.args[0] = single
                     lastPairCommitAt = System.currentTimeMillis()
@@ -547,6 +568,29 @@ internal object QuotePairSuppressor {
         val right = PAIRS[text[0]] ?: return null
         if (text[1] != right) return null
         return text.subSequence(0, 1)
+    }
+
+    /**
+     * 短文本提交留证。
+     *
+     * 只记录长度 ≤ 4 的提交（符号、单字），并做 150ms + 相同文本去重，避免刷屏。
+     * 这一行是下一轮的判据：
+     *  - 点一次前引号若出现两行（先 `“` 后 `”`），说明配对发生在提交之后；
+     *  - 若出现一行 `len=2`，说明配对发生在键位表里；
+     *  - 若**一行都没有**，说明这条链根本没参与，配对完全在 native 侧完成。
+     */
+    private fun traceCommit(text: CharSequence, source: String) {
+        if (text.isEmpty() || text.length > 4) return
+        val now = System.currentTimeMillis()
+        val asString = text.toString()
+        if (now - lastCommitTraceAt < 150L && asString == lastCommitTraceText) return
+        lastCommitTraceAt = now
+        lastCommitTraceText = asString
+        log(
+            "quote-pair: commit '" +
+                text.map { describe(it) }.joinToString("") +
+                "' len=" + text.length + " via=" + source
+        )
     }
 
     /** 记录"刚刚单独提交了一个成对左符号"，为下一步的自动补全判定留下依据。 */

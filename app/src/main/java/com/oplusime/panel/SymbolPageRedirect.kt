@@ -5,6 +5,7 @@ import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.query.enums.StringMatchType
 import java.lang.reflect.Field
+import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
 /**
@@ -59,8 +60,39 @@ internal object SymbolPageRedirect {
     /** `h0` 内部独有的日志串，用来在不写死类名的前提下定位输入法管理器。 */
     private const val HOLDER_ANCHOR = "show symbol view shown "
 
+    /**
+     * 完整符号页（纯符号列表页）对应的键盘类型常量名。
+     *
+     * 取证（宿主 dex 的 KeyboardType 枚举）：所有具体键盘类型都成对出现且一律叫
+     * `QWERTY_XXX_SYMBOL`（拼音/英文/注音/仓颉/蒙/藏/维……），而通用的完整符号页只有
+     * 一个独立常量 `SYMBOLS`，且全包内**没有任何代码**把符号档位字段写成 SYMBOL2。
+     * 这两点合起来说明：决定"建哪一页"的是这个键盘类型参数，不是档位字段。
+     */
+    private const val NAME_SYMBOLS_PAGE = "SYMBOLS"
+
+    /** 用来定位键盘类型枚举的语义串（是一个具体键盘类型的名字，不是类名）。 */
+    private const val KEYBOARD_TYPE_ANCHOR = "QWERTY_PINYIN_SYMBOL"
+
     @Volatile
     private var promoteCount: Int = 0
+
+    /** 输入法管理器类与其单例实例，供「返回 = 回主键盘」调用。 */
+    @Volatile
+    private var holderClass: Class<*>? = null
+
+    @Volatile
+    private var holderInstance: Any? = null
+
+    /** 管理器里的「符号页总入口」方法（`h0`），宿主 IInputApi.resetKeyboard() 走的就是它。 */
+    @Volatile
+    private var entryMethod: Method? = null
+
+    /** 完整符号页对应的键盘类型常量；为 null 时退回原来的"抬档"兜底。 */
+    @Volatile
+    private var symbolsPage: Any? = null
+
+    @Volatile
+    private var backCount: Int = 0
 
     /** 第一次真正进到切换方法时记一行，用来证明"钩子确实被调用了"（挂点选错时这一行不会出现）。 */
     @Volatile
@@ -98,6 +130,15 @@ internal object SymbolPageRedirect {
             return
         }
         fields.forEach { runCatching { it.isAccessible = true } }
+        holderClass = holder
+        symbolsPage = findSymbolsPageType(bridge, hostClassLoader)
+        entryMethod = findEntryMethod(bridge, hostClassLoader, holder)
+        log(
+            "symbol-page: fullPageType=" + ((symbolsPage as? Enum<*>)?.name ?: "unresolved") +
+                " entryMethod=" + (
+                    entryMethod?.let { "${it.declaringClass.simpleName}#${it.name}" } ?: "unresolved"
+                    )
+        )
 
         // 视图切换方法（1.19.0 就挂错在这里，这次按宿主真实形状挂）：
         //
@@ -136,26 +177,41 @@ internal object SymbolPageRedirect {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val target = param.args?.getOrNull(0) ?: return
+                        val keyboardType = param.args?.firstOrNull {
+                            it is Enum<*> && it.javaClass != enumClass
+                        }
                         if (!firstSwitchLogged) {
                             firstSwitchLogged = true
                             log(
                                 "symbol-page: switch hook fired ${method.declaringClass.simpleName}#" +
                                     "${method.name} args=" + method.parameterTypes.size +
-                                    " current=" + describeField(target, fields)
+                                    " current=" + describeField(target, fields) +
+                                    " target=" + (keyboardType as? Enum<*>)?.name
                             )
                         }
-                        val keyboardType = param.args?.firstOrNull {
-                            it is Enum<*> && it.javaClass != enumClass
+                        // 1.20.0 的教训（来自真机日志，不是推断）：
+                        //   把档位字段 SYMBOL1 -> SYMBOL2 确实执行成功了（日志有 promoted 行），
+                        //   但界面仍是简洁页。原因是"建哪一页"由这个 KeyboardType 参数决定，
+                        //   档位字段只影响按键行为。所以本版直接把目标类型换成完整符号页类型。
+                        val swapped = swapToFullPage(param.args, symbolsPage)
+                        if (swapped) {
+                            log(
+                                "symbol-page: switch target '" + (keyboardType as? Enum<*>)?.name +
+                                    "' -> " + NAME_SYMBOLS_PAGE + " (full page)"
+                            )
+                        } else if (keyboardType is Enum<*> &&
+                            keyboardType.name.contains("SYMBOL", ignoreCase = true)
+                        ) {
+                            // 认得出来是符号类键盘，但完整页类型不可用：退回原来的抬档兜底。
+                            promote(
+                                target,
+                                fields,
+                                simple,
+                                full,
+                                "switch-before[" + keyboardType.name +
+                                    "@" + method.parameterTypes.size + "]",
+                            )
                         }
-                        // h0 刚刚写下 SYMBOL1；在这里抬到 SYMBOL2，本次切换就建完整页。
-                        promote(
-                            target,
-                            fields,
-                            simple,
-                            full,
-                            "switch-before[" + (keyboardType as? Enum<*>)?.name +
-                                "@" + method.parameterTypes.size + "]",
-                        )
                     }
                 })
                 hooked++
@@ -172,6 +228,114 @@ internal object SymbolPageRedirect {
             "symbol-page: installed holder=${holder.name} fields=${fields.size}" +
                 " switches=${switches.size}(5arg=${fiveArg.size},3arg=${threeArg.size}) hooks=$hooked"
         )
+    }
+
+    /**
+     * 把参数里的「简洁符号键盘类型」换成完整符号页类型。
+     *
+     * 只在参数确实是一个名字里含 `SYMBOL` 的键盘类型、且目标类型可用时才换；
+     * 非符号键盘（普通拼音/英文等）一律不碰，因此不会影响日常输入。
+     */
+    private fun swapToFullPage(args: Array<Any?>?, symbols: Any?): Boolean {
+        if (args == null || symbols == null) return false
+        val typeName = symbols.javaClass.name
+        val index = args.indexOfFirst { it is Enum<*> && it.javaClass.name == typeName }
+        if (index < 0) return false
+        val current = args[index] as? Enum<*> ?: return false
+        if (current === symbols) return false
+        if (!current.name.contains("SYMBOL", ignoreCase = true)) return false
+        args[index] = symbols
+        return true
+    }
+
+    /** 找键盘类型枚举里的完整符号页常量：先按语义串定位枚举类，再点名 `SYMBOLS`。 */
+    private fun findSymbolsPageType(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+    ): Any? {
+        val candidates = runCatching {
+            bridge.findClass {
+                matcher {
+                    usingStrings(listOf(KEYBOARD_TYPE_ANCHOR), StringMatchType.Equals)
+                }
+            }.toList()
+        }.onFailure { log("symbol-page: keyboard type query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+
+        candidates.forEach { data ->
+            val cls = runCatching { data.getInstance(hostClassLoader) }.getOrNull() ?: return@forEach
+            if (!cls.isEnum) return@forEach
+            val names = runCatching { cls.enumConstants.map { (it as Enum<*>).name } }.getOrNull()
+                ?: return@forEach
+            if (!names.contains(KEYBOARD_TYPE_ANCHOR)) return@forEach
+            val full = cls.enumConstants.firstOrNull { (it as Enum<*>).name == NAME_SYMBOLS_PAGE }
+            if (full != null) {
+                log("symbol-page: keyboardType=${cls.name} has $NAME_SYMBOLS_PAGE")
+                return full
+            }
+        }
+        return null
+    }
+
+    /**
+     * 管理器里的「符号页总入口」方法。
+     *
+     * 判据是它内部那句独有日志串 `show symbol view shown `（同一个锚点已经用来定位过宿主类），
+     * 加上签名 `(boolean) -> void` 与声明类一致。宿主自己的 `IInputApi.resetKeyboard()`
+     * 实现就是调用这个方法（传入 false），因此这里可以安全地借它做「回主键盘」。
+     */
+    private fun findEntryMethod(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+        holder: Class<*>,
+    ): Method? {
+        val candidates = runCatching {
+            bridge.findMethod {
+                matcher {
+                    usingStrings(listOf(HOLDER_ANCHOR), StringMatchType.Equals)
+                    paramCount(1)
+                    paramTypes("boolean")
+                    returnType("void")
+                }
+            }.toList()
+        }.onFailure { log("symbol-page: entry query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+
+        candidates.forEach { data ->
+            val method = runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            if (method.declaringClass == holder) return method
+        }
+        return null
+    }
+
+    /**
+     * 「返回 = 回输入法主键盘」。
+     *
+     * 宿主文本编辑面板左上角的返回箭头（`iv_back`）只做「隐藏当前容器」；用户实测按完之后
+     * 输入法一路退了出去，而不是回到键盘主页面。这里在宿主动作完成后，借宿主自己的
+     * 「重置键盘」入口（`h0(false)`，也就是 `IInputApi.resetKeyboard()` 的实现）把键盘恢复成主键盘页。
+     *
+     * 全程留证：调用成功与失败都会写日志，便于下一轮直接核对。
+     */
+    fun backToMainKeyboard() {
+        val holder = holderClass
+        val method = entryMethod
+        if (holder == null || method == null) {
+            log("symbol-page: back ignored (holder/entry unresolved)")
+            return
+        }
+        val instance = holderInstance ?: Reflect.selfSingleton(holder)?.also { holderInstance = it }
+        if (instance == null) {
+            log("symbol-page: back ignored (holder instance unresolved)")
+            return
+        }
+        runCatching {
+            method.isAccessible = true
+            method.invoke(instance, false)
+            backCount++
+            log("symbol-page: back -> host keyboard reset invoked (total=$backCount)")
+        }.onFailure { log("symbol-page: back reset failed: ${it.message}") }
     }
 
     /** 档位只从「简洁页」抬到「完整页」；其余取值原样放行。 */
