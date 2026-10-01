@@ -1,6 +1,5 @@
 package com.oplusime.panel
 
-import android.app.Dialog
 import android.content.Context
 import android.content.res.AssetManager
 import android.content.res.Configuration
@@ -202,7 +201,6 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     }
                 },
                 registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
-                dialogBuilderClass = resolveDialogBuilderClass(bridge, hostClassLoader),
             )
             if (clipCounterId != 0) {
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
@@ -296,43 +294,6 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             } ?: return@runCatching null
             ctor.newInstance(context) as? TextView
         }.getOrNull()
-    }
-
-    /**
-     * 宿主自己的对话框构建器（本版是 `COUIAlertDialogBuilder`）。
-     *
-     * 为什么必须用它、而不是自己造一个 Dialog：宿主自己的输入弹窗
-     * （`input/view/body/D;->q`）走的是「把 IME 的 window token 交给对话框 + 声明为附加对话框 +
-     * 设置内部焦点」这条链，只有同族的对话框才会带 `setBlurBackgroundDrawable` 这类配套能力，
-     * 也才能和输入法的窗口体系对齐。这里按**方法形状**定位，不写死类名：
-     * 「名字叫 setBlurBackgroundDrawable、参数是 boolean、返回自身」的方法，其声明类即目标。
-     */
-    private fun resolveDialogBuilderClass(
-        bridge: DexKitBridge,
-        hostClassLoader: ClassLoader,
-    ): Class<*>? {
-        val candidates = findMethods(bridge, "dialog-builder") {
-            matcher {
-                name("setBlurBackgroundDrawable")
-                paramTypes("boolean")
-            }
-        }
-        val cls = candidates
-            .mapNotNull { runCatching { it.declaredClass?.getInstance(hostClassLoader) }.getOrNull() }
-            .distinct()
-            .firstOrNull { builder ->
-                // 必须真的能 create() 出一个 Dialog，否则不是我们要的构建器。
-                runCatching {
-                    val create = builder.getMethod("create")
-                    Dialog::class.java.isAssignableFrom(create.returnType)
-                }.getOrDefault(false)
-            }
-        if (cls == null) {
-            log("dialog-builder: unresolved; search dialog falls back to popup")
-        } else {
-            log("dialog-builder: selected ${cls.name}")
-        }
-        return cls
     }
 
     /**

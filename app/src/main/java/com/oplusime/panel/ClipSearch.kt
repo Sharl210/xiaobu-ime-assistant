@@ -1,10 +1,7 @@
 package com.oplusime.panel
 
-import android.app.Dialog
 import android.content.Context
-import android.content.DialogInterface
 import android.graphics.Color
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
@@ -70,7 +67,6 @@ internal class ClipSearch(
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
     /** 宿主自己的对话框构建器类（`COUIAlertDialogBuilder`）；拿不到时退回浮层。 */
-    private val dialogBuilderClass: Class<*>? = null,
 ) {
     @Volatile
     private var keyword: String? = null
@@ -82,6 +78,14 @@ internal class ClipSearch(
     /** 面板 → 我们新建的搜索按钮。 */
     private val buttons: MutableMap<ViewGroup, View> =
         Collections.synchronizedMap(WeakHashMap())
+
+    /** 面板 → 我们放在**输入法窗口内部**的「搜索输入页」。 */
+    private val searchCards: MutableMap<ViewGroup, View> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    /** 当前搜索输入页里的输入框（用于注册宿主内部焦点）。 */
+    @Volatile
+    private var activeField: EditText? = null
 
     // ------------------------------------------------------------------ UI
 
@@ -253,7 +257,7 @@ internal class ClipSearch(
     // -------------------------------------------------------------- 搜索开关与弹窗
 
     /**
-     * 点一次：弹出搜索框（仿宿主的「添加常用语」弹窗形态）。
+     * 点一次：在输入法窗口内部显示搜索输入页（见 [showInputInIme]）。
      * 再点一次：退出搜索，恢复全部条目，按钮回到未激活样式。
      */
     private fun onButtonClicked(anchor: View) {
@@ -267,115 +271,160 @@ internal class ClipSearch(
     }
 
     /**
-     * 搜索弹窗。
+     * 搜索输入页。
      *
-     * **必须是真正的 Dialog，而且必须是宿主那种 Dialog。** 原因（宿主自己的代码就是答案）：
+     * **关键：输入框不能是"压在输入法上面的另一个窗口"，而必须长在输入法窗口内部。**
      *
-     * 输入法进程本身就是输入源，普通窗口在 IME 里拿不到键盘输入。宿主自己那些带输入框的弹窗
-     * （`input/view/body/D;->q(String, Function0)`）是这么做的：
+     * 原因（用户实测 + 宿主代码双重印证）：
      *
-     * ```text
-     * COUIAlertDialogBuilder(context).setTitle(...)
-     *   .setBlurBackgroundDrawable(true)
-     *   .create()
-     * dialog.window.attributes.token = <IME 自己的 windowToken>   ← 关键一
-     * dialog.window.attributes.type  = 0x3eb (TYPE_APPLICATION_ATTACHED_DIALOG)  ← 关键二
-     * dialog.window.addFlags(0x20002)  // FLAG_DIM_BEHIND | FLAG_ALT_FOCUSABLE_IM  ← 关键三
-     * dialog.show()
-     * ```
+     * - 输入法进程自己就是输入源。任何"叠在输入法窗口之上"的窗口（PopupWindow，或
+     *   `type=0x3eb` 的附加 Dialog）都会把输入法窗口压在下面——输入法自己就是那个要弹出来的东西，
+     *   它没法再在自己头上弹一次，于是键盘不出来，光标点上去也没反应。
+     * - 宿主的做法是另一种：把带输入框的界面做成**输入法窗口内部的普通 View**（例如「添加常用语」
+     *   那一整页），再调用它自己的内部焦点切换
+     *   （`input/manager/h;->l(EditText, boolean)` → `switchInternalFocus`），
+     *   让 IME 的按键事件直接进到这个 EditText 上。这也是宿主自己的常用语编辑框能打字的原因。
      *
-     * 把 IME 自己的 window token 交给弹窗、并声明成「附加在输入法窗口上的对话框」，
-     * 弹窗才真正活在输入法的窗口体系里；再配合宿主自己的「内部焦点」机制
-     * （`input/manager/h;->l(EditText, boolean)`，宿主自己的常用语编辑框用的就是它），
-     * 键盘敲的字才会进到弹窗的输入框里。
+     * 因此本版完全照这条走：
      *
-     * 早期版本用的是 `PopupWindow`：那只是个挂在当前窗口上的浮层，既没有自己的 window token，
-     * 也不参与输入法的窗口层级，所以**永远收不到键盘输入**——这就是"弹窗里打不了字"的根因。
+     * 1. 在面板所在的容器里放一张**输入法窗口内部的**白色卡片（标题 + 输入框 + 取消/搜索）；
+     * 2. 输入框用宿主自己的编辑框类，并交给宿主的内部焦点切换；
+     * 3. 键盘本来就是输入法窗口的一部分，它一直在下面，卡片不会把它盖住。
      */
     private fun showInput(anchor: View) {
-        if (showHostStyleDialog(anchor)) return
+        if (showInputInIme(anchor)) return
         showPopupFallback(anchor)
     }
 
-    /** 宿主同款 Dialog：取不到宿主 Dialog 类时返回 false，由 [showPopupFallback] 兜底。 */
-    private fun showHostStyleDialog(anchor: View): Boolean {
-        val cls = dialogBuilderClass ?: return false
-        return runCatching {
-            val context = anchor.context
-            val density = context.resources.displayMetrics.density
-            val field = createInputField?.invoke(context) ?: EditText(context)
-            field.hint = "输入要搜索的关键字"
-            field.setSingleLine()
-            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            field.setText(keyword ?: "")
-            field.setPadding(
-                (10 * density).toInt(), (14 * density).toInt(),
-                (10 * density).toInt(), (14 * density).toInt(),
-            )
-
-            val builder = cls.getConstructor(Context::class.java).newInstance(context)
-            cls.getMethod("setTitle", CharSequence::class.java).invoke(builder, "搜索")
-            cls.getMethod("setView", View::class.java).invoke(builder, field)
-            cls.getMethod(
-                "setNegativeButton",
-                CharSequence::class.java,
-                DialogInterface.OnClickListener::class.java,
-            ).invoke(builder, "取消", null)
-            cls.getMethod(
-                "setPositiveButton",
-                CharSequence::class.java,
-                DialogInterface.OnClickListener::class.java,
-            ).invoke(
-                builder,
-                "搜索",
-                DialogInterface.OnClickListener { _, _ ->
-                    applyKeyword(field.text?.toString().orEmpty())
-                    applyActiveStyle(anchor)
-                },
-            )
-            runCatching {
-                cls.getMethod("setBlurBackgroundDrawable", Boolean::class.javaPrimitiveType)
-                    .invoke(builder, true)
-            }
-
-            val dialog = cls.getMethod("create").invoke(builder) as? Dialog
-                ?: error("create() did not return a Dialog")
-            dialog.setCancelable(true)
-            attachToImeWindow(dialog, anchor)
-            dialog.setOnShowListener {
-                field.requestFocus()
-                field.setSelection(field.text?.length ?: 0)
-                val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
-                    .getOrDefault(false)
-                log(
-                    "clip-search: host dialog shown, input-registered=$registered" +
-                        " token=${anchor.windowToken != null}"
-                )
-            }
-            dialog.show()
-            true
-        }.getOrElse {
-            log("clip-search: host dialog failed: ${it.message}")
-            false
-        }
-    }
-
     /**
-     * 把弹窗挂到输入法自己的窗口上：token 取当前视图的 window token，
-     * 窗口类型声明为「附加对话框」，并加上 `FLAG_ALT_FOCUSABLE_IM`
-     * （与宿主 `D.q` 的做法逐条一致）。
+     * 在输入法窗口内部显示搜索卡片。取不到合适容器时返回 false，由 [showPopupFallback] 兜底。
      */
-    private fun attachToImeWindow(dialog: Dialog, anchor: View) {
-        runCatching {
-            val window = dialog.window ?: return
-            val attrs = window.attributes
-            attrs.token = anchor.windowToken
-            attrs.type = TYPE_APPLICATION_ATTACHED_DIALOG
-            window.attributes = attrs
-            window.addFlags(FLAG_DIM_BEHIND or FLAG_ALT_FOCUSABLE_IM)
-            window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            window.setDimAmount(0.3f)
-        }.onFailure { log("clip-search: attach dialog to ime window failed: ${it.message}") }
+    private fun showInputInIme(anchor: View): Boolean = runCatching {
+        val context = anchor.context
+        val density = context.resources.displayMetrics.density
+        val container = (anchor.parent as? ViewGroup) ?: return@runCatching false
+
+        // 先把上一次留下的卡片清掉，避免重复点出多张。
+        searchCards.remove(container)?.let { runCatching { container.removeView(it) } }
+
+        val field = createInputField?.invoke(context) ?: EditText(context)
+        field.hint = "输入要搜索的关键字"
+        field.setSingleLine()
+        field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        field.setText(keyword ?: "")
+        field.setPadding(
+            (10 * density).toInt(), (14 * density).toInt(),
+            (10 * density).toInt(), (14 * density).toInt(),
+        )
+
+        val title = TextView(context).apply {
+            text = "搜索"
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTextColor(INACTIVE_FG)
+        }
+        val cancel = TextView(context).apply {
+            text = "取消"
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(INACTIVE_FG)
+            isClickable = true
+            setPadding(
+                (12 * density).toInt(), (12 * density).toInt(),
+                (12 * density).toInt(), (12 * density).toInt(),
+            )
+        }
+        val confirm = TextView(context).apply {
+            text = "搜索"
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(ACTIVE_FG)
+            isClickable = true
+            setPadding(
+                (12 * density).toInt(), (12 * density).toInt(),
+                (12 * density).toInt(), (12 * density).toInt(),
+            )
+        }
+        val actions = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(
+                cancel,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            addView(
+                confirm,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            )
+        }
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                (16 * density).toInt(), (16 * density).toInt(),
+                (16 * density).toInt(), (12 * density).toInt(),
+            )
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(Color.WHITE)
+                cornerRadius = 16 * density
+            }
+            addView(title)
+            addView(
+                field,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).also { it.topMargin = (14 * density).toInt() },
+            )
+            addView(
+                actions,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).also { it.topMargin = (8 * density).toInt() },
+            )
+        }
+
+        // 卡片平铺在容器上（和面板同层、同尺寸），键盘依旧在下面。
+        val params = (anchor.layoutParams?.javaClass
+            ?.getConstructor(Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            ?.newInstance(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ) as? ViewGroup.LayoutParams)
+            ?: ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+        container.addView(card, params)
+        searchCards[container] = card
+        activeField = field
+
+        confirm.setOnClickListener {
+            applyKeyword(field.text?.toString().orEmpty())
+            applyActiveStyle(anchor)
+            runCatching { container.removeView(card) }
+            searchCards.remove(container)
+            activeField = null
+        }
+        cancel.setOnClickListener {
+            runCatching { container.removeView(card) }
+            searchCards.remove(container)
+            activeField = null
+        }
+
+        field.requestFocus()
+        field.setSelection(field.text?.length ?: 0)
+        val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
+            .getOrDefault(false)
+        log(
+            "clip-search: search card shown in ime window, input-registered=$registered" +
+                " container=${container.javaClass.name}"
+        )
+        true
+    }.getOrElse {
+        log("clip-search: in-ime search card failed: ${it.message}")
+        false
     }
 
     /** 宿主 Dialog 类拿不到时的兜底：功能受限（键盘输入可能进不来），但至少能看能选。 */
@@ -676,15 +725,6 @@ internal class ClipSearch(
 
         /** 行级过滤用来暂存「原始行高」的 tag key。 */
         val ROW_HEIGHT_TAG: Int = "oplusime_panel_row_height".hashCode()
-
-        /** `WindowManager.LayoutParams.TYPE_APPLICATION_ATTACHED_DIALOG`（宿主 `D.q` 用的值）。 */
-        const val TYPE_APPLICATION_ATTACHED_DIALOG = 0x3eb
-
-        /** `WindowManager.LayoutParams.FLAG_DIM_BEHIND`。 */
-        const val FLAG_DIM_BEHIND = 0x2
-
-        /** `WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM`（宿主 `D.q` 加的 0x20002 里的一位）。 */
-        const val FLAG_ALT_FOCUSABLE_IM = 0x20000
 
         /** 搜索未激活：白底黑字。 */
         val INACTIVE_FG: Int = Color.parseColor("#E5000000")
