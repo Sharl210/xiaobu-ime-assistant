@@ -13,9 +13,9 @@ set -euo pipefail
 
 OWNER="${1:-}"
 REPO="${2:-OplusImePanel}"
-VERSION="1.6.0"
+VERSION="1.17.0"
 TAG="v${VERSION}"
-APK="/workspace/dist-oplusime-panel/OplusImePanel-${VERSION}-release.apk"
+APK="/workspace/OplusImePanel/app/build/outputs/apk/release/app-release.apk"
 NOTES="/workspace/OplusImePanel/RELEASE_NOTES_${VERSION}.md"
 SRC="/workspace/OplusImePanel"
 

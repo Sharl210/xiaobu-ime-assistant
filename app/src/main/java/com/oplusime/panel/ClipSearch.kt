@@ -1,15 +1,19 @@
 package com.oplusime.panel
 
 import android.content.Context
+import android.content.DialogInterface
+import android.app.Dialog
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.PopupWindow
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -56,9 +60,14 @@ import java.util.WeakHashMap
  * 搜索仍然可用。
  */
 internal class ClipSearch(
-    /** 计数控件（`tv_clip_count`），即 “n/∞” 那一行；按钮与它垂直居中对齐。 */
+    /** 剪贴板页计数控件（`tv_clip_count`）。 */
     private val counterId: Int,
+    /** 常用语页计数控件（`tv_phrase_count`）。 */
+    private val phraseCounterId: Int,
+    /** 剪贴板列表（`rv_clipboard`）。 */
     private val listId: Int,
+    /** 常用语列表（`rv_phrase_directory`）。 */
+    private val phraseListId: Int,
     private val label: String,
     /** 创建宿主同款控件（拿不到时退回普通 TextView）。 */
     private val createViewLike: ((View) -> TextView?)? = null,
@@ -67,8 +76,33 @@ internal class ClipSearch(
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
 ) {
+    private enum class Page { CLIPBOARD, PHRASE }
+
     @Volatile
-    private var keyword: String? = null
+    private var currentPage: Page = Page.CLIPBOARD
+
+    @Volatile
+    private var clipboardKeyword: String? = null
+
+    @Volatile
+    private var phraseKeyword: String? = null
+
+    private fun currentKeyword(): String? = when (currentPage) {
+        Page.CLIPBOARD -> clipboardKeyword
+        Page.PHRASE -> phraseKeyword
+    }
+
+    private fun keywordFor(page: Page): String? = when (page) {
+        Page.CLIPBOARD -> clipboardKeyword
+        Page.PHRASE -> phraseKeyword
+    }
+
+    private fun setKeyword(page: Page, value: String?) {
+        when (page) {
+            Page.CLIPBOARD -> clipboardKeyword = value
+            Page.PHRASE -> phraseKeyword = value
+        }
+    }
 
     /** 上一次锚点校验的结果，只在变化时打日志（避免每帧刷屏）。 */
     @Volatile
@@ -78,40 +112,30 @@ internal class ClipSearch(
     private val buttons: MutableMap<ViewGroup, View> =
         Collections.synchronizedMap(WeakHashMap())
 
-    /** 面板 → 我们放在**输入法窗口内部**的「搜索输入页」。 */
-    private val searchCards: MutableMap<ViewGroup, View> =
-        Collections.synchronizedMap(WeakHashMap())
-
-    /** 当前搜索输入页里的输入框（用于注册宿主内部焦点）。 */
-    @Volatile
-    private var activeField: EditText? = null
+    /** 当前活动输入框只由宿主 Dialog 自身持有，不在输入法面板内叠加卡片。 */
 
     // ------------------------------------------------------------------ UI
 
     /** 面板每次排布后调用；按钮只在第一次创建，之后只重申约束。 */
     fun attach(panel: ViewGroup) {
-        val counter = panel.findViewById<View>(counterId) ?: run {
-            log("clip-search: counter 0x${Integer.toHexString(counterId)} not found in panel")
+        val clipCounter = panel.findViewById<View>(counterId)
+        val phraseCounter = panel.findViewById<View>(phraseCounterId)
+        val onClipboardPage = clipCounter?.visibility == View.VISIBLE
+        val onPhrasePage = !onClipboardPage && phraseCounter?.visibility == View.VISIBLE
+        if (!onClipboardPage && !onPhrasePage) {
+            log("clip-search: no searchable page counter visible")
             return
         }
-        // 真正该把按钮加进去的父容器，是**计数控件所在的那个容器**（宿主布局 IB.xml 的根，
-        // 是一个 ConstraintLayout），而不是面板本身。宿主面板类继承自 RelativeLayout，
-        // 把带约束锚点的按钮加到它身上，锚点一个都不生效 → 被摆到 (0,0)，就是左上角那个位置。
+        currentPage = if (onClipboardPage) Page.CLIPBOARD else Page.PHRASE
+        val counter = if (onClipboardPage) clipCounter else phraseCounter
+            ?: return
+        // 按钮必须加入计数控件所在的 ConstraintLayout，而不是宿主面板本身。
         val host = counter.parent as? ViewGroup ?: panel
-        // 宿主用「计数控件是否可见」表达当前是不是剪贴板页（同一个方法里，剪贴板页让计数可见、
-        // 常用语页把它设成 INVISIBLE）。按钮只在剪贴板页显示。
-        val onClipboardPage = counter.visibility == View.VISIBLE
         val existing = buttons[panel]
         if (existing != null && existing.parent === host) {
-            if (onClipboardPage) {
-                // 每次都重申「文字 = 搜索」与锚点：宿主不认识这个控件，但重申一次成本极低，
-                // 且能挡住任何意外的文字覆盖。
-                place(existing, counter)
-                if (existing.visibility != View.VISIBLE) existing.visibility = View.VISIBLE
-                applyActiveStyle(existing)
-            } else if (existing.visibility != View.GONE) {
-                existing.visibility = View.GONE
-            }
+            place(existing, counter)
+            if (existing.visibility != View.VISIBLE) existing.visibility = View.VISIBLE
+            applyActiveStyle(existing)
             return
         }
         val button = createButton(counter) ?: return
@@ -119,12 +143,10 @@ internal class ClipSearch(
         buttons[panel] = button
         place(button, counter)
         applyActiveStyle(button)
-        if (!onClipboardPage) button.visibility = View.GONE
         log(
             "clip-search: button created id=0x" + Integer.toHexString(button.id) +
                 " class=${button.javaClass.name} parent=${host.javaClass.name}" +
-                " anchored to counter=0x" + Integer.toHexString(counterId) +
-                " clipboardPage=$onClipboardPage"
+                " page=$currentPage counter=0x" + Integer.toHexString(counter.id)
         )
     }
 
@@ -250,7 +272,7 @@ internal class ClipSearch(
 
     private fun applyActiveStyle(button: View) {
         val text = button as? TextView ?: return
-        applyButtonStyle(text, active = keyword != null)
+        applyButtonStyle(text, active = currentKeyword() != null)
     }
 
     // -------------------------------------------------------------- 搜索开关与弹窗
@@ -260,7 +282,7 @@ internal class ClipSearch(
      * 再点一次：退出搜索，恢复全部条目，按钮回到未激活样式。
      */
     private fun onButtonClicked(anchor: View) {
-        if (keyword != null) {
+        if (currentKeyword() != null) {
             applyKeyword("")
             applyActiveStyle(anchor)
             log("clip-search: search cleared by second tap")
@@ -291,239 +313,117 @@ internal class ClipSearch(
      * 3. 键盘本来就是输入法窗口的一部分，它一直在下面，卡片不会把它盖住。
      */
     private fun showInput(anchor: View) {
-        if (showInputInIme(anchor)) return
-        showPopupFallback(anchor)
+        showDialog(anchor)
     }
 
-    /**
-     * 在输入法窗口内部显示搜索卡片。取不到合适容器时返回 false，由 [showPopupFallback] 兜底。
-     */
-    private fun showInputInIme(anchor: View): Boolean = runCatching {
-        val context = anchor.context
-        val density = context.resources.displayMetrics.density
-        val container = (anchor.parent as? ViewGroup) ?: return@runCatching false
-
-        // 先把上一次留下的卡片清掉，避免重复点出多张。
-        searchCards.remove(container)?.let { runCatching { container.removeView(it) } }
-
-        val field = createInputField?.invoke(context) ?: EditText(context)
-        field.hint = "输入要搜索的关键字"
-        field.setSingleLine()
-        field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-        field.setText(keyword ?: "")
-        field.setPadding(
-            (10 * density).toInt(), (14 * density).toInt(),
-            (10 * density).toInt(), (14 * density).toInt(),
-        )
-
-        val title = TextView(context).apply {
-            text = "搜索"
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            setTextColor(INACTIVE_FG)
-        }
-        val cancel = TextView(context).apply {
-            text = "取消"
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setTextColor(INACTIVE_FG)
-            isClickable = true
-            setPadding(
-                (12 * density).toInt(), (12 * density).toInt(),
-                (12 * density).toInt(), (12 * density).toInt(),
-            )
-        }
-        val confirm = TextView(context).apply {
-            text = "搜索"
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setTextColor(ACTIVE_FG)
-            isClickable = true
-            setPadding(
-                (12 * density).toInt(), (12 * density).toInt(),
-                (12 * density).toInt(), (12 * density).toInt(),
-            )
-        }
-        val actions = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(
-                cancel,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
-            )
-            addView(
-                confirm,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
-            )
-        }
-        val card = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(
-                (16 * density).toInt(), (16 * density).toInt(),
-                (16 * density).toInt(), (12 * density).toInt(),
-            )
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                setColor(Color.WHITE)
-                cornerRadius = 16 * density
-            }
-            addView(title)
-            addView(
-                field,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).also { it.topMargin = (14 * density).toInt() },
-            )
-            addView(
-                actions,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).also { it.topMargin = (8 * density).toInt() },
-            )
-        }
-
-        // 卡片平铺在容器上（和面板同层、同尺寸），键盘依旧在下面。
-        val params = (anchor.layoutParams?.javaClass
-            ?.getConstructor(Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-            ?.newInstance(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            ) as? ViewGroup.LayoutParams)
-            ?: ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            )
-        container.addView(card, params)
-        searchCards[container] = card
-        activeField = field
-
-        confirm.setOnClickListener {
-            applyKeyword(field.text?.toString().orEmpty())
-            applyActiveStyle(anchor)
-            runCatching { container.removeView(card) }
-            searchCards.remove(container)
-            activeField = null
-        }
-        cancel.setOnClickListener {
-            runCatching { container.removeView(card) }
-            searchCards.remove(container)
-            activeField = null
-        }
-
-        field.requestFocus()
-        field.setSelection(field.text?.length ?: 0)
-        val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
-            .getOrDefault(false)
-        log(
-            "clip-search: search card shown in ime window, input-registered=$registered" +
-                " container=${container.javaClass.name}"
-        )
-        true
-    }.getOrElse {
-        log("clip-search: in-ime search card failed: ${it.message}")
-        false
-    }
-
-    /** 宿主 Dialog 类拿不到时的兜底：功能受限（键盘输入可能进不来），但至少能看能选。 */
-    private fun showPopupFallback(anchor: View) {
+    private fun showDialog(anchor: View) {
         runCatching {
             val context = anchor.context
             val density = context.resources.displayMetrics.density
+            val builderClass = Class.forName("com.coui.appcompat.dialog.COUIAlertDialogBuilder", false, context.classLoader)
+            val builder = builderClass.getConstructor(android.content.Context::class.java).newInstance(context)
             val field = createInputField?.invoke(context) ?: EditText(context)
             field.hint = "输入要搜索的关键字"
-            field.setSingleLine()
-            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            field.setText(keyword ?: "")
-            field.setPaddingRelative(
+            field.isFocusableInTouchMode = true
+            field.setShowSoftInputOnFocus(true)
+            field.setSingleLine(true)
+            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            field.setText(currentKeyword() ?: "")
+            field.setSelectAllOnFocus(false)
+            field.setPadding(
                 (12 * density).toInt(), (10 * density).toInt(),
                 (12 * density).toInt(), (10 * density).toInt(),
             )
 
-            val title = TextView(context).apply {
-                text = "搜索"
-                gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                setTextColor(INACTIVE_FG)
-                layoutParams = LinearLayout.LayoutParams(
-                    0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    1f,
-                )
+            builderClass.getMethod("setTitle", CharSequence::class.java).invoke(builder, "搜索")
+            builderClass.getMethod("setView", View::class.java).invoke(builder, field)
+            builderClass.getMethod("setCancelable", Boolean::class.javaPrimitiveType).invoke(builder, true)
+            runCatching { builderClass.getMethod("setBlurBackgroundDrawable", Boolean::class.javaPrimitiveType).invoke(builder, true) }
+
+            val dialogBox = arrayOfNulls<Dialog>(1)
+            val listenerType = DialogInterface.OnClickListener::class.java
+            val confirm = java.lang.reflect.Proxy.newProxyInstance(
+                listenerType.classLoader,
+                arrayOf(listenerType),
+            ) { _, method, _ ->
+                if (method.name == "onClick") {
+                    applyKeyword(field.text?.toString().orEmpty())
+                    dialogBox[0]?.dismiss()
+                }
+                null
+            } as DialogInterface.OnClickListener
+            val cancel = java.lang.reflect.Proxy.newProxyInstance(
+                listenerType.classLoader,
+                arrayOf(listenerType),
+            ) { _, method, _ ->
+                if (method.name == "onClick") dialogBox[0]?.dismiss()
+                null
+            } as DialogInterface.OnClickListener
+
+            invokeDialogButton(builderClass, builder, "setNeutralButton", "搜索", confirm)
+            invokeDialogButton(builderClass, builder, "setNegativeButton", "取消", cancel)
+
+            val dialog = builderClass.getMethod("create").invoke(builder) as Dialog
+            dialogBox[0] = dialog
+            val window = dialog.window
+            val token = anchor.windowToken ?: error("search anchor has no window token")
+            if (window != null) {
+                val attrs = window.attributes
+                attrs.token = token
+                // 逐字照抄宿主「添加常用语」弹窗 `body/D;->q(String, Function0)`：
+                //   token = 当前输入法窗口的 token，type = 0x3eb，
+                //   addFlags(0x20002) = FLAG_NOT_FOCUSABLE | FLAG_ALT_FOCUSABLE_IM。
+                // 关键是 0x20002：弹窗**不抢焦点**，输入法窗口因此不会被压下去，
+                // 文字改由宿主的内部焦点切换送进输入框（见 registerInputTarget）。
+                attrs.type = 0x3eb
+                window.attributes = attrs
+                window.addFlags(0x20002)
+                window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+                window.setDimAmount(0.3f)
             }
-            val cancel = TextView(context).apply {
-                text = "取消"
-                gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-                setTextColor(INACTIVE_FG)
-                setPadding(
-                    (8 * density).toInt(), (6 * density).toInt(),
-                    (8 * density).toInt(), (6 * density).toInt(),
-                )
-                isClickable = true
-            }
-            val confirm = TextView(context).apply {
-                text = "搜索"
-                gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-                setTextColor(ACTIVE_FG)
-                setPadding(
-                    (8 * density).toInt(), (6 * density).toInt(),
-                    (8 * density).toInt(), (6 * density).toInt(),
-                )
-                isClickable = true
-            }
-            val header = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                addView(cancel)
-                addView(title)
-                addView(confirm)
-            }
-            val card = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(
-                    (14 * density).toInt(), (10 * density).toInt(),
-                    (14 * density).toInt(), (10 * density).toInt(),
-                )
-                addView(header)
-                addView(field)
-            }
-            val popup = PopupWindow(
-                card,
-                (300 * density).toInt(),
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                true,
-            )
-            popup.isOutsideTouchable = true
-            popup.setBackgroundDrawable(
-                GradientDrawable().apply {
-                    setColor(Color.WHITE)
-                    cornerRadius = 16 * density
-                },
-            )
-            confirm.setOnClickListener {
-                applyKeyword(field.text?.toString().orEmpty())
-                applyActiveStyle(anchor)
-                popup.dismiss()
-            }
-            cancel.setOnClickListener { popup.dismiss() }
-            // 放在按钮下方、向上偏移，避免被输入法面板本身遮住。
-            popup.showAsDropDown(anchor, 0, -(anchor.height + (56 * density).toInt()))
+            dialog.show()
+            runCatching { builderClass.getMethod("updateViewAfterShown").invoke(builder) }
             field.requestFocus()
-            val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
-                .getOrDefault(false)
-            log("clip-search: dialog shown, host-input-registered=$registered")
-        }.onFailure { log("clip-search: input dialog failed: ${it.message}") }
+            field.setSelection(field.text?.length ?: 0)
+            val registered = registerInputTarget?.invoke(field) == true
+            field.postDelayed({
+                runCatching {
+                    val imm = context.getSystemService(InputMethodManager::class.java)
+                    imm?.showSoftInput(field, InputMethodManager.SHOW_IMPLICIT)
+                }
+            }, 120L)
+            log("clip-search: host dialog shown, input-registered=$registered windowType=${window?.attributes?.type}")
+        }.onFailure { log("clip-search: host dialog failed: ${it.message}") }
     }
 
+    private fun invokeDialogButton(
+        builderClass: Class<*>,
+        builder: Any,
+        methodName: String,
+        label: String,
+        listener: DialogInterface.OnClickListener,
+    ) {
+        val method = builderClass.methods.firstOrNull {
+            it.name == methodName &&
+                it.parameterTypes.size == 2 &&
+                CharSequence::class.java.isAssignableFrom(it.parameterTypes[0])
+        } ?: builderClass.methods.firstOrNull {
+            it.name == methodName &&
+                it.parameterTypes.size == 2 &&
+                it.parameterTypes[0] == Int::class.javaPrimitiveType
+        } ?: error("$methodName unavailable")
+        val first = if (method.parameterTypes[0] == Int::class.javaPrimitiveType) 0 else label
+        method.invoke(builder, first, listener)
+    }
+
+
     private fun applyKeyword(raw: String) {
+        val page = currentPage
         val next = raw.trim().ifEmpty { null }
-        if (next == keyword) return
-        keyword = next
-        log("clip-search: keyword=${next ?: "<cleared>"}")
-        reloadLists()
+        if (next == keywordFor(page)) return
+        setKeyword(page, next)
+        log("clip-search: page=$page keyword=${next ?: "<cleared>"}")
+        reloadLists(page)
     }
 
     /**
@@ -532,16 +432,17 @@ internal class ClipSearch(
      *  2. 再触发一次重新绑定，让行级过滤对当前已加载的行重算。
      * PagingDataAdapter 禁用了 `notifyDataSetChanged`，只能用 `notifyItemRangeChanged`。
      */
-    private fun reloadLists() {
+    private fun reloadLists(page: Page = currentPage) {
         synchronized(buttons) {
             buttons.keys.forEach { panel ->
-                val recycler = runCatching { panel.findViewById<ViewGroup>(listId) }.getOrNull()
+                val targetId = if (page == Page.CLIPBOARD) listId else phraseListId
+                val recycler = runCatching { panel.findViewById<ViewGroup>(targetId) }.getOrNull()
                     ?: return@forEach
                 val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
                     ?: return@forEach
                 runCatching {
                     adapter.javaClass.getMethod("refresh").invoke(adapter)
-                    log("clip-search: adapter refreshed")
+                    log("clip-search: adapter refreshed page=$page")
                 }.onFailure { log("clip-search: refresh failed: ${it.message}") }
                 runCatching {
                     val count = adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int ?: 0
@@ -579,7 +480,7 @@ internal class ClipSearch(
             runCatching {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val current = keyword ?: return
+                        val current = currentKeyword() ?: return
                         val list = param.result as? List<*> ?: return
                         if (list.isEmpty()) return
                         val filtered = list.filter { matches(it, current) }
@@ -631,7 +532,7 @@ internal class ClipSearch(
                                 .getMethod("getItem", Int::class.javaPrimitiveType)
                                 .invoke(param.thisObject, position)
                         }.getOrNull()
-                        val current = keyword
+                        val current = currentKeyword()
                         applyRowVisibility(view, current == null || matches(item, current))
                     }
                 })

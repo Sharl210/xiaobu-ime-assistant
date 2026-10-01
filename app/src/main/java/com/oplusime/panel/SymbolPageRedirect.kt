@@ -3,7 +3,6 @@ package com.oplusime.panel
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
-import org.luckypray.dexkit.query.FindClass
 import org.luckypray.dexkit.query.enums.StringMatchType
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
@@ -13,40 +12,43 @@ import java.lang.reflect.Modifier
  *
  * ## 取证（com.oplus.keyboard 1.7.38.17-os，全部来自输入法自身 dex）
  *
- * 宿主的符号页由一枚枚举分三档，而**枚举常量名没有被混淆**，本身就是语义串：
+ * 符号页由一枚枚举分三档，常量名没有被混淆，本身就是语义串：
  *
  * ```text
- * SymbolKeyboardType = { NONE_SYMBOL, SYMBOL1, SYMBOL2 }
+ * SymbolKeyboardType = { NONE_SYMBOL, SYMBOL1, SYMBOL2 }   // 字段 a / b / c
  * ```
  *
- * 当前档位挂在输入法管理器的一个实例字段上（`input.manager.l->v`），
- * 由管理器自己的少数几个方法写入：
+ * 档位挂在输入法管理器（`input.manager.l`，混淆名）的一个实例字段上，由管理器自己写入：
  *
  * ```text
- * l->v(KeyboardType, boolean)    普通键盘切符号：写 NONE_SYMBOL，或 isFull 时写 SYMBOL2
- * l->h0(boolean)                 「显示符号页」总入口：分支里写 SYMBOL1 然后切键盘视图
- * l->k0(...)   / l->e0()         换键盘视图时同步写这个字段
+ * h0(boolean shown)                      「显示符号页」总入口：
+ *                                        按当前键盘类型分支，先写 SYMBOL1(简洁页)，
+ *                                        紧接着调用视图切换方法把键盘换成符号键盘
+ * ...;->f0(l, boolean, KeyboardType)     视图切换（静态）：h0 各分支都走它
+ * v(KeyboardType, boolean)               z == true  → 写 SYMBOL2(完整页)，只改档位
+ *                                        z == false → 写 NONE_SYMBOL 并切回键盘
  * ```
  *
- * 宿主的 `IInputApi.showSymbolsView()` 走的是 `l->e0()`（完整符号页那条路）；
- * 而键盘上那个「符号」键走分档那条路，先落在 **`SYMBOL1`（简洁页）**，
- * 要再点页内的「更多」才升到 `SYMBOL2`（完整页）。
+ * 也就是说：**符号键永远先落简洁页**，宿主自己的「更多」才升到完整页。
  *
- * ## 做法
+ * ## 上一版为什么没用
  *
- * 不猜「更多」按钮长什么样，而是**在档位被写下的时刻把它抬到最高档**：
+ * 1.17/1.18 的做法是"在 `h0` 返回之后把档位从 SYMBOL1 改成 SYMBOL2，再调用候选的
+ * 完整页入口 `e0()`"。但 `h0` 是"先档位、后切视图"，等它返回时**简洁页已经建好了**；
+ * 再调一次别的方法，只会让"档位状态"和"当前实际显示的页面"对不上，
+ * 于是出现用户实测的现象：页面还是简洁页，而返回箭头又回不去主键盘。
  *
- * 1. 按枚举常量名（语义串）找到这枚枚举；
- * 2. 按 `h0` 里那句独有的日志串 `"show symbol view shown "` 找到输入法管理器类；
- * 3. 取它上面那个「该枚举类型」的实例字段；
- * 4. 给该类的所有方法挂钩子：**调用前后各查一次**，只把 `SYMBOL1` 改写成 `SYMBOL2`。
+ * ## 这一版的做法
  *
- * 调用**前**也查一次是必要的：宿主是「先写档位、再切键盘视图」，
- * 切视图那一步才知道该建哪一页；在它之前把档位抬上去，建出来的就是完整页。
- * 调用**后**再查一次，用于兜住内部又写回去的情况。
+ * 只拦**视图切换方法之前**这一瞬间，条件是该方法的形状唯一：
  *
- * `NONE_SYMBOL`（非符号页）与本来就是 `SYMBOL2` 的一律不动，因此不影响普通键盘、
- * 也不会把别处顶到符号页。类名、字段名只在日志里作为证据输出，不进查询条件。
+ * ```text
+ * static  void  (管理器自身, boolean, 键盘类型枚举)   // 参数 0 是管理器实例
+ * ```
+ *
+ * 在它执行前把档位从 SYMBOL1 抬到 SYMBOL2，那么这一次切换建出来的就是完整页；
+ * 因为改的是宿主自己的状态字段、走的也是宿主自己的切换流程，档位与实际页面始终一致，
+ * 返回箭头因此不受影响。`NONE_SYMBOL`（回主键盘）与本来就是 `SYMBOL2` 的一律不动。
  */
 internal object SymbolPageRedirect {
 
@@ -54,14 +56,8 @@ internal object SymbolPageRedirect {
     private const val NAME_SIMPLE = "SYMBOL1"
     private const val NAME_FULL = "SYMBOL2"
 
-    /** `l->h0` 内部独有的日志串，用来在不写死类名的前提下定位输入法管理器。 */
+    /** `h0` 内部独有的日志串，用来在不写死类名的前提下定位输入法管理器。 */
     private const val HOLDER_ANCHOR = "show symbol view shown "
-
-    /** 同一状态下的改写间隔下限，避免抖动。 */
-    private const val MIN_INTERVAL_MS = 16L
-
-    @Volatile
-    private var lastPromoteAt: Long = 0L
 
     @Volatile
     private var promoteCount: Int = 0
@@ -93,24 +89,43 @@ internal object SymbolPageRedirect {
         }
         fields.forEach { runCatching { it.isAccessible = true } }
 
+        // 视图切换方法：静态、返回 void、参数是 (管理器自身, boolean, 键盘类型枚举)。
+        // 参数 0 是管理器实例这一点，把它和普通静态工具方法区分开；
+        // 参数 2 是"另一个枚举"（键盘类型），把它和符号档位本身区分开。
+        val switches = holder.declaredMethods.filter { method ->
+            Modifier.isStatic(method.modifiers) &&
+                method.returnType == Void.TYPE &&
+                method.parameterTypes.size == 3 &&
+                method.parameterTypes[0] == holder &&
+                method.parameterTypes[1] == Boolean::class.javaPrimitiveType &&
+                method.parameterTypes[2].isEnum &&
+                method.parameterTypes[2] != enumClass
+        }
+
         var hooked = 0
-        holder.declaredMethods.forEach { method ->
-            if (Modifier.isAbstract(method.modifiers)) return@forEach
+        switches.forEach { method ->
             runCatching {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        promote(param.thisObject, fields, simple, full, "before")
-                    }
-
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        promote(param.thisObject, fields, simple, full, "after")
+                        val target = param.args?.getOrNull(0) ?: return
+                        val keyboardType = param.args?.getOrNull(2) ?: return
+                        // h0 刚刚写下 SYMBOL1；在这里抬到 SYMBOL2，本次切换就建完整页。
+                        promote(
+                            target,
+                            fields,
+                            simple,
+                            full,
+                            "view-switch-before[" + (keyboardType as? Enum<*>)?.name + "]",
+                        )
                     }
                 })
                 hooked++
-            }.onFailure { log("symbol-page: hook failed on ${method.name}: ${it.message}") }
+            }.onFailure { log("symbol-page: view switch hook failed: ${it.message}") }
         }
+
         log(
-            "symbol-page: installed holder=${holder.name} fields=${fields.size} hooks=$hooked"
+            "symbol-page: installed holder=${holder.name} fields=${fields.size}" +
+                " switches=${switches.size} hooks=$hooked"
         )
     }
 
@@ -123,8 +138,6 @@ internal object SymbolPageRedirect {
         phase: String,
     ) {
         if (target == null) return
-        val now = System.currentTimeMillis()
-        if (now - lastPromoteAt < MIN_INTERVAL_MS) return
         fields.forEach { field ->
             val current = runCatching { field.get(target) }.getOrNull() ?: return@forEach
             if (current !== simple) return@forEach
@@ -133,7 +146,6 @@ internal object SymbolPageRedirect {
                 true
             }.getOrDefault(false)
             if (ok) {
-                lastPromoteAt = now
                 promoteCount++
                 log("symbol-page: promoted SYMBOL1 -> SYMBOL2 (phase=$phase total=$promoteCount)")
             }

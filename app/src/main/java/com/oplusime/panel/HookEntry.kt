@@ -70,6 +70,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
          */
         private const val NAME_CLIP_LIST = "rv_clipboard"
 
+        /** 常用语计数与列表资源名，和剪贴板共用同一面板但不是同一数据源。 */
+        private const val NAME_PHRASE_COUNTER = "tv_phrase_count"
+        private const val NAME_PHRASE_LIST = "rv_phrase_directory"
+
         /** 搜索按钮上的两个字。 */
         private const val SEARCH_LABEL = "搜索"
 
@@ -134,13 +138,21 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val clipLengthId = resolveIdentifier(apkPath, "string", NAME_CLIP_LENGTH)
         val clipCounterId = resolveIdentifier(apkPath, "id", NAME_CLIP_COUNTER)
         val clipListId = resolveIdentifier(apkPath, "id", NAME_CLIP_LIST)
-        log("resolved clip_length id=$clipLengthId counter=$clipCounterId list=$clipListId")
+        val phraseCounterId = resolveIdentifier(apkPath, "id", NAME_PHRASE_COUNTER)
+        val phraseListId = resolveIdentifier(apkPath, "id", NAME_PHRASE_LIST)
+        log("resolved clip_length id=$clipLengthId counter=$clipCounterId list=$clipListId phraseCounter=$phraseCounterId phraseList=$phraseListId")
 
         DexKitBridge.create(apkPath).use { bridge ->
             // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
             // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
             runCatching { QuotePairSuppressor.attachHostImplementations(bridge, hostClassLoader) }
                 .onFailure { log("quote-pair host impl failed: ${it.message}") }
+            runCatching { QuotePairSuppressor.attachHostCommitDispatchers(bridge, hostClassLoader) }
+            // native 引擎 → Java 的真正提交汇聚点（引擎回调 + 提交分发器），
+            // 符号键也走这里，因此成对符号必须在这一层拦截才有效。
+            runCatching { QuotePairSuppressor.attachEngineCommit(bridge, hostClassLoader) }
+                .onFailure { log("quote-pair engine commit install failed: ${it.message}") }
+                .onFailure { log("quote-pair dispatcher failed: ${it.message}") }
 
             // 「符号」键直达完整符号页：在旁边把符号分档抬到最高档，
             // 于是键盘上的「符号」键一按就是完整符号页，不再先落简洁页。
@@ -189,7 +201,9 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 上下贴计数控件）。宿主不认识这个控件，就不会再改写它。
             val clipSearch = ClipSearch(
                 counterId = clipCounterId,
+                phraseCounterId = phraseCounterId,
                 listId = clipListId,
+                phraseListId = phraseListId,
                 label = SEARCH_LABEL,
                 createViewLike = { template -> cloneTextView(template) },
                 createInputField = resolveHostEditTextClass(bridge, hostClassLoader)?.let { cls ->
@@ -230,7 +244,27 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                             }
                         },
                     )
-                    log("clip-search: panel constructor hooked ${clipPanelClass.name}")
+                    // 宿主在同一个面板实例内通过“一个 int + 一个 boolean”的页切换方法
+                    // 更新 tv_clip_count / tv_phrase_count；切页后必须重新识别当前页面，
+                    // 否则常用语页的按钮和关键词会继续沿用剪贴板页状态。
+                    clipPanelClass.declaredMethods
+                        .filter { method ->
+                            method.parameterTypes.size == 2 &&
+                                method.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                                method.parameterTypes[1] == Boolean::class.javaPrimitiveType
+                        }
+                        .forEach { method ->
+                            runCatching {
+                                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                                    override fun afterHookedMethod(param: MethodHookParam) {
+                                        (param.thisObject as? ViewGroup)?.let { clipSearch.attach(it) }
+                                    }
+                                })
+                            }.onFailure {
+                                log("clip-search: page-switch hook failed ${method.name}: ${it.message}")
+                            }
+                        }
+                    log("clip-search: panel constructor/page-switch hooks installed ${clipPanelClass.name}")
                 } else {
                     log("clip-search: clipboard panel class unresolved")
                 }
@@ -327,31 +361,61 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     /**
-     * 宿主「把某个 EditText 设成当前输入目标」的方法：静态 + `(EditText, boolean)` + 返回 void。
+     * 宿主「把某个 EditText 设成当前输入目标」的方法。
      *
-     * 宿主自己的编辑界面（常用语新增）就是靠它拿到 IME 内的键盘输入；搜索弹窗复用同一条链，
-     * 才能在输入法进程里真正输入文字。取不到时返回 null，搜索弹窗退回"只显示/可选择"的形态。
+     * 这里不能只用“两个参数 + void”作为条件：宿主 dex 里有上万条这样的候选，
+     * 1.18.0 实际误选了 `androidx.appcompat.widget.Toolbar#b`，它是实例方法，
+     * 没有可用的宿主管理器实例，所以搜索框虽然创建成功，却没有接入输入法焦点链。
+     *
+     * 先用 DexKit 做宽结构召回，再用反射事实做第二层收敛：必须是静态方法、
+     * 第二参数为 boolean、第一参数与 EditText 可赋值兼容、返回 void。宿主已有取证
+     * 表明内部焦点切换就是静态 `(EditText, boolean) -> void` 入口；不写死类名或混淆方法名。
      */
     private fun resolveInputTargetRegistrar(
         bridge: DexKitBridge,
         hostClassLoader: ClassLoader,
     ): ((EditText) -> Boolean)? {
+        // 佐证：宿主自己的常用语编辑框走的正是 `input/view/head/O;->o(CustomEditText)`：
+        // 它先 setImeOptions(1)，紧接着 `manager/h;->l(editText, true)`，
+        // 即"把一个 EditText 设为输入法内部输入目标（并让键盘出来）"的写法。
+        //
+        // 该方法的形状在整包内是唯一的：静态 + `(EditText, boolean) -> void`。
+        // 1.18.0 用的是"两参数 + void"这种过宽的召回，命中了 11766 个候选，
+        // 最后选中 `androidx.appcompat.widget.Toolbar#b`（实例方法、拿不到宿主实例），
+        // 于是搜索框创建成功却收不到输入法按键。本版把召回收紧到宿主真实的参数形状。
         val candidates = findMethods(bridge, "input-target") {
             matcher {
-                paramTypes("android.widget.EditText", "boolean")
                 returnType("void")
+                paramTypes("android.widget.EditText", "boolean")
             }
         }
-        val method = candidates
-            .mapNotNull { runCatching { it.getMethodInstance(hostClassLoader) }.getOrNull() }
-            .firstOrNull { Modifier.isStatic(it.modifiers) }
+        val resolved = candidates.mapNotNull { data ->
+            runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+        }
+        val compatible = resolved.filter { candidate ->
+            Modifier.isStatic(candidate.modifiers) &&
+                candidate.parameterTypes.size == 2 &&
+                candidate.parameterTypes[1] == Boolean::class.javaPrimitiveType &&
+                (EditText::class.java.isAssignableFrom(candidate.parameterTypes[0]) ||
+                    candidate.parameterTypes[0].isAssignableFrom(EditText::class.java))
+        }
+        log(
+            "input-target: resolved=${resolved.size} compatibleStatic=${compatible.size}" +
+                " candidates=" + compatible.joinToString(",") { it.declaringClass.name + "#" + it.name }
+        )
+        val method = compatible.firstOrNull()
             ?: run {
-                log("input-target: unresolved; search field keeps host default behaviour")
+                log("input-target: no compatible static EditText registrar")
                 return null
             }
-        log("input-target: selected ${method.declaringClass.name}#${method.name}")
+        log(
+            "input-target: selected ${method.declaringClass.name}#${method.name}" +
+                " params=${method.parameterTypes.joinToString { it.name }}"
+        )
         return { field ->
             runCatching {
+                method.isAccessible = true
+                // 与宿主同向：true = 设为内部输入目标，并让输入法键盘显示出来。
                 method.invoke(null, field, true)
                 true
             }.getOrElse {

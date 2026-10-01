@@ -3,9 +3,13 @@ package com.oplusime.panel
 import android.os.Handler
 import android.os.Looper
 import android.view.inputmethod.InputConnection
+import android.content.DialogInterface
+import android.app.Dialog
+import android.view.WindowManager
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
+import java.lang.reflect.Modifier
 
 /**
  * 引号「成对补全」抑制。
@@ -109,7 +113,8 @@ internal object QuotePairSuppressor {
      * 因此只有在"刚刚确实有一次成对符号的提交"之后的极短时间内才允许修正：
      * 那才是宿主自动补全产生的状态；其余时刻一律只观察、不动手。
      */
-    private const val SANDWICH_WINDOW_MS = 400L
+    private const val SANDWICH_WINDOW_MS = 1200L
+    private val CLEANUP_DELAYS_MS = longArrayOf(0L, 40L, 90L, 160L, 280L, 450L, 700L)
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -125,6 +130,13 @@ internal object QuotePairSuppressor {
 
     @Volatile
     private var fixCount: Int = 0
+
+    /** 引擎提交证据去重用的两个字段，避免连续按键刷屏。 */
+    @Volatile
+    private var lastObserveAt: Long = 0L
+
+    @Volatile
+    private var lastObservedText: String = ""
 
     /**
      * 在宿主进程内安装。输入法进程里承载编辑框调用的代理类可能不止一个名字，
@@ -201,6 +213,245 @@ internal object QuotePairSuppressor {
         log("quote-pair: host IC classes=${names.size} hooks=$hooked")
     }
 
+    /**
+     * 宿主自己的 KeyEventHandler 在真正调用 InputConnection 之前还会经过
+     * `commonCommitText` 分发器。仅 hook InputConnectionWrapper 会漏掉“成对文本先在宿主分发器生成”的路径，
+     * 因此这里按宿主 dex 的结构特征再挂两层：含 `match_symbol` 的 CharSequence 分发器，
+     * 以及 `(int, CharSequence)` 的直接提交入口。
+     */
+    fun attachHostCommitDispatchers(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        var installed = 0
+        val matchSymbol = runCatching {
+            bridge.findMethod {
+                matcher {
+                    returnType("boolean")
+                    usingStrings(listOf("match_symbol"), org.luckypray.dexkit.query.enums.StringMatchType.Equals, false)
+                    paramCount(9)
+                }
+            }.toList()
+        }.getOrDefault(emptyList())
+        matchSymbol.forEach { data ->
+            runCatching {
+                XposedBridge.hookMethod(data.getMethodInstance(hostClassLoader), object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        trimPairArguments(param.args)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val ic = param.args?.firstOrNull { it is InputConnection } as? InputConnection
+                        scheduleInspect(ic, "commonCommitText")
+                    }
+                })
+                installed++
+            }.onFailure { log("quote-pair: common dispatcher hook failed: ${it.message}") }
+        }
+
+        // p.y(InputConnection, CharSequence, String, int, ..., boolean, boolean)
+        // 是宿主真正把 commonCommitText 结果送进编辑器的最后一层；B() 之后
+        // 仍可能在这里重新组合文本，因此必须同时覆盖这个形状。
+        val finalCommit = runCatching {
+            bridge.findMethod {
+                matcher {
+                    returnType("boolean")
+                    paramCount(7)
+                    usingStrings(
+                        listOf("commitText failed", "KeyEventHandler"),
+                        org.luckypray.dexkit.query.enums.StringMatchType.Equals,
+                        false,
+                    )
+                }
+            }.toList()
+        }.getOrDefault(emptyList())
+        finalCommit.forEach { data ->
+            runCatching {
+                val method = data.getMethodInstance(hostClassLoader)
+                if (method.parameterTypes.firstOrNull() != InputConnection::class.java) return@runCatching
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        trimPairArguments(param.args)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val ic = param.args?.firstOrNull { it is InputConnection } as? InputConnection
+                        scheduleInspect(ic, "final-commit")
+                    }
+                })
+                installed++
+            }.onFailure { log("quote-pair: final commit hook failed: ${it.message}") }
+        }
+
+        val direct = runCatching {
+            bridge.findMethod {
+                matcher {
+                    returnType("void")
+                    paramCount(2)
+                    paramTypes("int", "java.lang.CharSequence")
+                    addInvoke("Landroid/view/inputmethod/InputConnection;->commitText(Ljava/lang/CharSequence;I)Z")
+                }
+            }.toList()
+        }.getOrDefault(emptyList())
+        direct.forEach { data ->
+            runCatching {
+                XposedBridge.hookMethod(data.getMethodInstance(hostClassLoader), object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        trimPairArguments(param.args)
+                    }
+                })
+                installed++
+            }.onFailure { log("quote-pair: direct dispatcher hook failed: ${it.message}") }
+        }
+        log("quote-pair: host commit dispatchers candidates=${matchSymbol.size + direct.size} installed=$installed")
+    }
+
+    /**
+     * native 引擎 → Java 的提交汇聚点。
+     *
+     * 取证（宿主 dex）：native 引擎回调 Java 的实现是 `input/event/a`（类内日志串
+     * `commitText, cleared compositionText`，日志 tag 为 `CjZhuyinEngineCallbackImpl`）；
+     * 它的 `o(String)` 就是"引擎说要提交这段文字"，紧接着调用
+     * `input/event/p;->A(CharSequence, InputConnection, c, boolean, int)` 完成提交。
+     *
+     * 符号键（上滑符号、符号页）同样从这里出去，所以引号成对必然在这条链上。
+     * 按结构 + 语义串把两处找出来，都不写死类名或混淆方法名：
+     *
+     * 1. 含上述日志串、且存在 `(String) -> boolean` 实例方法的类 → 挂它的引擎回调；
+     * 2. 含 `commitText failed` 串、且存在静态
+     *    `(CharSequence, InputConnection, *, boolean, int) -> boolean` 的类 → 挂真正提交的分发器。
+     *
+     * 两个挂点只做两件事：①"一次提交上来正好是一对"就裁成单个左符号；
+     * ②把这次动作记成"刚发生成对符号动作"，为 [check] 打开修正时间窗。
+     */
+    fun attachEngineCommit(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        var installed = 0
+
+        val callbackClasses = runCatching {
+            bridge.findClass {
+                matcher {
+                    usingStrings(
+                        listOf("commitText, cleared compositionText"),
+                        org.luckypray.dexkit.query.enums.StringMatchType.Equals,
+                    )
+                }
+            }.toList()
+        }.onFailure { log("quote-pair: engine callback query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+
+        callbackClasses.forEach { data ->
+            val cls = runCatching { data.getInstance(hostClassLoader) }.getOrNull() ?: return@forEach
+            cls.declaredMethods
+                .filter { method ->
+                    !Modifier.isStatic(method.modifiers) &&
+                        method.returnType == Boolean::class.javaPrimitiveType &&
+                        method.parameterTypes.size == 1 &&
+                        method.parameterTypes[0] == String::class.java
+                }
+                .forEach { method ->
+                    runCatching {
+                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                val text = param.args?.getOrNull(0) as? String ?: return
+                                observeEngineCommit(text, cls.simpleName + "#" + method.name)
+                                val single = unwrapPair(text) ?: return
+                                param.args[0] = single.toString()
+                                lastPairCommitAt = System.currentTimeMillis()
+                                log(
+                                    "quote-pair: engine commit pair trimmed to '" +
+                                        describe(single[0]) + "'"
+                                )
+                            }
+                        })
+                        installed++
+                        log("quote-pair: engine callback hooked ${cls.name}#${method.name}")
+                    }.onFailure { log("quote-pair: engine callback hook failed: ${it.message}") }
+                }
+        }
+
+        val dispatcherClasses = runCatching {
+            bridge.findClass {
+                matcher {
+                    usingStrings(
+                        listOf("commitText failed"),
+                        org.luckypray.dexkit.query.enums.StringMatchType.Equals,
+                    )
+                }
+            }.toList()
+        }.onFailure { log("quote-pair: dispatcher query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+
+        dispatcherClasses.forEach { data ->
+            val cls = runCatching { data.getInstance(hostClassLoader) }.getOrNull() ?: return@forEach
+            cls.declaredMethods
+                .filter { method ->
+                    Modifier.isStatic(method.modifiers) &&
+                        method.returnType == Boolean::class.javaPrimitiveType &&
+                        method.parameterTypes.size == 5 &&
+                        method.parameterTypes[0] == CharSequence::class.java &&
+                        method.parameterTypes[1] == InputConnection::class.java &&
+                        method.parameterTypes[3] == Boolean::class.javaPrimitiveType &&
+                        method.parameterTypes[4] == Int::class.javaPrimitiveType
+                }
+                .forEach { method ->
+                    runCatching {
+                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                                observeEngineCommit(text.toString(), cls.simpleName + "#" + method.name)
+                                val single = unwrapPair(text) ?: return
+                                param.args[0] = single
+                                lastPairCommitAt = System.currentTimeMillis()
+                                log(
+                                    "quote-pair: dispatcher pair trimmed to '" +
+                                        describe(single[0]) + "'"
+                                )
+                            }
+                        })
+                        installed++
+                        log("quote-pair: commit dispatcher hooked ${cls.name}#${method.name}")
+                    }.onFailure { log("quote-pair: commit dispatcher hook failed: ${it.message}") }
+                }
+        }
+
+        log("quote-pair: engine commit hooks installed=$installed")
+    }
+
+    /**
+     * 只在"这次提交确实与成对符号有关"时记一行证据，避免每次按键都刷日志。
+     *
+     * 这一行是下一轮真机取证的判据：如果日志里出现 `len=2`（一次上来就是一对），
+     * 说明配对发生在引擎之前（键位表）；如果只有 `len=1`，说明配对发生在提交之后，
+     * 由 [check] 的时间窗负责拆掉。
+     */
+    private fun observeEngineCommit(text: String, source: String) {
+        if (!mentionsPair(text)) return
+        val now = System.currentTimeMillis()
+        if (now - lastObserveAt < 200L && text == lastObservedText) return
+        lastObserveAt = now
+        lastObservedText = text
+        log(
+            "quote-pair: engine commit text='" +
+                text.map { describe(it) }.joinToString("") +
+                "' len=" + text.length + " source=" + source
+        )
+        if (text.length == 1 && PAIRS.containsKey(text[0])) {
+            // 单个左符号提交同样是"刚发生一次成对符号动作"，要打开修正时间窗。
+            lastPairCommitAt = now
+        }
+    }
+
+    private fun trimPairArguments(args: Array<Any?>?) {
+        if (args == null) return
+        var inputConnection: InputConnection? = null
+        args.indices.forEach { index ->
+            val candidate = args[index]
+            if (candidate is InputConnection) inputConnection = candidate
+            val value = candidate as? CharSequence ?: return@forEach
+            val single = unwrapPair(value) ?: return@forEach
+            args[index] = single
+            lastPairCommitAt = System.currentTimeMillis()
+            log("quote-pair: host dispatcher pair trimmed to single ${describe(single[0])}")
+        }
+        scheduleInspect(inputConnection, "dispatcher-trim")
+    }
     private fun hookAll(cls: Class<*>): Int {
         var count = 0
         count += runCatching {
@@ -289,11 +540,21 @@ internal object QuotePairSuppressor {
     }
 
     private fun inspect(target: Any?, source: String) {
-        val ic = target as? InputConnection ?: return
-        // 延后一帧再读：若宿主在 commitText 之后才 setSelection 到引号中间，这里能等到结果。
-        main.post {
-            runCatching { check(ic, source) }
-                .onFailure { log("quote-pair: inspect failed: ${it.message}") }
+        scheduleInspect(target as? InputConnection, source)
+    }
+
+    /**
+     * 宿主可能先提交左符号、稍后再补右符号；一次 post 不够。
+     * 在一次输入动作后的多个时间点重读同一个编辑器状态，直到右符号出现并删除，
+     * 或时间窗结束。这样不依赖某个单一的 native/Java 时序。
+     */
+    private fun scheduleInspect(ic: InputConnection?, source: String) {
+        if (ic == null) return
+        CLEANUP_DELAYS_MS.forEach { delay ->
+            main.postDelayed({
+                runCatching { check(ic, source) }
+                    .onFailure { log("quote-pair: inspect failed: ${it.message}") }
+            }, delay)
         }
     }
 
@@ -315,26 +576,42 @@ internal object QuotePairSuppressor {
         if (now - lastPairCommitAt > SANDWICH_WINDOW_MS) return
         val before = runCatching { ic.getTextBeforeCursor(1, 0) }.getOrNull() ?: return
         if (before.length != 1) return
-        val expected = PAIRS[before[0]] ?: return
+        val expected = PAIRS[before[0]]
         val after = runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull() ?: return
-        if (after.length != 1 || after[0] != expected) return
         if (now - lastFixAt < MIN_INTERVAL_MS) return
 
-        val removed = runCatching { ic.deleteSurroundingText(0, 1) }.getOrDefault(false)
+        val removed: Boolean
+        val removedSymbol: Char
+        if (expected != null && after.length == 1 && after[0] == expected) {
+            // 光标位于左右符号之间，例如 “|”；删除右侧自动补出的符号。
+            removed = deleteSurrounding(ic, 0, 1)
+            removedSymbol = expected
+        } else {
+            // 另一种宿主时序：成对文本已提交，光标位于末尾，例如 “”|。
+            val beforeTwo = runCatching { ic.getTextBeforeCursor(2, 0) }.getOrNull()
+            if (beforeTwo == null || beforeTwo.length != 2) return
+            val pairRight = PAIRS[beforeTwo[0]]
+            if (pairRight == null || beforeTwo[1] != pairRight) return
+            removed = deleteSurrounding(ic, 1, 0)
+            removedSymbol = beforeTwo[1]
+        }
         if (removed) {
             lastFixAt = System.currentTimeMillis()
             // 修正完成即关闭时间窗，避免同一状态被反复处理。
             lastPairCommitAt = 0L
             fixCount++
             log(
-                "quote-pair: removed auto-inserted closing symbol '" + describe(expected) +
-                    "' after '" + describe(before[0]) + "' (source=" + source +
+                "quote-pair: removed auto-inserted closing symbol '" + describe(removedSymbol) +
+                    "' (source=" + source +
                     ", total=" + fixCount + ")"
             )
         } else {
             log("quote-pair: editor rejected deleteSurroundingText (source=$source)")
         }
     }
+
+    private fun deleteSurrounding(ic: InputConnection, before: Int, after: Int): Boolean =
+        runCatching { ic.deleteSurroundingText(before, after) }.getOrDefault(false)
 
     /** 只输出可读字符；引号本身用码位标注，避免日志里出现成对引号引起歧义。 */
     private fun describe(c: Char): String = String(charArrayOf(c)) + " (U+" + String.format("%04X", c.code) + ")"
