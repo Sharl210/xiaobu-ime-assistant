@@ -110,6 +110,17 @@ internal object SymbolPageRedirect {
             runCatching { (field.get(target) as? Enum<*>)?.name }.getOrNull()
         }.joinToString(",")
 
+    /** 本次切换是否"正要进入简洁符号页"（在 after 阶段据此替用户按一次「更多」）。 */
+    @Volatile
+    private var enteringSimplePage: Boolean = false
+
+    /** 已替用户按下「更多」的次数与节流时间。 */
+    @Volatile
+    private var fullPageCount: Int = 0
+
+    @Volatile
+    private var lastFullPageAt: Long = 0L
+
     fun install(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         val enumClass = findSymbolEnum(bridge, hostClassLoader)
         if (enumClass == null) {
@@ -181,20 +192,14 @@ internal object SymbolPageRedirect {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val target = param.args?.getOrNull(0) ?: return
+                        // 管理器实例直接从切换调用的第 0 个参数拿。
+                        // 1.21.1 真机日志里的 `back ignored (holder instance unresolved)` 就是因为
+                        // 之前靠"自类型静态单例"去猜这个实例、而宿主的管理器并不是 Kotlin object。
+                        // 宿主的切换调用一定会把实例当第 0 个参数传进来，所以这里是可靠来源。
+                        if (holderInstance == null) holderInstance = target
                         val keyboardType = param.args?.firstOrNull {
                             it is Enum<*> && it.javaClass != enumClass
                         }
-                        // 1.21.0 的教训（真机崩溃栈，不是推断）：
-                        //   把参数里的键盘类型替换成 SYMBOLS 会让宿主 k0 走进需要 T9 键盘实例的分支，
-                        //   抛 `lateinit property t9PinYin has not been initialized`，点「符号」即闪退。
-                        //   结论：宿主不接受从外部把符号键盘替换成通用符号页类型。
-                        //
-                        // 1.20.0 的教训（真机日志）：
-                        //   改档位字段 SYMBOL1 -> SYMBOL2 确实执行成功（有 promoted 行），但界面仍是简洁页。
-                        //
-                        // 两条合起来说明：这条"从外部改状态"的路走不通。本版**只观察、不改行为**，
-                        // 把宿主行为完整交还（不闪退、返回箭头恢复原样），同时把真实调用链留成证据，
-                        // 供下一轮按证据定位宿主自己那个「更多」按钮到底做了什么。
                         switchLogCount++
                         if (switchLogCount <= SWITCH_LOG_LIMIT) {
                             log(
@@ -204,6 +209,30 @@ internal object SymbolPageRedirect {
                                     " target=" + (keyboardType as? Enum<*>)?.name
                             )
                         }
+                        // 记录"正要进入简洁符号页"：档位此刻是 SYMBOL1，目标是某个符号键盘。
+                        // 这正是用户按「符号」键的那一下（从主键盘进简洁页）。
+                        enteringSimplePage =
+                            describeField(target, fields) == NAME_SIMPLE &&
+                                (keyboardType as? Enum<*>)?.name
+                                    ?.contains("SYMBOL", ignoreCase = true) == true
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        // 替用户按一次宿主自己的「更多」。
+                        //
+                        // 取证依据（宿主 dex）：符号列表适配器 `SymbolsAdapter`（含内部类
+                        // `onBindViewHolder$6$1$1`）与符号页回调 `body/x`（就是符号页左上角那个返回箭头
+                        // 所在类的兄弟回调）都调用同一个管理器入口 `h0(boolean)`；而 `h0` 在
+                        // "当前已经是符号键盘"时走 `v(前一个键盘类型, true)` 分支，那是全包内**唯一**
+                        // 会把档位写成 `SYMBOL2` 的地方 —— 也就是完整页。
+                        //
+                        // 关键差别（这解释了 1.20.0 为什么白改）：
+                        // 1.20.0 是在 k0 **执行之前**改档位，而 k0 随后会按 body 类型把它重置；
+                        // 这里是在 k0 **执行之后**、页面已经建好的那一刻调用宿主自己的入口，
+                        // 与用户手点「更多」完全同一条路，因此不需要猜类型、也不会崩。
+                        if (!enteringSimplePage) return
+                        enteringSimplePage = false
+                        followFullPage(param.args?.getOrNull(0))
                     }
                 })
                 hooked++
@@ -264,6 +293,32 @@ internal object SymbolPageRedirect {
     }
 
     /**
+     * 替用户按一次「更多」：调用宿主自己的符号页总入口 `h0(true)`。
+     *
+     * 只在"刚从主键盘进入简洁符号页"之后调用一次，并做 500ms 节流；
+     * 调用本身走的是宿主自己的流程（与用户手点「更多」一致），因此不会改坏状态机。
+     */
+    private fun followFullPage(manager: Any?) {
+        val method = entryMethod ?: run {
+            log("symbol-page: follow-up 'more' skipped (entry unresolved)")
+            return
+        }
+        val instance = manager ?: holderInstance ?: run {
+            log("symbol-page: follow-up 'more' skipped (manager instance unresolved)")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastFullPageAt < 500L) return
+        lastFullPageAt = now
+        runCatching {
+            method.isAccessible = true
+            method.invoke(instance, true)
+            fullPageCount++
+            log("symbol-page: follow-up 'more' invoked h0(true) (total=$fullPageCount)")
+        }.onFailure { log("symbol-page: follow-up 'more' failed: ${it.message}") }
+    }
+
+    /**
      * 「返回 = 回输入法主键盘」。
      *
      * 宿主文本编辑面板左上角的返回箭头（`iv_back`）只做「隐藏当前容器」；用户实测按完之后
@@ -273,15 +328,19 @@ internal object SymbolPageRedirect {
      * 全程留证：调用成功与失败都会写日志，便于下一轮直接核对。
      */
     fun backToMainKeyboard() {
-        val holder = holderClass
         val method = entryMethod
-        if (holder == null || method == null) {
-            log("symbol-page: back ignored (holder/entry unresolved)")
+        if (method == null) {
+            log("symbol-page: back ignored (entry unresolved)")
             return
         }
-        val instance = holderInstance ?: Reflect.selfSingleton(holder)?.also { holderInstance = it }
+        // 实例来源优先级：切换调用里抓到的真实实例 → 自类型静态单例（部分宿主形态）。
+        // 1.21.1 的日志是 `holder instance unresolved`，所以这里必须两条都试，并写清用的是哪条。
+        val instance = holderInstance ?: holderClass?.let { Reflect.selfSingleton(it) }?.also {
+            holderInstance = it
+            log("symbol-page: manager instance captured via self-singleton")
+        }
         if (instance == null) {
-            log("symbol-page: back ignored (holder instance unresolved)")
+            log("symbol-page: back ignored (manager instance unresolved)")
             return
         }
         runCatching {

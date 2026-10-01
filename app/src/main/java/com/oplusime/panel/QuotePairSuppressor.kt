@@ -9,6 +9,7 @@ import android.view.WindowManager
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
+import java.util.Collections
 import java.lang.reflect.Modifier
 
 /**
@@ -200,6 +201,56 @@ internal object QuotePairSuppressor {
             installed = true
             log("quote-pair: installed, hook points=$hooked")
         }
+        // 输入法进程里真正把文本送进目标应用的，是框架侧那个"远程输入连接"
+        // （`InputMethodService.getCurrentInputConnection()` 返回的对象）。它既不是
+        // `BaseInputConnection`、也不是任何 `InputConnectionWrapper`。
+        //
+        // 1.21.1 真机日志把这一点钉死了：整场运行只有一行提交留证，而且是内部编辑框的
+        // `BaseInputConnection.commitText`；用户点了很多次符号/引号，`commitText`、
+        // `setComposingText`、引擎回调、两个分发器**全都没有出现**。也就是说符号提交
+        // 走的是这条远程连接，而它从来没被挂过。
+        //
+        // 这里改成：挂住框架的提供者，拿到实例后**按运行时真实类**动态挂载。
+        // 不写死任何与 Android 版本相关的类名，换版本也能继续命中。
+        attachImeInputConnection(hostClassLoader)
+    }
+
+    /** 已动态挂载过的输入连接实现类名，避免同一类被反复挂钩。 */
+    private val hookedIcClasses: MutableSet<String> =
+        Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    /**
+     * 挂住框架的"当前输入连接"提供者，再按其返回值的**运行时类**挂提交方法。
+     *
+     * 这条链覆盖的是"输入法 → 目标应用"的真正出口，符号键、候选词、引号都从这里出去。
+     */
+    fun attachImeInputConnection(hostClassLoader: ClassLoader) {
+        val serviceClass = runCatching {
+            Class.forName("android.inputmethodservice.InputMethodService", false, hostClassLoader)
+        }.getOrNull()
+        if (serviceClass == null) {
+            log("quote-pair: InputMethodService not present; remote IC path uncovered")
+            return
+        }
+        runCatching {
+            XposedBridge.hookAllMethods(
+                serviceClass,
+                "getCurrentInputConnection",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val ic = param.result as? InputConnection ?: return
+                        hookIcClass(ic.javaClass)
+                    }
+                },
+            )
+            log("quote-pair: remote IC provider hooked (${serviceClass.name}#getCurrentInputConnection)")
+        }.onFailure { log("quote-pair: remote IC provider hook failed: ${it.message}") }
+    }
+
+    private fun hookIcClass(cls: Class<*>) {
+        if (!hookedIcClasses.add(cls.name)) return
+        val added = hookAll(cls)
+        log("quote-pair: remote IC hooked ${cls.name} points=$added")
     }
 
     /**
@@ -492,7 +543,11 @@ internal object QuotePairSuppressor {
                  */
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
-                    traceCommit(text, cls.simpleName + ".commitText")
+                    // 留证里带上**运行时类名**：1.21.1 的日志只写死了挂钩的类（`BaseInputConnection`），
+                    // 分不清文本到底是进了宿主内部编辑框还是我们自己的搜索框。改成运行时类后，
+                    // 一眼就能看出是哪一方的输入连接在收字。
+                    val owner = param.thisObject?.javaClass?.simpleName ?: cls.simpleName
+                    traceCommit(text, "$owner.commitText")
                     // 形态零（本版新增，也是 1.19.0 真机失败的直接原因）：
                     // 上一拍刚落下一个左符号，紧接着又送来"正好配对"的右符号 —— 这就是宿主/引擎
                     // 的自动补全**第二步**。1.19.0 只做事后删除，而删除发生在它之后又被它补回，
@@ -528,7 +583,8 @@ internal object QuotePairSuppressor {
                  */
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
-                    traceCommit(text, cls.simpleName + ".setComposingText")
+                    val owner = param.thisObject?.javaClass?.simpleName ?: cls.simpleName
+                    traceCommit(text, "$owner.setComposingText")
                     val single = unwrapPair(text) ?: return
                     param.args[0] = single
                     lastPairCommitAt = System.currentTimeMillis()
