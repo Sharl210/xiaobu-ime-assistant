@@ -170,6 +170,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             runCatching { SymbolPageRedirect.install(bridge, hostClassLoader) }
                 .onFailure { log("symbol-page install failed: ${it.message}") }
 
+            // 「返回 = 回键盘主页面」：面板显示期间接管系统返回键。
+            runCatching { PanelBackRouter.install(bridge, hostClassLoader) }
+                .onFailure { log("panel-back install failed: ${it.message}") }
+
             val onClick = resolvePanelOnClick(bridge, ids)
             if (onClick == null) {
                 log("panel onclick unresolved, abort")
@@ -185,6 +189,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             val layoutMethod = resolvePanelLayoutMethod(bridge, hostClassLoader)
             val keyFeedback = resolveKeyFeedback(onClick, hostClassLoader)
             val closePath = resolveClosePath(onClick, hostClassLoader)
+            PanelState.closePanel = closePath
 
             val opener = ClipboardOpener.resolve(bridge, hostClassLoader, CLIP_BOX_ENUM_NAME)
             val arranger = PanelArranger(
@@ -231,6 +236,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     }
                 },
                 registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
+                clearInputTarget = resolveInputTargetClearer(bridge, hostClassLoader),
                 closePanel = closePath,
                 openPanel = { boxName -> opener.openByName(boxName) },
             )
@@ -243,9 +249,23 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 if (clipPanelClass != null) {
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
-                            (param.thisObject as? ViewGroup)?.let { clipSearch.attach(it) }
+                            (param.thisObject as? ViewGroup)?.let {
+                                PanelState.remember(it)
+                                clipSearch.attach(it)
+                            }
                         }
                     })
+                    XposedBridge.hookAllMethods(
+                        clipPanelClass,
+                        "onVisibilityAggregated",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                if (param.args?.getOrNull(0) == true) {
+                                    (param.thisObject as? View)?.let { PanelState.remember(it) }
+                                }
+                            }
+                        },
+                    )
                     // 构造函数里可能还没把子视图挂完；附加一次“上屏后”的挂载机会，
                     // 保证计数行已经存在时按钮一定能插进去。
                     XposedBridge.hookAllMethods(
@@ -319,7 +339,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
             XposedBridge.hookAllConstructors(panelClass, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    (param.thisObject as? View)?.let { arranger.apply(it) }
+                    (param.thisObject as? View)?.let {
+                        PanelState.remember(it)
+                        arranger.apply(it)
+                    }
                 }
             })
             log("panel constructor hooked: ${panelClass.name}")
@@ -442,6 +465,60 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 true
             }.getOrElse {
                 log("input-target: invoke failed: ${it.message}")
+                false
+            }
+        }
+    }
+
+    /**
+     * 解除宿主的「内部输入目标」。
+     *
+     * 为什么必须有这一步：搜索条排在输入法窗口根视图上时，宿主把内部输入目标指向它。
+     * 如果只把视图摘掉、不让宿主忘记它，宿主接下来会对着一个已经脱离视图树的输入框
+     * 继续处理焦点，输入法就把整个窗口收下去 —— 这正是用户实测的「点搜索后界面被关掉」。
+     *
+     * 定位方式仍然是结构化的：复用上面那条唯一形状 `(EditText, boolean) -> void` 的声明类，
+     * 在它身上找**静态、类型可赋值为 EditText** 的字段（宿主的内部输入框就存在这个字段里），
+     * 置空即完成解除。字段名是混淆的，但我们是按类型拿的，不写死名字。
+     */
+    private fun resolveInputTargetClearer(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+    ): (() -> Boolean)? {
+        val candidates = findMethods(bridge, "input-target-clear") {
+            matcher {
+                returnType("void")
+                paramTypes("android.widget.EditText", "boolean")
+            }
+        }
+        val owner = candidates
+            .mapNotNull { runCatching { it.getMethodInstance(hostClassLoader) }.getOrNull() }
+            .firstOrNull { candidate ->
+                Modifier.isStatic(candidate.modifiers) &&
+                    candidate.parameterTypes.size == 2 &&
+                    candidate.parameterTypes[1] == Boolean::class.javaPrimitiveType
+            }
+            ?.declaringClass
+        if (owner == null) {
+            log("input-target-clear: registrar owner unresolved; search close will not release target")
+            return null
+        }
+        val holder = owner.declaredFields.firstOrNull { field ->
+            Modifier.isStatic(field.modifiers) && EditText::class.java.isAssignableFrom(field.type)
+        }
+        if (holder == null) {
+            log("input-target-clear: no static EditText field on ${owner.name}")
+            return null
+        }
+        runCatching { holder.isAccessible = true }
+        log("input-target-clear: bound to ${owner.name}#${holder.name}")
+        return {
+            runCatching {
+                holder.set(null, null)
+                log("input-target-clear: host internal edit target released")
+                true
+            }.getOrElse {
+                log("input-target-clear: release failed: ${it.message}")
                 false
             }
         }

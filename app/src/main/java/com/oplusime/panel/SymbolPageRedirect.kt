@@ -1,5 +1,7 @@
 package com.oplusime.panel
 
+import android.os.Handler
+import android.os.Looper
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
@@ -80,6 +82,10 @@ internal object SymbolPageRedirect {
     @Volatile
     private var holderClass: Class<*>? = null
 
+    /** 档位字段（install 时定下来，供延迟复核使用）。 */
+    @Volatile
+    private var fieldList: List<Field> = emptyList()
+
     @Volatile
     private var holderInstance: Any? = null
 
@@ -110,7 +116,7 @@ internal object SymbolPageRedirect {
             runCatching { (field.get(target) as? Enum<*>)?.name }.getOrNull()
         }.joinToString(",")
 
-    /** 本次切换是否"正要进入简洁符号页"（在 after 阶段据此替用户按一次「更多」）。 */
+    /** 本次切换是否"正要进入简洁符号页"（仅用于日志，不再参与判定）。 */
     @Volatile
     private var enteringSimplePage: Boolean = false
 
@@ -148,6 +154,7 @@ internal object SymbolPageRedirect {
         }
         fields.forEach { runCatching { it.isAccessible = true } }
         holderClass = holder
+        fieldList = fields
         entryMethod = findEntryMethod(bridge, hostClassLoader, holder)
         log(
             "symbol-page: entryMethod=" + (
@@ -209,12 +216,9 @@ internal object SymbolPageRedirect {
                                     " target=" + (keyboardType as? Enum<*>)?.name
                             )
                         }
-                        // 记录"正要进入简洁符号页"：档位此刻是 SYMBOL1，目标是某个符号键盘。
-                        // 这正是用户按「符号」键的那一下（从主键盘进简洁页）。
-                        enteringSimplePage =
-                            describeField(target, fields) == NAME_SIMPLE &&
-                                (keyboardType as? Enum<*>)?.name
-                                    ?.contains("SYMBOL", ignoreCase = true) == true
+                        // 判定不在这里做（见 after）：快速连点时 before/after 会跨调用交错，
+                        // 用布尔标记会出现"后一次 before 置位、前一次 after 消费掉"的竞态，
+                        // 表现就是用户实测的"连点有概率落回简洁页"。
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
@@ -230,9 +234,16 @@ internal object SymbolPageRedirect {
                         // 1.20.0 是在 k0 **执行之前**改档位，而 k0 随后会按 body 类型把它重置；
                         // 这里是在 k0 **执行之后**、页面已经建好的那一刻调用宿主自己的入口，
                         // 与用户手点「更多」完全同一条路，因此不需要猜类型、也不会崩。
-                        if (!enteringSimplePage) return
-                        enteringSimplePage = false
-                        followFullPage(param.args?.getOrNull(0))
+                        // 按**当前实际档位**实时判定：只有"这一步之后真的停在简洁符号页"才补一次「更多」。
+                        // 无论中间套了几层调用、几个线程交错，判定都与现场一致，
+                        // 不再依赖跨调用的布尔标记（那正是连点会偶尔失效的原因）。
+                        val manager = param.args?.getOrNull(0) ?: return
+                        val target = (param.args?.firstOrNull {
+                            it is Enum<*> && it.javaClass != enumClass
+                        } as? Enum<*>) ?: return
+                        if (!target.name.contains("SYMBOL", ignoreCase = true)) return
+                        if (describeField(manager, fields) != NAME_SIMPLE) return
+                        followFullPage(manager)
                     }
                 })
                 hooked++
@@ -316,6 +327,19 @@ internal object SymbolPageRedirect {
             fullPageCount++
             log("symbol-page: follow-up 'more' invoked h0(true) (total=$fullPageCount)")
         }.onFailure { log("symbol-page: follow-up 'more' failed: ${it.message}") }
+        // 复核并补一次：k0 之后宿主还可能把档位写回，连点时偶尔会落回简洁页。
+        // 180ms 后按当时**实际档位**判断，仍是 SYMBOL1 就再调一次（等价再按一次「更多」）。
+        runCatching {
+            Handler(Looper.getMainLooper()).postDelayed({
+                runCatching {
+                    if (describeField(instance, fieldList) != NAME_SIMPLE) return@postDelayed
+                    method.isAccessible = true
+                    method.invoke(instance, true)
+                    fullPageCount++
+                    log("symbol-page: follow-up 'more' retried h0(true) (total=$fullPageCount)")
+                }
+            }, 180L)
+        }
     }
 
     /**

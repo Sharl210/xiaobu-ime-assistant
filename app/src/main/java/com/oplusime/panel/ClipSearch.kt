@@ -6,7 +6,9 @@ import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -78,6 +80,8 @@ internal class ClipSearch(
     private val createInputField: ((android.content.Context) -> EditText)? = null,
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
+    /** 解除宿主的内部输入目标（收搜索条时必须先做这一步，见 confirmSearch）。 */
+    private val clearInputTarget: (() -> Boolean)? = null,
     /** 宿主自己的「收起面板回键盘」链（与 HostTweaks 用的是同一条）。 */
     private val closePanel: (() -> Boolean)? = null,
     /** 按 BoxEnums 常量名重新打开面板（搜索结果要看得到，就必须回到面板）。 */
@@ -323,9 +327,15 @@ internal class ClipSearch(
         showSearchBar(anchor)
     }
 
-    /** 当前显示中的搜索输入条（长在输入法窗口内部，不是叠加窗口）。 */
-    @Volatile
-    private var searchBar: View? = null
+    /**
+     * 搜索输入条**不再由实例字段持有**，改放在 companion 的 `activeBar` 上。
+     *
+     * 原因（1.22.0 真机现象）：宿主要在切页/重建时新建面板实例，实例字段跟着丢引用，
+     * 已经排在输入法窗口根视图上的输入条就变成孤儿 —— 用户看到的就是"输入框还残留在屏幕上"。
+     */
+    private val liveFilterHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private var liveFilterRunnable: Runnable = Runnable { }
 
     /**
      * 搜索输入条：**在输入法窗口内部、键盘正上方**插入一条输入条。
@@ -374,6 +384,7 @@ internal class ClipSearch(
                 return
             }
             removeSearchBar()
+            removeTaggedBars(root)
             val closed = runCatching { closePanel?.invoke() }.getOrNull()
             log("clip-search: panel closed before input=$closed page=$page")
 
@@ -403,13 +414,12 @@ internal class ClipSearch(
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
             )
             row.addView(buildBarButton(context, "取消") {
+                liveFilterHandler.removeCallbacks(liveFilterRunnable)
                 removeSearchBar()
                 reopenPanel(page)
             })
             row.addView(buildBarButton(context, "搜索") {
-                applyKeyword(field.text?.toString().orEmpty())
-                removeSearchBar()
-                reopenPanel(page)
+                confirmSearch(field, page)
             })
 
             val lp = FrameLayout.LayoutParams(
@@ -417,9 +427,51 @@ internal class ClipSearch(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             )
             lp.gravity = Gravity.TOP
+            row.tag = BAR_TAG
             root.addView(row, lp)
             row.bringToFront()
-            searchBar = row
+            activeBar = row
+
+            // 输入条被摘掉时同步"忘记"它。宿主此刻把内部输入目标指向了这个输入框，
+            // 如果只摘视图、不解除指向，宿主会对着一个已脱离视图树的输入框继续操作，
+            // 输入法就会自己把窗口收下去（用户实测：点「搜索」后整个界面被关掉）。
+            row.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) = Unit
+                override fun onViewDetachedFromWindow(v: View) {
+                    if (activeBar === v) activeBar = null
+                }
+            })
+
+            // 边打字边过滤（300ms 防抖）：即使"确认"这一下因为任何原因没送到，
+            // 关键字也已经生效，不会出现"点了等于没点"。
+            field.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    val text = s?.toString().orEmpty()
+                    runCatching { liveFilterHandler.removeCallbacks(liveFilterRunnable) }
+                    liveFilterRunnable = Runnable {
+                        runCatching {
+                            applyKeyword(text)
+                            log("clip-search: live filter applied kw='$text'")
+                        }
+                    }
+                    runCatching { liveFilterHandler.postDelayed(liveFilterRunnable, 300L) }
+                }
+            })
+
+            // 键盘上的"搜索/回车"键同样当作确认：内部焦点链下这条最稳，不依赖触摸投递。
+            field.setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEARCH ||
+                    actionId == EditorInfo.IME_ACTION_DONE ||
+                    actionId == EditorInfo.IME_ACTION_UNSPECIFIED
+                ) {
+                    confirmSearch(field, page)
+                    true
+                } else {
+                    false
+                }
+            }
 
             field.requestFocus()
             field.setSelection(field.text?.length ?: 0)
@@ -453,14 +505,56 @@ internal class ClipSearch(
         return button
     }
 
+    /**
+     * 「确认搜索」的唯一实现：先应用关键字，延迟一点再收输入条、解除宿主的内部输入目标、回到面板。
+     *
+     * 顺序是有证据的（1.22.0 真机现象）：输入条是排在输入法窗口根视图上的普通 View，
+     * 宿主此时把内部输入目标指向了它。**先摘视图、后解除指向**会让宿主对着已脱离视图树的
+     * 输入框继续操作，于是输入法把整个窗口收下去；先解除指向、再摘视图就避免了这一点。
+     */
+    private fun confirmSearch(field: EditText, page: Page) {
+        liveFilterHandler.removeCallbacks(liveFilterRunnable)
+        val kw = field.text?.toString().orEmpty()
+        applyKeyword(kw)
+        log("clip-search: confirm tapped kw='$kw' page=$page")
+        runCatching {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                runCatching { clearInputTarget?.invoke() }
+                    .onFailure { log("clip-search: clear input target failed: ${it.message}") }
+                removeSearchBar()
+                reopenPanel(page)
+            }, 120L)
+        }.onFailure { log("clip-search: confirm failed: ${it.message}") }
+    }
+
     /** 移除输入条；可重复调用。 */
     private fun removeSearchBar() {
-        val bar = searchBar ?: return
-        searchBar = null
+        val bar = activeBar
+        activeBar = null
+        if (bar == null) {
+            log("clip-search: search bar already gone")
+            return
+        }
         runCatching {
             (bar.parent as? ViewGroup)?.removeView(bar)
+            bar.tag = null
             log("clip-search: search bar removed")
         }.onFailure { log("clip-search: search bar remove failed: ${it.message}") }
+    }
+
+    /** 扫掉根视图里所有带标记、但不是当前活动条的输入条（防残留）。 */
+    private fun removeTaggedBars(container: ViewGroup) {
+        val stale = mutableListOf<View>()
+        fun walk(node: ViewGroup) {
+            for (i in 0 until node.childCount) {
+                val child = node.getChildAt(i)
+                if (child.tag == BAR_TAG && child !== activeBar) stale.add(child)
+                if (child is ViewGroup) walk(child)
+            }
+        }
+        runCatching { walk(container) }
+        stale.forEach { runCatching { (it.parent as? ViewGroup)?.removeView(it) } }
+        if (stale.isNotEmpty()) log("clip-search: stale bars removed=${stale.size}")
     }
 
     private fun showDialog(anchor: View) {
@@ -805,6 +899,13 @@ internal class ClipSearch(
         .also { log("$label candidates=${it.size}") }
 
     private companion object {
+        /** 当前显示中的搜索输入条（模块级：任何路径都能把它清掉，防止变成屏幕上的孤儿）。 */
+        @Volatile
+        var activeBar: View? = null
+
+        /** 输入条根视图上的标记，用于"引用丢了也能扫出来清掉"。 */
+        val BAR_TAG: Int = "oplusime_panel_search_bar".hashCode()
+
         /** 宿主 BoxEnums 里两张页的常量名（语义串，不写死混淆名）。 */
         const val BOX_CLIP = "BOX_CLIP"
         const val BOX_PHRASE = "BOX_PHRASE"
