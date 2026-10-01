@@ -252,8 +252,16 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 //（详见 ClipSearch.installImeInsetsHook 的说明），所以必须挂宿主那份覆写。
                 runCatching { clipSearch.installImeInsetsHook(bridge, hostClassLoader) }
                     .onFailure { log("clip-search insets hook install failed: ${it.message}") }
+                // 数据层过滤（主路）：重写分页适配器报告的条目数与取值，列表因此真的只剩
+                // 匹配项。1.28.0 之前的"把行藏起来"这条路已证伪 —— 列表只认适配器报的条目数，
+                // 行被藏了条目数没变，列表就认为"什么都没变"，所以界面上永远没反应。
+                runCatching { clipSearch.installPagingDataFilter(bridge, hostClassLoader) }
+                    .onFailure { log("clip-search paging-data install failed: ${it.message}") }
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
+                // 列表行的「超大正文」渲染护栏：只影响看得见的那点文字，不影响复制到的内容。
+                runCatching { ListRenderGuard.install(bridge, hostClassLoader) }
+                    .onFailure { log("render-guard install failed: ${it.message}") }
                 runCatching { clipSearch.installRowFilter(bridge, hostClassLoader) }
                     .onFailure { log("clip-search row install failed: ${it.message}") }
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)

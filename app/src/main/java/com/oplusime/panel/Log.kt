@@ -45,9 +45,13 @@ internal object ModuleSwitches {
     /**
      * 未设置过时的日志默认值。
      *
-     * 调试期保持 `true`；**正式发版时改成 `false`**，其余代码一个字都不用动。
+     * 仓库发布的**正式版**取 `false`：模块完全不产生日志，没有拼字符串、没有跨进程写日志的
+     * 开销，也不会在多个模块共用同一份日志时造成干扰。
+     *
+     * 需要排障时，在模块主界面把「日志开关」打开即可（改完最多 5 秒在输入法进程内生效，
+     * 不必重启输入法）；用户手动设置过之后一律以设置为准，因此开关打开后照常能取证。
      */
-    const val DEFAULT_LOG_ENABLED: Boolean = true
+    const val DEFAULT_LOG_ENABLED: Boolean = false
 
     /**
      * 缓存值 + 上次刷新时间。

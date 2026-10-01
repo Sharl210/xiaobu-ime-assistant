@@ -113,6 +113,9 @@ internal class ClipSearch(
             Page.CLIPBOARD -> clipboardKeyword = value
             Page.PHRASE -> phraseKeyword = value
         }
+        // 关键字一变，所有过滤快照立即作废（下一轮列表询问时重建）。
+        dataVersion++
+        synchronized(dataAdaptersLock) { dataSnapshots.clear() }
     }
 
     /** 上一次锚点校验的结果，只在变化时打日志（避免每帧刷屏）。 */
@@ -1036,21 +1039,33 @@ internal class ClipSearch(
      * 拿不到就退化为"通知一个足够大的窗口"（RecyclerView 会自行按实际条目数截断）。
      */
     private fun notifyRebind(adapter: Any, page: Page, reason: String) {
+        // 登记这个适配器属于哪一页。数据层过滤（重写分页适配器的条目数/取值）只对
+        // **登记过的**适配器生效，因此宿主的其它分页列表（表情、搜索页等）不受影响。
+        // 这里同时是"关键字已生效"的标记点：登记之后，列表下一次询问条目数就会被过滤。
+        registerDataAdapter(adapter, page)
         val count = runCatching {
             adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int
         }.getOrNull() ?: 0
+        // 首选 notifyDataSetChanged：1.29.0 起过滤发生在**数据层**（重写分页适配器的
+        // getItemCount/getItem），条目数本身会变，必须让列表重问一次；只发
+        // notifyItemRangeChanged 的话列表仍以为条目数是原来那个，计数对不上会直接不刷新。
         val notified = runCatching {
-            adapter.javaClass
-                .getMethod(
-                    "notifyItemRangeChanged",
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                )
-                .invoke(adapter, 0, count)
+            adapter.javaClass.getMethod("notifyDataSetChanged").invoke(adapter)
             true
         }.getOrElse {
-            log("clip-search: notify($reason) failed: ${it.message}")
-            false
+            runCatching {
+                adapter.javaClass
+                    .getMethod(
+                        "notifyItemRangeChanged",
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                    )
+                    .invoke(adapter, 0, count)
+                true
+            }.getOrElse { e2 ->
+                log("clip-search: notify($reason) failed: ${it.message} / ${e2.message}")
+                false
+            }
         }
         log("clip-search: rebind($reason) page=$page notify=$notified count=$count adapter=${adapter.javaClass.name}")
     }
@@ -1080,6 +1095,132 @@ internal class ClipSearch(
     }
 
     // -------------------------------------------------------------- 分页过滤
+
+    /**
+     * 数据层过滤：直接改**分页适配器自己报告的条目数与取值**。
+     *
+     * ## 为什么必须走这一层（1.28.0 真机日志的直接教训）
+     *
+     * 1.28.0 只做「绑定时把不匹配的行收起来」：日志里 `confirm tapped` 到达、
+     * `rebind notify=true count=20` 也成功，但列表**一点变化都没有**。原因是列表控件
+     * 只认适配器报告的条目数——行被我们藏了，条目数没变，列表认为"什么都没有变"。
+     *
+     * 所以这里改成：只要搜索关键字生效，适配器报告的条目数就**只剩匹配的**，
+     * 列表自己就会重新布局成"只显示匹配项"。这是数据层过滤，不是装饰层隐藏。
+     *
+     * ## 定位方式
+     *
+     * {@code androidx.paging.o0} 是宿主内封的 paging 适配器基类（R8 只改了类名后缀，
+     * **包名 `androidx.paging` 保留**），`getItemCount()` 与 `getItem(int)` 都声明在它上面。
+     * 因此按「方法名 + 签名 + 声明类名含 paging」定位，不写死任何混淆名。
+     *
+     * ## 只作用于我们自己的那两张列表
+     *
+     * 适配器实例是**登记制**的：只有从 `rv_clipboard` / `rv_phrase_directory` 上取到的
+     * 那个适配器实例会被登记。宿主的其它分页列表（表情、搜索页等）一律不受影响。
+     */
+    fun installPagingDataFilter(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val countCandidates = findMethods(bridge, "paging-count") {
+            matcher {
+                name("getItemCount")
+                returnType("int")
+            }
+        }.filter { it.declaredClassName?.contains("paging") == true }
+        val itemCandidates = findMethods(bridge, "paging-item") {
+            matcher {
+                name("getItem")
+                paramTypes("int")
+            }
+        }.filter { it.declaredClassName?.contains("paging") == true }
+        log("paging-data: count=${countCandidates.size} item=${itemCandidates.size}")
+
+        countCandidates.forEach { candidate ->
+            val method = runCatching { candidate.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            pagingCountMethod = method
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val adapter = param.thisObject ?: return
+                        val snapshot = ensureSnapshot(adapter) ?: return
+                        param.result = snapshot.items.size
+                        logThrottled("paging-data", 1_000L) {
+                            "paging-data: adapter=${adapter.javaClass.name}" +
+                                " count ${snapshot.originalCount} -> ${snapshot.items.size}" +
+                                " kw=${snapshot.keyword}"
+                        }
+                    }
+                })
+                log("paging-data: count hooked ${candidate.declaredClassName}")
+            }.onFailure { log("paging-data count hook failed: ${it.message}") }
+        }
+
+        itemCandidates.forEach { candidate ->
+            val method = runCatching { candidate.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            pagingItemMethod = method
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val adapter = param.thisObject ?: return
+                        val position = param.args?.getOrNull(0) as? Int ?: return
+                        val snapshot = ensureSnapshot(adapter) ?: return
+                        param.result = snapshot.items.getOrNull(position)
+                    }
+                })
+                log("paging-data: item hooked ${candidate.declaredClassName}")
+            }.onFailure { log("paging-data item hook failed: ${it.message}") }
+        }
+    }
+
+    /** 登记：只有从我们那两张列表上取到的适配器实例才参与过滤。 */
+    private fun registerDataAdapter(adapter: Any, page: Page) {
+        synchronized(dataAdaptersLock) { dataAdapterPages[adapter] = page }
+    }
+
+    private fun dataKeywordFor(adapter: Any): String? =
+        synchronized(dataAdaptersLock) { dataAdapterPages[adapter] }?.let { keywordFor(it) }
+
+    /**
+     * 取（必要时重建）该适配器的过滤快照。
+     *
+     * 关键字没生效、或这个适配器没被登记 → 返回 null，钩子直接放行原行为。
+     * 关键字或数据版本一变就重建；重建时用 [XposedBridge.invokeOriginalMethod] 取原始条目，
+     * 因此不会和本钩子互相递归。
+     */
+    private fun ensureSnapshot(adapter: Any): DataSnapshot? {
+        val kw = dataKeywordFor(adapter) ?: return null
+        synchronized(dataAdaptersLock) {
+            val cached = dataSnapshots[adapter]
+            if (cached != null && cached.version == dataVersion && cached.keyword == kw) return cached
+        }
+        val countMethod = pagingCountMethod ?: return null
+        val itemMethod = pagingItemMethod ?: return null
+        val originalCount = runCatching {
+            XposedBridge.invokeOriginalMethod(countMethod, adapter, arrayOfNulls<Any>(0)) as? Int
+        }.getOrNull() ?: return null
+        val items = ArrayList<Any?>(maxOf(originalCount, 0))
+        for (i in 0 until originalCount) {
+            val item = runCatching {
+                XposedBridge.invokeOriginalMethod(itemMethod, adapter, arrayOf<Any?>(i))
+            }.getOrNull()
+            // 占位行（分页尚未加载到的位置）保持原样，交给宿主自己按占位处理。
+            if (item == null || matches(item, kw)) items.add(item)
+        }
+        val snapshot = DataSnapshot(dataVersion, kw, originalCount, items)
+        synchronized(dataAdaptersLock) { dataSnapshots[adapter] = snapshot }
+        log("paging-data: snapshot adapter=${adapter.javaClass.name} $originalCount -> ${items.size} kw=$kw")
+        return snapshot
+    }
+
+    private class DataSnapshot(
+        val version: Int,
+        val keyword: String,
+        val originalCount: Int,
+        val items: List<Any?>,
+    )
+
+    // -------------------------------------------------------------- 分页过滤（旧路径：源转换）
 
     fun installPagingFilter(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         // 分页源把「查到的行」转成「列表项」：受保护、List 进 List 出。
@@ -1269,31 +1410,67 @@ internal class ClipSearch(
     private fun nameMentionsPaging(name: String): Boolean =
         name.contains("paging", ignoreCase = true)
 
-    /** 条目的任一字符串字段 / 字符串 getter 包含关键字即命中（不依赖任何混淆字段名）。 */
+    /**
+     * 条目的任一字符串字段 / 字符串 getter / 嵌套对象里的字符串包含关键字即命中。
+     *
+     * ## 1.29.0 修掉的真实缺陷
+     *
+     * 宿主剪贴板列表每行绑定的条目是 `ClipboardWithExtract`（一个**外层包裹对象**），
+     * 正文并不在它自己的字段里，而在它内部那个 `ClipboardData` 的 `text` 字段上。
+     * 旧实现只看「本层的 String 字段 + 无参 String getter」，于是外层对象上找不到正文，
+     * 判定恒为「不匹配」—— 这也是 1.28.0 真机上"搜索不生效"的直接原因：
+     * 要么一行都没命中，要么每行都被隐藏，两种观感都不是"只剩匹配条目"。
+     *
+     * 现在按固定深度递归进**对象字段**（并顺带覆盖集合元素），同时保留字段/getter 两条路。
+     * 深度与访问次数都有上限，避免自引用对象把这里拖死。
+     */
     private fun matches(item: Any?, kw: String): Boolean {
         if (item == null) return false
+        val visited = Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+        return matchesDeep(item, kw, 0, visited)
+    }
+
+    private fun matchesDeep(item: Any?, kw: String, depth: Int, visited: MutableSet<Any>): Boolean {
+        if (item == null || depth > MAX_MATCH_DEPTH) return false
+        if (item is CharSequence) return item.contains(kw, ignoreCase = true)
+        if (item is java.lang.Number || item is Boolean) return false
+        if (!visited.add(item)) return false
+
+        // 集合/数组：逐元素判定（列表项偶尔是包裹在列表里的）。
+        if (item is Iterable<*>) {
+            return item.any { matchesDeep(it, kw, depth + 1, visited) }
+        }
+        if (item.javaClass.isArray) {
+            val length = java.lang.reflect.Array.getLength(item)
+            for (i in 0 until minOf(length, MAX_MATCH_ELEMENTS)) {
+                val element = runCatching { java.lang.reflect.Array.get(item, i) }.getOrNull()
+                if (matchesDeep(element, kw, depth + 1, visited)) return true
+            }
+            return false
+        }
+
         var current: Class<*>? = item.javaClass
-        while (current != null && current != Any::class.java) {
+        var scanned = 0
+        while (current != null && current != Any::class.java && scanned < MAX_MATCH_FIELDS) {
             current.declaredFields.forEach { field ->
-                if (field.type == String::class.java) {
-                    val value = runCatching {
-                        field.isAccessible = true
-                        field.get(item) as? String
-                    }.getOrNull()
-                    if (value != null && value.contains(kw, ignoreCase = true)) return true
+                if (scanned >= MAX_MATCH_FIELDS) return@forEach
+                scanned++
+                val type = field.type
+                val scalar = type == String::class.java || type == CharSequence::class.java
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(item)
+                }.getOrNull() ?: return@forEach
+                if (scalar) {
+                    if ((value as? CharSequence)?.contains(kw, ignoreCase = true) == true) return true
+                    return@forEach
+                }
+                // 非标量字段：只对「可能装正文」的类型递归，避免扫描一堆基本类型的包装。
+                if (!type.isPrimitive && !type.isEnum) {
+                    if (matchesDeep(value, kw, depth + 1, visited)) return true
                 }
             }
-            // 条目大多是 Kotlin data class，正文可能只暴露成 getter（getContent / getLabel 等），
-            // 因此无参 String getter 一并纳入判定。
-            current.declaredMethods.forEach { method ->
-                if (method.parameterCount == 0 && method.returnType == String::class.java) {
-                    val value = runCatching {
-                        method.isAccessible = true
-                        method.invoke(item) as? String
-                    }.getOrNull()
-                    if (value != null && value.contains(kw, ignoreCase = true)) return true
-                }
-            }
+            if (scanned >= MAX_MATCH_FIELDS) break
             current = current.superclass
         }
         return false
@@ -1312,6 +1489,39 @@ internal class ClipSearch(
         /** 当前显示中的搜索输入条（模块级：任何路径都能把它清掉，防止变成屏幕上的孤儿）。 */
         @Volatile
         var activeBar: View? = null
+
+        // ------------------------------------------------------------ 数据层过滤
+
+        /**
+         * 只对**登记过**的分页适配器做数据层过滤。
+         *
+         * 登记发生在 [notifyRebind]：那条路径上的适配器一定来自我们自己的两张列表
+         * （`rv_clipboard` / `rv_phrase_directory`）。宿主的其它分页列表（表情、搜索页、
+         * 云同步页等）从不登记，因此它们的条目数与取值完全不受影响。
+         */
+        val dataAdaptersLock: Any = Any()
+
+        /** 适配器 → 它属于哪一页（只用于取该页当前的关键字）。 */
+        private val dataAdapterPages: MutableMap<Any, Page> = java.util.WeakHashMap()
+
+        /** 适配器 → 过滤后的条目快照（关键字或数据版本一变就作废重建）。 */
+        private val dataSnapshots: MutableMap<Any, DataSnapshot> = java.util.WeakHashMap()
+
+        /**
+         * 数据版本：关键字每次变化就 +1。
+         *
+         * 快照带版本号，是为了让"重建"这件事有明确依据——否则关键字相同但列表数据变了
+         * （用户新复制了一条）时，会一直用旧快照。
+         */
+        @Volatile
+        var dataVersion: Int = 0
+
+        /** 分页适配器用来报告条目数/取条目的原始方法：重建快照时要拿它们取真实数据。 */
+        @Volatile
+        var pagingCountMethod: java.lang.reflect.Method? = null
+
+        @Volatile
+        var pagingItemMethod: java.lang.reflect.Method? = null
 
         /**
          * 输入条所在的那个窗口根视图（输入法窗口自己的 DecorView）。
@@ -1377,6 +1587,18 @@ internal class ClipSearch(
 
         /** 行级过滤用来暂存「原始行高」的 tag key。 */
         val ROW_HEIGHT_TAG: Int = "oplusime_panel_row_height".hashCode()
+
+        /**
+         * 「匹配」递归的上限。
+         *
+         * 宿主列表项是**外层包裹对象**（正文在它的一个对象字段里），不递归就看不懂正文，
+         * 因此必须递归；但对象可能自引用/成环，所以三个维度都要封顶：
+         * 深度、单次判定的字段访问总数、数组/集合取元素数。
+         * 取值都远大于真实数据形状，只用来兜住异常结构，不构成功能上限。
+         */
+        const val MAX_MATCH_DEPTH: Int = 6
+        const val MAX_MATCH_FIELDS: Int = 64
+        const val MAX_MATCH_ELEMENTS: Int = 32
 
         /** 搜索未激活：白底黑字。 */
         val INACTIVE_FG: Int = Color.parseColor("#E5000000")

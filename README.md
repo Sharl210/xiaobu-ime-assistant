@@ -35,6 +35,9 @@
 - 剪贴板页和常用语页各自拥有独立的「搜索」过滤逻辑，切页时不会串用关键词或列表。
 - 两页计数行最右侧新增一个**白底圆角气泡「搜索」按钮**。
   输入关键字后点「搜索」，列表就只留下内容里包含该关键字的条目；再点一次按钮即取消搜索、恢复全部。
+- **超长条目的渲染优化**：复制进来几万字的超大条目时，列表滑动不再卡顿。
+  列表行的正文控件只为看得见的那部分建立排版，屏幕外的内容不参与渲染。
+  复制/剪切拿到的仍然是**完整原文**，只影响"屏幕上能预览多少"。
 
   > 搜索卡片为什么不做成"弹窗"：输入法进程本身就是输入源，任何叠在输入法窗口**之上**的窗口
   > （`PopupWindow` 或 `type=0x3eb` 的附加 Dialog）都会把输入法压在下面，键盘就再也弹不出来。
@@ -78,7 +81,9 @@ logcat -b all -d | grep OplusImePanel
 resolved ids selectAll=… clip=… copy=… paste=… delete=… return=…
 record-trim: wrappers=2 installed=2
 content-length-filter: candidates=1 installed=1
-clip-search: convert candidates=… filterHooks=…
+paging-data: count hooked androidx.paging.o0
+paging-data: item hooked androidx.paging.o0
+render-guard installed=1 maxChars=4000
 panel transplanted: 剪切/全选共用左列第一格 删除<-全选格 回车<-删除格 剪贴板<-回车格
 panel verify rows=全选+删除 | 复制+回车 | 粘贴+剪贴板 overlaps=none zeroSize=none verdict=PASS
 clip-search: button created id=0x… class=… parent=androidx.constraintlayout.widget.ConstraintLayout anchored to counter=0x7f0905aa
@@ -92,12 +97,25 @@ clip-search: button created id=0x… class=… parent=androidx.constraintlayout.
 | 点「剪切」回主键盘 | `cut tapped -> back to keyboard` |
 | 真的粘贴到内容后回主键盘 | `paste applied -> back to keyboard` |
 | 粘贴时剪贴板是空的 | `paste tapped but nothing to paste` |
-| 用搜索过滤 | `clip-search: page filtered …` |
-| 点「搜索」 | `clip-search: search card shown in ime window, input-registered=…` |
+| 用搜索过滤 | `paging-data: snapshot adapter=… 20 -> 3 kw=…` |
+| 点「搜索」 | `clip-search: search bar shown in ime window … input-registered=true` |
+| 超长条目被截断渲染 | `render-guard truncated row text 58321 -> 4001 chars` |
 | 常用语写超 500 字 | `over-limit input allowed (limit=500)` |
 | 选中文字 | `selection cell switched: 全选->剪切 (宿主已启用剪切)` |
 
 如果某行没出现，说明该功能在你这台机器上没挂上，可以把日志发到 [Issues](../../issues)。
+
+---
+
+## 日志开关
+
+模块主界面上有**「日志开关」**，默认按版本走：
+
+- 仓库里发布的**正式版默认关闭**：模块完全不产生日志，没有拼字符串、没有跨进程写日志的开销，
+  也不会在不同模块共用同一份日志时造成干扰；
+- 如果在使用中遇到问题需要排查，把开关**打开**即可（改完最多 5 秒生效，不用重启输入法），
+  复现一次再把 `OplusImePanel` 相关日志发出来即可。 
+
 
 ---
 
@@ -117,6 +135,8 @@ clip-search: button created id=0x… class=… parent=androidx.constraintlayout.
 | 容量上限的裁剪 | 事务 lambda 的形状：`invoke(Object)Object` + 用到 500 + 调用 `Number.intValue()` |
 | 正文长度上限 | 输入过滤器的标准签名 `filter(CharSequence,int,int,Spanned,int,int)` + 用到 500 |
 | 分页列表 | 继承链上带分页包名、且方法形状是「List 进 List 出」 |
+| 分页条目数与取值 | 方法名 `getItemCount` / `getItem(int)` + 声明类名含分页包名（R8 只改短名后缀，包名保留） |
+| 列表行的超长正文控件 | 「名为 `setText`、参数为 `(CharSequence, BufferType)`」+ 声明类继承自文本控件 + 该类另有一个 `CharSequence` 字段 |
 
 **一句话：资源名称和字符串常量当锚点，类名一律不参与判断。** 所以输入法小版本升级后，多数情况下不需要改模块。
 
