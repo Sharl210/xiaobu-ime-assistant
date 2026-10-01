@@ -258,9 +258,7 @@ internal object ClipboardEdit {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val holder = param.args?.getOrNull(0) ?: return
                         val position = (param.args?.getOrNull(1) as? Int) ?: return
-                        val itemView = runCatching {
-                            holder.javaClass.getMethod("getItemView").invoke(holder)
-                        }.getOrNull() as? View ?: return
+                        val itemView = itemViewOf(holder) ?: return
                         val item = itemAt(param.thisObject ?: return, position) ?: return
                         attachToRow(itemView, item)
                     }
@@ -270,6 +268,34 @@ internal object ClipboardEdit {
             }.onFailure { log("clip-edit: bind hook failed $owner: ${it.message}") }
         }
         log("clip-edit: bind hooks=$hooks")
+    }
+
+    /**
+     * 取 ViewHolder 的行视图。
+     *
+     * **这里踩过坑**：`RecyclerView.ViewHolder` 只提供 **字段** `itemView`，
+     * 并没有 `getItemView()` 这个方法（那是部分第三方库自己加的）。
+     * 上一版调 `getMethod("getItemView")` 必然抛异常，被 `runCatching` 吞掉之后
+     * 编辑按钮**一次都没被插进去** —— 这就是"编辑按钮还是没做"的真实原因。
+     * 现在按字段先取，找不到再退回方法（兼容确实定义了该方法的机型/版本）。
+     */
+    private fun itemViewOf(holder: Any): View? {
+        runCatching {
+            var current: Class<*>? = holder.javaClass
+            var depth = 0
+            while (depth < 8) {
+                val owner: Class<*> = current ?: break
+                val f = runCatching { owner.getDeclaredField("itemView") }.getOrNull()
+                if (f != null) {
+                    f.isAccessible = true
+                    return f.get(holder) as? View
+                }
+                current = owner.superclass
+                depth++
+            }
+        }
+        return runCatching { holder.javaClass.getMethod("getItemView").invoke(holder) as? View }
+            .getOrNull()
     }
 
     /**
@@ -316,15 +342,54 @@ internal object ClipboardEdit {
         val index = runCatching { parent.indexOfChild(anchor) }.getOrDefault(0)
         runCatching {
             parent.addView(button, index)
+            joinVisibilityGroup(itemView, button, anchor)
             logThrottled("clip-edit", 2_000L) {
                 "clip-edit: button added index=$index parent=${parent.javaClass.name}"
             }
         }.onFailure { log("clip-edit: add button failed: ${it.message}") }
     }
 
+    /**
+     * 让新按钮跟随这一排动作控件的**显隐**。
+     *
+     * 宿主的动作排用一个 `ConstraintLayout.Group` 统一控制显隐（Group 不是 ViewGroup，
+     * 它只按 id 列表批量改可见性）。我们的按钮不在那个 id 列表里，于是别的按钮被收起时
+     * 它会孤零零留在屏幕上。这里把我们的 id **并进**那个 Group 的列表（公开 API），
+     * 收起/展开就完全同步了。
+     */
+    private fun joinVisibilityGroup(root: View, button: View, anchor: View) {
+        runCatching {
+            val groupCls = Class.forName(
+                "androidx.constraintlayout.widget.Group",
+                false,
+                root.javaClass.classLoader,
+            )
+            val groups = ArrayList<View>()
+            fun walk(v: View) {
+                if (groupCls.isInstance(v)) groups.add(v)
+                if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+            }
+            walk(root)
+            groups.forEach { g ->
+                val getter = runCatching { groupCls.getMethod("getReferencedIds") }.getOrNull()
+                    ?: return@forEach
+                val ids = runCatching { getter.invoke(g) as? IntArray }.getOrNull() ?: return@forEach
+                if (!ids.contains(anchor.id)) return@forEach
+                val next = IntArray(ids.size + 1)
+                System.arraycopy(ids, 0, next, 0, ids.size)
+                next[ids.size] = button.id
+                runCatching {
+                    groupCls.getMethod("setReferencedIds", IntArray::class.java).invoke(g, next)
+                    logThrottled("clip-edit", 5_000L) {
+                        "clip-edit: joined visibility group (ids ${ids.size} -> ${next.size})"
+                    }
+                }
+            }
+        }.onFailure { log("clip-edit: join visibility group failed: ${it.message}") }
+    }
+
     /** 照着相邻功能键的外观造按钮，保证和整排风格一致。 */
-    private fun buildButton(anchor: View): TextView? {
-        val button = TextView(anchor.context)
+    private fun buildButton(anchor: View): TextView? {        val button = TextView(anchor.context)
         button.tag = TAG_EDIT
         button.text = LABEL
         button.gravity = Gravity.CENTER
@@ -336,10 +401,15 @@ internal object ClipboardEdit {
             button.setTextSize(TypedValue.COMPLEX_UNIT_PX, anchor.textSize)
             button.typeface = anchor.typeface
             button.setPadding(anchor.paddingLeft, anchor.paddingTop, anchor.paddingRight, anchor.paddingBottom)
-            // 图标沿用「编辑」那条 drawable（拿不到就只显示文字）。
-            anchor.compoundDrawables.getOrNull(0)?.let {
-                button.setCompoundDrawables(it, null, null, null)
-            }
+        }
+        // 图标用宿主自己的「编辑」那条 drawable（`ic_clip_edit` / 深色版），**不能**沿用
+        // 相邻那个「加到常用语」的图标 —— 用户实测里编辑按钮和「加入常用语」共用了同一个
+        // 加号图标，那是错的。资源名是语义锚点，id 每版运行时重新解析；解析不到就退回纯文字。
+        val editIcon = resolveEditIcon(anchor.context)
+        if (editIcon != null) {
+            val size = if (anchor is TextView) anchor.textSize.toInt() else 0
+            if (size > 0) editIcon.setBounds(0, 0, size, size)
+            button.setCompoundDrawables(editIcon, null, null, null)
         }
         runCatching {
             val lp = anchor.layoutParams
@@ -465,4 +535,32 @@ internal object ClipboardEdit {
     private const val LABEL: String = "编辑"
     private const val TITLE: String = "编辑"
     private const val CONFIRM: String = "确定"
+
+    /**
+     * 取宿主自己的「编辑」图标（一支笔）。
+     *
+     * 资源名是语义锚点（`ic_clip_edit` / 深色版），id 每版运行时按包名重新解析，
+     * 因此不写死任何数字 id。浅色解析不到再试深色；两个都拿不到就返回 null，
+     * 按钮退回纯文字（总好过用错图标 —— 上一版就是共用了「加入常用语」的加号）。
+     */
+    private fun resolveEditIcon(context: Context): android.graphics.drawable.Drawable? {
+        val names = arrayOf("ic_clip_edit", "ic_clip_edit_dark")
+        names.forEach { name ->
+            val id = runCatching {
+                context.resources.getIdentifier(name, "drawable", HOST_PACKAGE)
+            }.getOrDefault(0)
+            if (id != 0) {
+                val drawable = runCatching { context.resources.getDrawable(id, null) }.getOrNull()
+                if (drawable != null) {
+                    log("clip-edit: icon resolved $name")
+                    return drawable
+                }
+            }
+        }
+        log("clip-edit: edit icon unresolved, falling back to text only")
+        return null
+    }
+
+    /** 宿主包名：任何情况下都不做混淆，是稳定的语义锚点。 */
+    private const val HOST_PACKAGE: String = "com.oplus.keyboard"
 }

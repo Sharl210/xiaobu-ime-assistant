@@ -82,6 +82,13 @@ internal class ClipSearch(
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
     /** 解除宿主的内部输入目标（收搜索条时必须先做这一步，见 confirmSearch）。 */
     private val clearInputTarget: (() -> Boolean)? = null,
+    /**
+     * 把宿主的输入焦点交还给**外部编辑器**。
+     *
+     * 不调用它就会出现「用过一次搜索之后，键盘怎么按都打不出字，必须收起键盘重开」——
+     * 因为宿主仍以为输入目标是那个已经被摘掉的搜索框。详见 `HookEntry.resolveFocusRestorer`。
+     */
+    private val restoreFocus: (() -> Boolean)? = null,
     /** 宿主自己的「收起面板回键盘」链（与 HostTweaks 用的是同一条）。 */
     private val closePanel: (() -> Boolean)? = null,
     /** 按 BoxEnums 常量名重新打开面板（搜索结果要看得到，就必须回到面板）。 */
@@ -171,18 +178,59 @@ internal class ClipSearch(
 
     /** 面板每次排布后调用；按钮只在第一次创建，之后只重申约束。 */
     fun attach(panel: ViewGroup) {
+        ensurePageWatcher(panel)
+        syncButtonVisibility(panel)
+    }
+
+    /**
+     * 给面板挂一个「布局变化就重新判页」的观察者（每个面板只挂一次）。
+     *
+     * ## 为什么需要它
+     *
+     * 用户实测「切到常用语页，搜索按钮还在」。原因是：按钮是在**剪贴板页**建出来的，
+     * 而宿主的页切换只是把计数控件/列表的可见性换来换去 —— 既不重建面板、也不触发
+     * `onVisibilityAggregated`，于是我们**没有任何时机**去把按钮收起来。
+     *
+     * 布局监听正好落在这些切换上（可见性变化必然引起一次布局），而且只做两次
+     * `visibility` 读 + 最多一次写，成本可以忽略。
+     */
+    private fun ensurePageWatcher(panel: ViewGroup) {
+        if (watched.contains(panel)) return
+        watched.add(panel)
+        runCatching {
+            panel.viewTreeObserver.addOnGlobalLayoutListener {
+                runCatching { syncButtonVisibility(panel) }
+            }
+            log("clip-search: page watcher attached to ${panel.javaClass.name}")
+        }.onFailure { log("clip-search: page watcher failed: ${it.message}") }
+    }
+
+    /** 按「当前是不是剪贴板页」决定按钮显隐；剪贴板页首次出现时顺便创建。 */
+    private fun syncButtonVisibility(panel: ViewGroup) {
         val clipCounter = panel.findViewById<View>(counterId)
-        val phraseCounter = panel.findViewById<View>(phraseCounterId)
         val onClipboardPage = clipCounter?.visibility == View.VISIBLE
-        val onPhrasePage = !onClipboardPage && phraseCounter?.visibility == View.VISIBLE
-        if (!onClipboardPage && !onPhrasePage) {
-            log("clip-search: no searchable page counter visible")
+        if (!onClipboardPage) {
+            // 常用语页：**不显示搜索按钮**（用户明确要求）。按钮是在剪贴板页建出来的，
+            // 宿主切页只改可见性、不重建面板，所以必须靠布局监听主动收起来。
+            val button = buttons[panel] ?: return
+            if (button.visibility != View.GONE) {
+                button.visibility = View.GONE
+                log("clip-search: search button hidden (page=PHRASE)")
+            }
             return
         }
-        currentPage = if (onClipboardPage) Page.CLIPBOARD else Page.PHRASE
-        val counter = if (onClipboardPage) clipCounter else phraseCounter
-            ?: return
-        // 按钮必须加入计数控件所在的 ConstraintLayout，而不是宿主面板本身。
+        currentPage = Page.CLIPBOARD
+        if (clipCounter == null) return
+        createAndPlace(panel, clipCounter)
+        buttons[panel]?.let { if (it.visibility != View.VISIBLE) it.visibility = View.VISIBLE }
+    }
+
+    /** 已经挂过页观察者的面板（幂等）。 */
+    private val watched: MutableSet<ViewGroup> =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<ViewGroup, Boolean>())
+
+    /** 建按钮 + 摆位置（只在剪贴板页第一次出现时调用）。 */
+    private fun createAndPlace(panel: ViewGroup, counter: View) {
         val host = counter.parent as? ViewGroup ?: panel
         val existing = buttons[panel]
         if (existing != null && existing.parent === host) {
@@ -271,16 +319,11 @@ internal class ClipSearch(
         }
         val lp = button.layoutParams ?: return
         runCatching {
-            // 计数控件本身先摆正：**两页都必须居中**。
+            // 注意：**不动**任何计数控件的锚点。
             //
-            // 宿主 `res/IB.xml` 里两个计数控件的约束是：
-            //   tv_clip_count    (0x7F0905AA)  0dp  start→parent  end→tv_phrase_count.start  marginEnd=8dp
-            //   tv_phrase_count  (0x7F0905DD)  wrap end→parent  marginEnd=16dp
-            // 剪贴板页是 `tv_clip_count` 在显示，它被拉成 0dp 横跨中段、右端让给 `tv_phrase_count`，
-            // 视觉上正好居中；而常用语页显示的是 `tv_phrase_count` —— 它自己贴在**右端**，
-            // 于是和我们钉在右端的气泡按钮叠在一起（用户截图就是这个）。
-            // 这里把常用语页的计数改成「左右都锚到 parent + 水平偏移 0.5」，与剪贴板页观感一致。
-            centerCounter(counter)
+            // 上一版为了让常用语页的计数不被搜索气泡压住，把 `tv_phrase_count` 改成了居中；
+            // 现在常用语页**不再装搜索按钮**，遮挡问题从根上没有了，
+            // 所以这里恢复「完全不碰宿主计数控件」——观感与宿主原生一致，也少一处风险。
             // 水平：贴父容器右端（与宿主自己的右端槽位同位置），不参与计数的锚点链。
             Reflect.writeInt(lp, "startToStart", UNSET)
             Reflect.writeInt(lp, "startToEnd", UNSET)
@@ -325,38 +368,6 @@ internal class ClipSearch(
      * 只动水平锚点与偏移；垂直方向保持宿主原样（它在标题行里本来就是对的位置）。
      * 写入后回读校验，锚点写不进去时留一行日志，避免"位置没放对"变成只有用户能发现的哑故障。
      */
-    private fun centerCounter(counter: View) {
-        val lp = counter.layoutParams ?: return
-        runCatching {
-            Reflect.writeInt(lp, "startToStart", PARENT_ID)
-            Reflect.writeInt(lp, "startToEnd", UNSET)
-            Reflect.writeInt(lp, "endToEnd", PARENT_ID)
-            Reflect.writeInt(lp, "endToStart", UNSET)
-            Reflect.writeInt(lp, "leftToLeft", UNSET)
-            Reflect.writeInt(lp, "rightToRight", UNSET)
-            // 0.5 偏移＝居中（ConstraintLayout 的 horizontal_bias）。
-            Reflect.writeFloat(lp, "horizontalBias", 0.5f)
-            if (lp is ViewGroup.MarginLayoutParams) {
-                lp.marginStart = 0
-                lp.marginEnd = 0
-                // 剪贴板页的计数本来是 0dp 被拉宽的；居中后要让它按内容收缩，否则会压住右端按钮。
-                if (lp.width == 0) lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
-            }
-            counter.layoutParams = lp
-            counter.requestLayout()
-            val gotStart = Reflect.readInt(lp, "startToStart")
-            val gotEnd = Reflect.readInt(lp, "endToEnd")
-            val ok = gotStart == PARENT_ID && gotEnd == PARENT_ID
-            if (lastCounterCentered != ok) {
-                lastCounterCentered = ok
-                log(
-                    "clip-search: counter centered ${if (ok) "PASS" else "FAIL"}" +
-                        " id=0x${Integer.toHexString(counter.id)}" +
-                        " startToStart=$gotStart endToEnd=$gotEnd"
-                )
-            }
-        }.onFailure { log("clip-search: center counter failed: ${it.message}") }
-    }
 
     /** 未激活＝白底气泡黑字；激活＝浅蓝气泡蓝字（可一眼看出正在过滤）。 */
     private fun applyButtonStyle(button: TextView, active: Boolean) {
@@ -921,6 +932,11 @@ internal class ClipSearch(
             bar.tag = null
             log("clip-search: search bar removed")
         }.onFailure { log("clip-search: search bar remove failed: ${it.message}") }
+        // 关键：把输入焦点交还给外部编辑器。
+        // 不还就会出现「用过一次搜索之后键盘怎么按都打不出字」——宿主仍把按键分发给
+        // 那个已经脱离视图树的搜索框。这一步与"摘视图"必须成对，顺序也是先摘后还。
+        runCatching { restoreFocus?.invoke() }
+            .onFailure { log("clip-search: focus restore failed: ${it.message}") }
     }
 
     /** 扫掉根视图里所有带标记、但不是当前活动条的输入条（防残留）。 */

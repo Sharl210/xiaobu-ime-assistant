@@ -255,6 +255,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 },
                 registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
                 clearInputTarget = resolveInputTargetClearer(bridge, hostClassLoader),
+                restoreFocus = resolveFocusRestorer(bridge, hostClassLoader),
                 closePanel = closePath,
                 openPanel = { boxName -> opener.openByName(boxName) },
             )
@@ -558,6 +559,74 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 true
             }.getOrElse {
                 log("input-target-clear: release failed: ${it.message}")
+                false
+            }
+        }
+    }
+
+    /**
+     * 让宿主的**内部输入焦点交还给外部编辑器**。
+     *
+     * ## 为什么必须有这一步（用户实测现象）
+     *
+     * 「搜索结束（无论点确认还是取消）之后，键盘上就再也打不了字了，必须把键盘收起再展开」。
+     *
+     * 原因：宿主内部的焦点状态是一个**跨调用的全局状态**（`FocusState`：EXTERNAL / INTERNAL）。
+     * 我们调 `manager/h;->l(editText, true)` 时它被设成 INTERNAL，并把 `editText` 记在
+     * 一个静态字段里。搜索结束后我们只把视图摘掉、没有把这个状态改回去 —— 于是键盘敲的键
+     * 仍然按"送给内部输入框"分发，而那个输入框已经脱离了视图树，字就**哪儿都没去**。
+     *
+     * 宿主自己有一对方法完成这两个方向：
+     *
+     * ```text
+     * l(EditText, boolean) -> void    切到内部焦点（我们注册搜索框时用的）
+     * k(int)               -> void    切回外部焦点：清空内部输入框引用、clearFocus、
+     *                                 清组合串，并打印 "switchToExternal"
+     * ```
+     *
+     * 两者在**同一个类**里，因此定位方式完全结构化、不含任何混淆名：
+     * 先找到那个唯一的静态 `(EditText, boolean) -> void`，再在它所属的类里找静态
+     * `(int) -> void`。找不到就不调用（宁可不做，也不猜一个方法乱调）。
+     */
+    private fun resolveFocusRestorer(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+    ): (() -> Boolean)? {
+        val registrarOwner = findMethods(bridge, "focus-restore") {
+            matcher {
+                returnType("void")
+                paramTypes("android.widget.EditText", "boolean")
+            }
+        }
+            .mapNotNull { runCatching { it.getMethodInstance(hostClassLoader) }.getOrNull() }
+            .firstOrNull { candidate ->
+                java.lang.reflect.Modifier.isStatic(candidate.modifiers)
+            }
+            ?.declaringClass
+        if (registrarOwner == null) {
+            log("focus-restore: registrar owner unresolved; keyboard focus will not be restored")
+            return null
+        }
+        val intPrimitive = Int::class.javaPrimitiveType ?: return null
+        val restorer = registrarOwner.declaredMethods.firstOrNull { candidate ->
+            java.lang.reflect.Modifier.isStatic(candidate.modifiers) &&
+                candidate.returnType == Void.TYPE &&
+                candidate.parameterTypes.size == 1 &&
+                candidate.parameterTypes[0] == intPrimitive
+        }
+        if (restorer == null) {
+            log("focus-restore: no static (int)->void on ${registrarOwner.name}")
+            return null
+        }
+        log("focus-restore: bound to ${registrarOwner.name}#${restorer.name}(int)")
+        return {
+            runCatching {
+                restorer.isAccessible = true
+                restorer.invoke(null, 3)
+                log("focus-restore: host internal focus released (external restored)")
+                true
+            }.getOrElse {
+                log("focus-restore: invoke failed: ${it.message}")
                 false
             }
         }

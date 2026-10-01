@@ -39,18 +39,28 @@ import org.luckypray.dexkit.result.MethodData
 internal object SoftKeySwipeMap {
 
     /**
-     * 中文逗号上滑的标记。
+     * 英文逗号上滑的标记 —— 百度那一枚「小册子」图标。
      *
-     * 用「英」＋零宽连接符（U+200D）拼成：屏幕上看到的就是「英」（零宽字符不占位），
-     * 但完整字符串是候选词表里不可能出现的，因此在**上屏出口**按它精确拦截、零误伤。
+     * 百度 `en_26.ini` 里英文逗号键是 `UP=F25`：F25 不是字符，而是一个**功能图标**
+     * （小册子＝英文联想/候选开关）。小布这枚图标**不在资源表里**（全库没有任何与它对应的
+     * drawable），而宿主键面的「上滑小字」这个槽位（`base/entity/c.t`）**只接受字符串**、
+     * 不接受图片，所以这里用书本字形 U+1F4D6 近似它。
+     *
+     * 完整字符串是候选词表里不可能产出的，因此在**上屏出口**按它精确拦截、零误伤。
      */
-    const val CN_COMMA_MARK: String = "英\u200D"
+    const val CN_COMMA_MARK: String = "\uD83D\uDCD6"
 
     /**
-     * 英文页（百度输入法英文 26 键）。
+     * 英文页 —— 逐字抄自**百度输入法自己的布局文件**。
      *
-     * 逗号、句号也在这里：小布原本这两个键**没有上滑**，用户要求补齐，
-     * 并照百度英文页映射（逗号 → `"`、句号 → `?`）。
+     * 来源：`百度输入法定制版_8.5.302.769.apk` → `assets/1080/port/en_26.ini`
+     * 每个 `[KEYn]` 段落里的 `UP=` 就是该键的上滑字符：
+     *
+     * ```text
+     * q..p UP=1..0      │ a..l UP=! @ # $ % & * ( )   │ z..m UP=' / - _ : ; ?
+     * 逗号 KEY27 UP=F25  ← 那个「小册子」图标，即英文联想/候选开关（不是字符）
+     * 句号 KEY29 UP=?   ← 半角问号
+     * ```
      */
     private val TABLE_EN: Map<Char, String> = mapOf(
         'q' to "1", 'w' to "2", 'e' to "3", 'r' to "4", 't' to "5",
@@ -59,34 +69,48 @@ internal object SoftKeySwipeMap {
         'h' to "&", 'j' to "*", 'k' to "(", 'l' to ")",
         'z' to "'", 'x' to "/", 'c' to "-", 'v' to "_", 'b' to ":",
         'n' to ";", 'm' to "?",
-        ',' to "\"", '.' to "'",
+        // 英文页逗号：百度这里是**功能图标**（小册子＝英文联想开关），不是符号。
+        ',' to CN_COMMA_MARK,
+        // 英文页句号：百度是半角问号。
+        '.' to "?",
     )
 
-    /** 中文页（百度输入法中文 26 键）。 */
+    /**
+     * 中文页 —— 逐字抄自百度输入法布局文件 `assets/1080/port/py_26.ini` 的 `UP=` 字段。
+     *
+     * ```text
+     * q..p UP=1..0
+     * a UP=～(全角波浪)  s..j UP=@ # $ % & *
+     * k UP=（   l UP=）        ← 全角圆括号
+     * z UP='  x UP=/  c UP=-  v UP=_
+     * b UP=：（全角冒号）  n UP=；（全角分号）  m UP=、(顿号)
+     * 逗号 KEY27 UP=！（全角叹号）
+     * 句号 KEY29 UP=？（全角问号）
+     * ```
+     *
+     * 注意中英两页**并不相同**：中文页的括号/冒号/分号是**全角**，`～` 也是全角，
+     * 标点是中文标点；英文页则是半角。之前一版两边用同一套半角，所以"不太准确"。
+     */
     private val TABLE_CN: Map<Char, String> = mapOf(
         'q' to "1", 'w' to "2", 'e' to "3", 'r' to "4", 't' to "5",
         'y' to "6", 'u' to "7", 'i' to "8", 'o' to "9", 'p' to "0",
-        'a' to "~", 's' to "@", 'd' to "#", 'f' to "$", 'g' to "%",
-        'h' to "&", 'j' to "*", 'k' to "(", 'l' to ")",
-        'z' to "'", 'x' to "/", 'c' to "-", 'v' to "_", 'b' to ":",
-        'n' to ";", 'm' to "`",
-        // 逗号：百度中文页这里是**英文候选开关**（那个小册子图标）而不是字符，
-        // 所以标记成「英」+ 一个不可见的私用区字符：键面提示看起来就是「英」，
-        // 而拦截判据是「英\uE000」这个两字符串 —— 候选词/手输都不可能产出它，零误伤。
-        ',' to CN_COMMA_MARK, '.' to "?",
+        'a' to "\uFF5E", 's' to "@", 'd' to "#", 'f' to "$", 'g' to "%",
+        'h' to "&", 'j' to "*", 'k' to "\uFF08", 'l' to "\uFF09",
+        'z' to "'", 'x' to "/", 'c' to "-", 'v' to "_",
+        'b' to "\uFF1A", 'n' to "\uFF1B", 'm' to "\u3001",
+        // 中文页逗号：百度这里是**功能图标**（小册子＝英文联想/候选开关），不是符号。
+        ',' to CN_COMMA_MARK, '\uFF0C' to CN_COMMA_MARK,
+        // 中文页句号：全角问号。
+        '.' to "\uFF1F", '\u3002' to "\uFF1F",
     )
 
     /**
      * 中文页逗号的上滑动作：切换"英文候选"开关（百度输入法那个小册子图标的功能）。
      *
-     * 百度那枚图标在小布的资源表里**不存在**（全库只有 `settings_memory_codebook_title` 一处
-     * 含 "book"，与键盘无关），所以这里用汉字「英」当标记；功能本身照做。
+     * 百度 `en_26.ini` 里这一格是 `UP=F25` —— 一个**功能号**而不是字符；中英两页的逗号
+     * 在小布上都用来承担这个开关（用户要求"逗号上滑切英文候选"）。
      */
     const val CN_COMMA_ACTION: String = "toggle_english_suggestion"
-
-    /** 判断某个键是不是"上滑要拦截成开关"的中文逗号。 */
-    private fun isCnCommaToggle(text: String?, lang: String): Boolean =
-        lang == "zh" && text != null && (text == "," || text == "，")
 
     /**
      * 引擎真正读取的**存储键**。
@@ -101,6 +125,13 @@ internal object SoftKeySwipeMap {
 
     /** 宿主设置用的 SharedPreferences 名（未被混淆的字符串常量）。 */
     const val PREFS_NAME: String = "com.oplus.keyboard.restore.preference"
+
+    /** 宿主包名：稳定语义锚点，不参与混淆。 */
+    private const val HOST_PACKAGE: String = "com.oplus.keyboard"
+
+    /** 最近一次拿到的 Context（上下滑标记命中时用来切开关）。 */
+    @Volatile
+    private var contextRef: android.content.Context? = null
 
     /** 标记这个 SoftKey 已经被我们按当前语言刷过，避免每帧重复写。 */
     private const val TAG_LANG: String = "oplusime.swipe.lang"
@@ -138,10 +169,25 @@ internal object SoftKeySwipeMap {
      * 为什么挂在远程连接上：1.21.1 的真机日志已经证明，符号/上滑这类提交最终都从这条链出去
      * （`RemoteInputConnection.commitText`），挂在别处收不到。
      */
+    /**
+     * 上滑标记的**拦截出口**集合。
+     *
+     * ## 为什么不能只挂一处
+     *
+     * 用户实测「上滑了但英文候选没被打开」。上滑字符最终从哪条链提交，取决于键盘类型与
+     * 宿主当时的状态机（框架侧远程输入连接 / 宿主自己的 InputConnection 实现 / 引擎回调），
+     * 之前几个版本每次只挂其中一条，就出现过"挂上了但这条链根本没走"。
+     *
+     * 因此这里一次挂全三条，并且**任何一次提交都留一行证据**（含未命中标记的），
+     * 这样下次日志可以直接看出"标记到底有没有被提交、从哪条链提交"。
+     *
+     * 判据全部是结构化的，不含任何混淆类名/方法名。
+     */
     private fun installSwipeToggleHook(hostClassLoader: ClassLoader) {
         val hookedIcClasses = java.util.Collections.newSetFromMap(
             java.util.concurrent.ConcurrentHashMap<String, Boolean>(),
         )
+        // ① 框架侧远程输入连接：输入法进程对外写字的最终出口（1.22.0 日志已证符号走这条）。
         runCatching {
             val serviceClass = Class.forName(
                 "android.inputmethodservice.InputMethodService",
@@ -161,10 +207,83 @@ internal object SoftKeySwipeMap {
             )
             log("swipe-map: remote IC provider hooked")
         }.onFailure { log("swipe-map: remote IC provider hook failed: ${it.message}") }
+
+        // ② 宿主自己的 InputConnection 实现（不经框架代理的那条）。
+        runCatching {
+            val icClass = android.view.inputmethod.InputConnection::class.java
+            val candidates: List<MethodData> = bridgeRef?.findMethod {
+                matcher {
+                    paramTypes("java.lang.CharSequence", "int")
+                    returnType("boolean")
+                }
+            }?.toList().orEmpty()
+            var count = 0
+            candidates.forEach { data ->
+                val owner = data.declaredClassName ?: return@forEach
+                if (!owner.startsWith(HOST_PACKAGE)) return@forEach
+                val cls = runCatching { Class.forName(owner, false, hostClassLoader) }.getOrNull()
+                    ?: return@forEach
+                if (!icClass.isAssignableFrom(cls)) return@forEach
+                if (!hookedIcClasses.add(cls.name)) return@forEach
+                hookIc(cls, null)
+                count++
+            }
+            log("swipe-map: host IC impl classes hooked=$count")
+        }.onFailure { log("swipe-map: host IC impl scan failed: ${it.message}") }
+
+        // ③ 宿主内部的"提交文本"汇聚点：静态 `(int, CharSequence) -> boolean`
+        //    宿主自己的日志串就是 "commitInternalText text="，说明这是内部提交入口。
+        runCatching {
+            val candidates: List<MethodData> = bridgeRef?.findMethod {
+                matcher {
+                    paramTypes("int", "java.lang.CharSequence")
+                    returnType("boolean")
+                }
+            }?.toList().orEmpty()
+            var count = 0
+            candidates.forEach { data ->
+                val method = runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                    ?: return@forEach
+                if (!java.lang.reflect.Modifier.isStatic(method.modifiers)) return@forEach
+                runCatching {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val text = param.args?.getOrNull(1) as? CharSequence ?: return
+                            if (!isCommaMarker(text)) return
+                            onMarkerSeen("internal-commit")
+                            param.result = java.lang.Boolean.TRUE
+                        }
+                    })
+                    count++
+                }
+            }
+            log("swipe-map: internal commit hooks=$count")
+        }.onFailure { log("swipe-map: internal commit hook failed: ${it.message}") }
+    }
+
+    /** 文本是不是中文逗号上滑那枚标记（容忍首尾空白）。 */
+    private fun isCommaMarker(text: CharSequence?): Boolean {
+        val value = text?.toString()?.trim() ?: return false
+        if (value == CN_COMMA_MARK) return true
+        // 有些路径会带回车或零宽字符，这里放宽一点：包含标记即命中。
+        return value.contains(CN_COMMA_MARK)
+    }
+
+    /** 命中标记：切开关 + 吞掉这次提交，并留一行证据。 */
+    private fun onMarkerSeen(source: String): Boolean {
+        val ctx = contextRef
+        if (ctx == null) {
+            log("swipe-map: marker seen from $source but no context yet")
+            return true
+        }
+        toggleEnglishSuggestion(ctx)
+        log("swipe-map: comma swipe toggled english suggestion (source=$source, submission suppressed)")
+        return true
     }
 
     /** 在远程输入连接上拦「上滑标记」。 */
     private fun hookIc(cls: Class<*>, context: android.content.Context?) {
+        if (context != null) contextRef = context
         val intPrimitive: Class<*> = Int::class.javaPrimitiveType ?: return
         val points: List<Pair<String, Array<Class<*>>>> = listOf(
             "commitText" to arrayOf<Class<*>>(CharSequence::class.java, intPrimitive),
@@ -177,12 +296,10 @@ internal object SoftKeySwipeMap {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val text = param.args?.getOrNull(0) as? CharSequence ?: return
-                        if (text.toString() != CN_COMMA_MARK) return
-                        val ctx = context ?: return
-                        toggleEnglishSuggestion(ctx)
+                        if (!isCommaMarker(text)) return
+                        onMarkerSeen("${cls.name}#$name")
                         // 吞掉这次提交：开关动作本身不该在输入框里留下字符。
                         param.result = true
-                        log("swipe-map: comma swipe toggled english suggestion (submission suppressed)")
                     }
                 })
                 added++
@@ -252,6 +369,7 @@ internal object SoftKeySwipeMap {
      */
     private fun applyLang(view: View?, key: Any) {
         val lang = resolveLang(view) ?: return
+        if (view != null && contextRef == null) contextRef = view.context
         if (appliedLang[key] == lang) return
         runCatching {
             val text = readString(key, "s") ?: return
@@ -315,12 +433,19 @@ internal object SoftKeySwipeMap {
         val next = !current
         val viaHost = writeFlag(next)
         if (!viaHost) {
+            // 宿主入口没定位到时的兜底：至少把值写对，并**自己通知一次**
+            // （找一个宿主进程里注册过该键的监听者做不到，所以这里只落盘 + 记日志，
+            //  用户下次进设置页手动切换一次即可让引擎同步）。
             runCatching {
                 context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    .edit().putBoolean(KEY_EN_SUGGESTION, next).commit()
+                    .edit().putBoolean(KEY_EN_SUGGESTION, next).apply()
             }
         }
-        log("swipe-map: english suggestion $current -> $next (viaHost=$viaHost)")
+        val verify = readFlag()
+        log(
+            "swipe-map: english suggestion $current -> $next (viaHost=$viaHost" +
+                " notify=${flagNotifier?.name} readback=$verify)"
+        )
         return true
     }
 
@@ -330,6 +455,16 @@ internal object SoftKeySwipeMap {
 
     @Volatile
     private var flagWriter: java.lang.reflect.Method? = null
+
+    /**
+     * 宿主设置变更的**通知**入口。
+     *
+     * 光写盘不会实时生效：宿主的设置层把"值变了"和"通知监听者"拆成两步 ——
+     * 写方法只落盘，另有一个静态 `(值, 键名) -> void` 负责遍历该键上的监听者并逐个回调。
+     * 不调它，引擎手里的还是旧值，表现就是"开关动了但输入行为没变"。
+     */
+    @Volatile
+    private var flagNotifier: java.lang.reflect.Method? = null
 
     @Volatile
     private var flagResolved = false
@@ -374,7 +509,19 @@ internal object SoftKeySwipeMap {
                     ?: return@forEach
                 flagReader = reader
                 flagWriter = writer
-                log("swipe-map: settings accessors resolved ${cls.name} read=${reader.name} write=${writer.name}")
+                // 通知入口：同一个类里的静态 `(Object, String) -> void`
+                // 宿主自己的实现就是「按 key 取出监听者列表，逐个 invoke(value, key)」。
+                flagNotifier = cls.declaredMethods.firstOrNull {
+                    java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+                        it.returnType == Void.TYPE &&
+                        it.parameterTypes.size == 2 &&
+                        it.parameterTypes[0] == Any::class.java &&
+                        it.parameterTypes[1] == String::class.java
+                }
+                log(
+                    "swipe-map: settings accessors resolved ${cls.name} read=${reader.name}" +
+                        " write=${writer.name} notify=${flagNotifier?.name}"
+                )
             }
         }.onFailure { log("swipe-map: resolve settings accessors failed: ${it.message}") }
         return flagReader != null && flagWriter != null
@@ -391,6 +538,10 @@ internal object SoftKeySwipeMap {
         if (!resolveFlagAccessors()) return false
         return runCatching {
             flagWriter?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, value)
+            // 显式通知监听者：只写盘不通知，引擎拿的还是旧值（"改了不生效"就是这个）。
+            runCatching {
+                flagNotifier?.invoke(null, value, KEY_EN_SUGGESTION)
+            }.onFailure { log("swipe-map: notify failed: ${it.message}") }
             true
         }.getOrDefault(false)
     }
