@@ -10,7 +10,7 @@
 
 ### 一、文本编辑面板重排
 
-输入框上方弹出的「文本编辑」面板，原来的按钮网格重排成：
+输入框上方弹出的「文本编辑」面板，按钮网格重排成（**即百度输入法的排版**）：
 
 ```
 ┌──────────────┬──────────────┐
@@ -32,7 +32,13 @@
 
 - 面板底部「当前条数 / 上限」那一行，显示上限的地方变成 **∞**。
 - 真正生效的 500 条上限也一并解除——输入法不会再在存满 500 条时把最旧的一条挤掉。
-- 该行最右侧新增一个**白底圆角气泡「搜索」按钮**：点开输入关键字并回车，列表就只留下内容里包含该关键字的条目；清空关键字即恢复全部。
+- 该行最右侧新增一个**白底圆角气泡「搜索」按钮**：点它在**输入法窗口内部**展开一张搜索卡片，
+  输入关键字后点「搜索」，列表就只留下内容里包含该关键字的条目；再点一次按钮即取消搜索、恢复全部。
+
+  > 搜索卡片为什么不做成"弹窗"：输入法进程本身就是输入源，任何叠在输入法窗口**之上**的窗口
+  > （`PopupWindow` 或 `type=0x3eb` 的附加 Dialog）都会把输入法压在下面，键盘就再也弹不出来。
+  > 因此这里把输入界面放进**输入法窗口内部**，并把输入框交给输入法自己的内部焦点机制
+  > （`InputConnectManager.switchInternalFocus`），键盘敲的字才会进到输入框里。
 
 ### 三、常用语
 
@@ -75,7 +81,7 @@ content-length-filter: candidates=1 installed=1
 clip-search: convert candidates=… filterHooks=…
 panel transplanted: 剪切/全选共用左列第一格 删除<-全选格 回车<-删除格 剪贴板<-回车格
 panel verify rows=全选+删除 | 复制+回车 | 粘贴+剪贴板 overlaps=none zeroSize=none verdict=PASS
-clip-search: button created id=0x… class=… anchored to counter=0x7f0905aa
+clip-search: button created id=0x… class=… parent=androidx.constraintlayout.widget.ConstraintLayout anchored to counter=0x7f0905aa
 ```
 
 几处关键行为对应的日志：
@@ -87,6 +93,7 @@ clip-search: button created id=0x… class=… anchored to counter=0x7f0905aa
 | 真的粘贴到内容后回主键盘 | `paste applied -> back to keyboard` |
 | 粘贴时剪贴板是空的 | `paste tapped but nothing to paste` |
 | 用搜索过滤 | `clip-search: page filtered …` |
+| 点「搜索」 | `clip-search: search card shown in ime window, input-registered=…` |
 | 常用语写超 500 字 | `over-limit input allowed (limit=500)` |
 | 选中文字 | `selection cell switched: 全选->剪切 (宿主已启用剪切)` |
 
@@ -142,7 +149,7 @@ app/src/main/java/com/oplusime/panel/
   PanelArranger.kt      文本编辑面板：格子置换、双态格、按钮加宽、版式自检
   ClipboardOpener.kt    打开剪贴板面板：结构定位 + 版本兜底
   HostLimits.kt         解除容量上限：到顶裁剪、正文长度上限
-  ClipSearch.kt         剪贴板搜索：气泡按钮 + 分页过滤
+  ClipSearch.kt         剪贴板搜索：气泡按钮 + 输入法窗口内搜索卡片 + 分页过滤
   HostTweaks.kt         计数显示改 ∞、剪切/粘贴条件返回键盘
   QuotePairSuppressor.kt 引号自动配对抑制
   MainActivity.kt       模块说明页
