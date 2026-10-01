@@ -24,11 +24,11 @@ git -c user.name="Sharl210" -c user.email="sharl210@users.noreply.github.com" \
 git log --oneline -1
 
 echo "== 2/5 推送源码 =="
-git push origin HEAD:main
+git -c credential.helper= push "https://${OWNER}:${TOKEN}@github.com/${OWNER}/${REPO}.git" HEAD:main
 
 echo "== 3/5 打标签并推送 =="
 git tag -f "$TAG"
-git push -f origin "$TAG"
+git -c credential.helper= push -f "https://${OWNER}:${TOKEN}@github.com/${OWNER}/${REPO}.git" "$TAG"
 
 echo "== 4/5 建 Release =="
 python3 - "$TOKEN" "$API" "$OWNER" "$REPO" "$TAG" "$NOTES" <<'PY'
