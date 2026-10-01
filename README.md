@@ -75,7 +75,7 @@ content-length-filter: candidates=1 installed=1
 clip-search: convert candidates=… filterHooks=…
 panel transplanted: 剪切/全选共用左列第一格 删除<-全选格 回车<-删除格 剪贴板<-回车格
 panel verify rows=全选+删除 | 复制+回车 | 粘贴+剪贴板 overlaps=none zeroSize=none verdict=PASS
-clip-search: button attached id=0x…
+clip-search: button created id=0x… class=… anchored to counter=0x7f0905aa
 ```
 
 几处关键行为对应的日志：
