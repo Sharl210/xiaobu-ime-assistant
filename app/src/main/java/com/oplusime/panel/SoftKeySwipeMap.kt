@@ -88,10 +88,18 @@ internal object SoftKeySwipeMap {
     private fun isCnCommaToggle(text: String?, lang: String): Boolean =
         lang == "zh" && text != null && (text == "," || text == "，")
 
-    /** 宿主设置里"英文候选"的开关 key（dex 字符串常量，未混淆）。 */
-    const val KEY_ENGLISH_SUGGESTION: String = "key_english_suggestion"
+    /**
+     * 引擎真正读取的**存储键**。
+     *
+     * 注意区分：设置页那一行的 preference key 是 `key_english_suggestion`，
+     * 而引擎侧读的是 `key_en_suggestion` —— 宿主自己就是这样"界面 key → 存储 key"翻译的
+     * （`settings/English26KeyFragment.onPreferenceTreeClick` 里两个字符串同时出现，
+     *  随后调 `utils/storage/a.k(名字, "key_en_suggestion", 值)`）。
+     * 直接写存储键，才是真正改到引擎行为。
+     */
+    const val KEY_EN_SUGGESTION: String = "key_en_suggestion"
 
-    /** 宿主设置用的 SharedPreferences 名（`body/s.onAttachedToWindow` 里出现）。 */
+    /** 宿主设置用的 SharedPreferences 名（未被混淆的字符串常量）。 */
     const val PREFS_NAME: String = "com.oplus.keyboard.restore.preference"
 
     /** 标记这个 SoftKey 已经被我们按当前语言刷过，避免每帧重复写。 */
@@ -103,6 +111,10 @@ internal object SoftKeySwipeMap {
     @Volatile
     private var hostClassLoader: ClassLoader? = null
 
+    /** 安装时拿到的 DexKit 桥（定位设置读写入口时复用）。 */
+    @Volatile
+    private var bridgeRef: DexKitBridge? = null
+
     /** 最近一次生效的语言（zh / en），用于只在切换语言时重写整表。 */
     @Volatile
     private var lastLang: String? = null
@@ -110,6 +122,7 @@ internal object SoftKeySwipeMap {
     fun install(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         if (installed) return
         this.hostClassLoader = hostClassLoader
+        bridgeRef = bridge
         installDrawHook(bridge, hostClassLoader)
         installSwipeToggleHook(hostClassLoader)
         installed = true
@@ -279,18 +292,107 @@ internal object SoftKeySwipeMap {
     /**
      * 中文逗号上滑 → 切换"英文候选"开关（实时生效）。
      *
-     * 开关 key 由 dex 字符串常量确认：`key_english_suggestion`。
-     * 写入后 commit（宿主的 `body/s` 注册了 `OnSharedPreferenceChangeListener`，
-     * 会立刻按新值重绘 —— 所以不需要重启输入法）。
+     * ## 为什么必须走宿主自己的写入口
+     *
+     * 宿主设置层有一对结构化特征明确的静态方法（同一类里成对出现）：
+     *
+     * ```text
+     * (String 名字, String 键, boolean 默认值) -> boolean   读
+     * (String 名字, String 键, boolean 值)     -> void      写
+     * ```
+     *
+     * 写方法内部除了写盘，还会**逐个通知注册过的键监听**（宿主自己的 `i(值, 键)`），
+     * 输入法因此立刻按新值生效。如果我们自己 `getSharedPreferences(...).edit()`，
+     * 值虽然写进去了，但宿主那套监听不会被触发 —— 观感就是"改了但不实时生效"。
+     *
+     * 所以优先调用宿主写入口；只在它定位不到时才退回直接写偏好（至少值是对的）。
      */
     fun toggleEnglishSuggestion(context: Context): Boolean {
-        val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val next = !prefs.getBoolean(KEY_ENGLISH_SUGGESTION, true)
-        val ok = runCatching {
-            prefs.edit().putBoolean(KEY_ENGLISH_SUGGESTION, next).commit()
+        val current = readFlag() ?: runCatching {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_EN_SUGGESTION, true)
+        }.getOrDefault(true)
+        val next = !current
+        val viaHost = writeFlag(next)
+        if (!viaHost) {
+            runCatching {
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putBoolean(KEY_EN_SUGGESTION, next).commit()
+            }
+        }
+        log("swipe-map: english suggestion $current -> $next (viaHost=$viaHost)")
+        return true
+    }
+
+    /** 宿主设置读写入口（结构匹配结果，进程内缓存）。 */
+    @Volatile
+    private var flagReader: java.lang.reflect.Method? = null
+
+    @Volatile
+    private var flagWriter: java.lang.reflect.Method? = null
+
+    @Volatile
+    private var flagResolved = false
+
+    /**
+     * 结构化定位宿主的设置读写入口。
+     *
+     * 判据（全是类型/形状，不含任何混淆名）：
+     * 同一个**宿主类**里同时存在
+     * `(String,String,boolean) -> boolean` 与 `(String,String,boolean) -> void` 两个静态方法。
+     * 这个成对特征在整个宿主里是唯一的（设置读写助手）。
+     */
+    private fun resolveFlagAccessors(): Boolean {
+        if (flagResolved) return flagReader != null && flagWriter != null
+        flagResolved = true
+        val loader = hostClassLoader ?: return false
+        val bridge = bridgeRef ?: return false
+        runCatching {
+            val boolCls = Boolean::class.javaPrimitiveType ?: return false
+            val candidates: List<MethodData> = bridge.findMethod {
+                matcher {
+                    paramTypes("java.lang.String", "java.lang.String", "boolean")
+                    returnType("void")
+                }
+            }.toList()
+            candidates.forEach { candidate ->
+                val owner = candidate.declaredClassName ?: return@forEach
+                // 只认宿主自己的类（排除框架/第三方）。
+                if (owner.startsWith("android.") || owner.startsWith("androidx.") ||
+                    owner.startsWith("kotlin.") || owner.startsWith("java.")
+                ) {
+                    return@forEach
+                }
+                val cls = runCatching { Class.forName(owner, false, loader) }.getOrNull()
+                    ?: return@forEach
+                val reader = cls.methods.firstOrNull {
+                    it.name != candidate.name && it.parameterTypes.contentEquals(
+                        arrayOf(String::class.java, String::class.java, boolCls),
+                    ) && it.returnType == boolCls
+                } ?: return@forEach
+                val writer = runCatching { candidate.getMethodInstance(loader) }.getOrNull()
+                    ?: return@forEach
+                flagReader = reader
+                flagWriter = writer
+                log("swipe-map: settings accessors resolved ${cls.name} read=${reader.name} write=${writer.name}")
+            }
+        }.onFailure { log("swipe-map: resolve settings accessors failed: ${it.message}") }
+        return flagReader != null && flagWriter != null
+    }
+
+    private fun readFlag(): Boolean? {
+        if (!resolveFlagAccessors()) return null
+        return runCatching {
+            flagReader?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, true) as? Boolean
+        }.getOrNull()
+    }
+
+    private fun writeFlag(value: Boolean): Boolean {
+        if (!resolveFlagAccessors()) return false
+        return runCatching {
+            flagWriter?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, value)
+            true
         }.getOrDefault(false)
-        log("swipe-map: english suggestion -> $next (commit=$ok)")
-        return ok
     }
 
     // ------------------------------------------------------------------ 字段读写

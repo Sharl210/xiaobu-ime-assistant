@@ -51,7 +51,7 @@ internal object ModuleSwitches {
      * 需要排障时，在模块主界面把「日志开关」打开即可（改完最多 5 秒在输入法进程内生效，
      * 不必重启输入法）；用户手动设置过之后一律以设置为准，因此开关打开后照常能取证。
      */
-    const val DEFAULT_LOG_ENABLED: Boolean = false
+    const val DEFAULT_LOG_ENABLED: Boolean = true
 
     /**
      * 缓存值 + 上次刷新时间。
