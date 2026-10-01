@@ -145,6 +145,10 @@ internal class ClipSearch(
     @Volatile
     private var lastAnchorReported: Boolean? = null
 
+    /** 计数控件居中校验的结果，只在变化时打日志。 */
+    @Volatile
+    private var lastCounterCentered: Boolean? = null
+
     /**
      * 快照构建线程（**常驻**，全模块一个）。
      *
@@ -267,6 +271,16 @@ internal class ClipSearch(
         }
         val lp = button.layoutParams ?: return
         runCatching {
+            // 计数控件本身先摆正：**两页都必须居中**。
+            //
+            // 宿主 `res/IB.xml` 里两个计数控件的约束是：
+            //   tv_clip_count    (0x7F0905AA)  0dp  start→parent  end→tv_phrase_count.start  marginEnd=8dp
+            //   tv_phrase_count  (0x7F0905DD)  wrap end→parent  marginEnd=16dp
+            // 剪贴板页是 `tv_clip_count` 在显示，它被拉成 0dp 横跨中段、右端让给 `tv_phrase_count`，
+            // 视觉上正好居中；而常用语页显示的是 `tv_phrase_count` —— 它自己贴在**右端**，
+            // 于是和我们钉在右端的气泡按钮叠在一起（用户截图就是这个）。
+            // 这里把常用语页的计数改成「左右都锚到 parent + 水平偏移 0.5」，与剪贴板页观感一致。
+            centerCounter(counter)
             // 水平：贴父容器右端（与宿主自己的右端槽位同位置），不参与计数的锚点链。
             Reflect.writeInt(lp, "startToStart", UNSET)
             Reflect.writeInt(lp, "startToEnd", UNSET)
@@ -303,6 +317,45 @@ internal class ClipSearch(
                 )
             }
         }.onFailure { log("clip-search: place button failed: ${it.message}") }
+    }
+
+    /**
+     * 把计数控件摆到**水平居中**（两页观感统一）。
+     *
+     * 只动水平锚点与偏移；垂直方向保持宿主原样（它在标题行里本来就是对的位置）。
+     * 写入后回读校验，锚点写不进去时留一行日志，避免"位置没放对"变成只有用户能发现的哑故障。
+     */
+    private fun centerCounter(counter: View) {
+        val lp = counter.layoutParams ?: return
+        runCatching {
+            Reflect.writeInt(lp, "startToStart", PARENT_ID)
+            Reflect.writeInt(lp, "startToEnd", UNSET)
+            Reflect.writeInt(lp, "endToEnd", PARENT_ID)
+            Reflect.writeInt(lp, "endToStart", UNSET)
+            Reflect.writeInt(lp, "leftToLeft", UNSET)
+            Reflect.writeInt(lp, "rightToRight", UNSET)
+            // 0.5 偏移＝居中（ConstraintLayout 的 horizontal_bias）。
+            Reflect.writeFloat(lp, "horizontalBias", 0.5f)
+            if (lp is ViewGroup.MarginLayoutParams) {
+                lp.marginStart = 0
+                lp.marginEnd = 0
+                // 剪贴板页的计数本来是 0dp 被拉宽的；居中后要让它按内容收缩，否则会压住右端按钮。
+                if (lp.width == 0) lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
+            }
+            counter.layoutParams = lp
+            counter.requestLayout()
+            val gotStart = Reflect.readInt(lp, "startToStart")
+            val gotEnd = Reflect.readInt(lp, "endToEnd")
+            val ok = gotStart == PARENT_ID && gotEnd == PARENT_ID
+            if (lastCounterCentered != ok) {
+                lastCounterCentered = ok
+                log(
+                    "clip-search: counter centered ${if (ok) "PASS" else "FAIL"}" +
+                        " id=0x${Integer.toHexString(counter.id)}" +
+                        " startToStart=$gotStart endToEnd=$gotEnd"
+                )
+            }
+        }.onFailure { log("clip-search: center counter failed: ${it.message}") }
     }
 
     /** 未激活＝白底气泡黑字；激活＝浅蓝气泡蓝字（可一眼看出正在过滤）。 */

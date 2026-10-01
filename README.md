@@ -40,6 +40,10 @@
 - **超长条目的渲染优化**：复制进来几万字的超大条目时，列表滑动不再卡顿。
   列表行的正文控件只为看得见的那部分建立排版（超过 800 字符的部分不参与渲染），屏幕外的内容不进排版。
   复制/剪切拿到的仍然是**完整原文**，只影响"屏幕上能预览多少"。
+- **剪贴板条目可以编辑**：条目左侧比输入法原本多一个「编辑」，排在整排功能的最前面
+  （输入法原本的剪贴板行只有"加到常用语 / 分词 / 删除"）。点它弹出和宿主同款的输入框，
+  确认后直接写回输入法自己的剪贴板表；写库走的是输入法自己的 SQL 适配器，不拼 SQL。
+- 常用语页和剪贴板页的计数都**水平居中**，搜索气泡靠右，两边互不遮挡。
 
 > **日志开关**：模块主界面顶部有一个「日志开关」。发布版**默认关闭**（不产生日志，也没有拼字符串、
 > 跨进程写日志的开销，不会在 LSPosed 日志里刷屏干扰其它模块）；需要排查问题时在界面里打开即可，
@@ -50,12 +54,18 @@
   > 因此这里把输入界面放进**输入法窗口内部**，并把输入框交给输入法自己的内部焦点机制
   > （`InputConnectManager.switchInternalFocus`），键盘敲的字才会进到输入框里。
 
-### 三、常用语
+### 三、键盘上滑字符（对齐百度输入法）
+
+- 26 键**中文页**与**英文页**的上滑字符，各自与百度输入法一一对应。
+- 逗号、句号原本没有上滑，现在补齐：英文页逗号→`"`、句号→`'`；中文页逗号→**切换「英文候选」开关**、句号→`?`。
+  中文页逗号上滑就是百度里那枚小册子图标的功能——上滑即开关「英文候选」，实时生效，不用重启输入法。
+
+### 四、常用语
 
 - 单条内容的 **500 字输入上限**解除，可以一直往下写；字数统计照常显示，超限提示不再出现，保存照旧。
 - 常用语条目的**数量上限**也一并解除，不再有「容量已满」。
 
-### 四、引号
+### 五、引号
 
 - 中文符号页、英文符号页和括号类符号，都不再**自动配对补全**：按一个就只上一个，光标停在它后面。
 
@@ -105,7 +115,11 @@ clip-search: button created id=0x… class=… parent=androidx.constraintlayout.
 | 粘贴时剪贴板是空的 | `paste tapped but nothing to paste` |
 | 用搜索过滤 | `paging-data: snapshot adapter=… 20 -> 3 kw=…` |
 | 点「搜索」 | `clip-search: search bar shown in ime window … input-registered=true` |
-| 超长条目被截断渲染 | `render-guard truncated row text 58321 -> 4001 chars` |
+| 超长条目被截断渲染 | `render-guard truncated row text 58321 -> 801 chars` |
+| 上滑字符改写 | `swipe-map: 'q' mark '…' -> '1' (lang=zh)` |
+| 中文逗号上滑切英文候选 | `swipe-map: comma swipe toggled english suggestion` |
+| 剪贴板编辑按钮 | `clip-edit: button added index=0 parent=…` |
+| 编辑写库 | `clip-edit: db write done len=…` |
 | 常用语写超 500 字 | `over-limit input allowed (limit=500)` |
 | 选中文字 | `selection cell switched: 全选->剪切 (宿主已启用剪切)` |
 
@@ -176,6 +190,8 @@ app/src/main/java/com/oplusime/panel/
   ClipboardOpener.kt    打开剪贴板面板：结构定位 + 版本兜底
   HostLimits.kt         解除容量上限：到顶裁剪、正文长度上限
   ClipSearch.kt         剪贴板搜索：气泡按钮 + 输入法窗口内搜索卡片 + 分页过滤
+  ClipboardEdit.kt      剪贴板条目的「编辑」：行内插按钮 + 弹窗 + 写回输入法库
+  SoftKeySwipeMap.kt    26 键上滑字符（中/英两套，对齐百度输入法）+ 逗号上滑切英文候选
   HostTweaks.kt         计数显示改 ∞、剪切/粘贴条件返回键盘
   QuotePairSuppressor.kt 引号自动配对抑制
   MainActivity.kt       模块说明页

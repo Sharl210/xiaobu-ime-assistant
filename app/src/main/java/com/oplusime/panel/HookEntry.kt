@@ -86,6 +86,15 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         /** 搜索按钮上的两个字。 */
         private const val SEARCH_LABEL = "搜索"
 
+        /**
+         * 剪贴板行里「加到常用语」那个控件的资源名。
+         *
+         * 剪贴板行的动作排是：`at_add_to_phrase`（加到常用语）/ `at_splitting_words`（分词）/
+         * `at_delete`（删除）—— **本来就没有「编辑」**。我们的编辑按钮插在「加到常用语」左边，
+         * 于是它在整排里排最前，符合用户"编辑放到最前面"的要求。
+         */
+        private const val NAME_AT_ADD_TO_PHRASE = "at_add_to_phrase"
+
         @Volatile
         var modulePath: String = ""
 
@@ -154,9 +163,15 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val clipListId = resolveIdentifier(apkPath, "id", NAME_CLIP_LIST)
         val phraseCounterId = resolveIdentifier(apkPath, "id", NAME_PHRASE_COUNTER)
         val phraseListId = resolveIdentifier(apkPath, "id", NAME_PHRASE_LIST)
-        log("resolved clip_length id=$clipLengthId counter=$clipCounterId list=$clipListId phraseCounter=$phraseCounterId phraseList=$phraseListId")
+        val addToPhraseId = resolveIdentifier(apkPath, "id", NAME_AT_ADD_TO_PHRASE)
+        log("resolved clip_length id=$clipLengthId counter=$clipCounterId list=$clipListId phraseCounter=$phraseCounterId phraseList=$phraseListId addToPhrase=$addToPhraseId")
 
         DexKitBridge.create(apkPath).use { bridge ->
+            // 26 键上滑字符：按百度输入法一一对应（中文页 / 英文页两套），
+            // 并处理中文逗号上滑＝切换「英文候选」开关。
+            runCatching { SoftKeySwipeMap.install(bridge, hostClassLoader) }
+                .onFailure { log("swipe-map install failed: ${it.message}") }
+
             // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
             // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
             runCatching { QuotePairSuppressor.attachHostImplementations(bridge, hostClassLoader) }
@@ -265,6 +280,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 // 搜索框「退格无效」修复（宿主删除链不落到内部输入框上时由我们补一次）。
                 runCatching { clipSearch.installSearchFieldDeleteFix(bridge, hostClassLoader) }
                     .onFailure { log("clip-search delete fix install failed: ${it.message}") }
+                // 剪贴板条目的「编辑」：在行内动作排最前面插一个编辑按钮，
+                // 弹出宿主同款输入框，确认后写回宿主剪贴板表。
+                runCatching { ClipboardEdit.install(bridge, hostClassLoader, addToPhraseId) }
+                    .onFailure { log("clip-edit install failed: ${it.message}") }
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)
                 if (clipPanelClass != null) {
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {
@@ -815,6 +834,17 @@ internal object Reflect {
     fun writeBoolean(target: Any, name: String, value: Boolean): Boolean {
         val f = field(target.javaClass, name) ?: return false
         return runCatching { f.setBoolean(target, value) }.isSuccess
+    }
+
+    /** 浮点字段（`ConstraintLayout.LayoutParams` 的 `horizontalBias` 等）。 */
+    fun writeFloat(target: Any, name: String, value: Float): Boolean {
+        val f = field(target.javaClass, name) ?: return false
+        return runCatching { f.setFloat(target, value) }.isSuccess
+    }
+
+    fun readFloat(target: Any, name: String): Float? {
+        val f = field(target.javaClass, name) ?: return null
+        return runCatching { f.getFloat(target) }.getOrNull()
     }
 
     /** 取类的“自类型静态单例”字段（宿主常见的 object 单例形态）。 */
