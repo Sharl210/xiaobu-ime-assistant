@@ -13,9 +13,7 @@ import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
-import org.luckypray.dexkit.query.FindClass
 import org.luckypray.dexkit.query.FindMethod
-import org.luckypray.dexkit.result.ClassData
 import org.luckypray.dexkit.result.MethodData
 import java.util.Collections
 import java.util.WeakHashMap
@@ -23,21 +21,46 @@ import java.util.WeakHashMap
 /**
  * 剪贴板面板的「搜索」按钮与条目过滤。
  *
- * 位置：剪贴板面板底部的计数行（`tv_clip_count`，即 “n/∞” 那一行）最右侧，
- * 白底圆角气泡 + 「搜索」两字。
+ * ## 位置（这是本文件的第三次返工，写清楚为什么）
  *
- * 过滤落点：剪贴板列表由分页数据源驱动，分页源会把查到的行「转换」成列表项
- * （`convertRows(List) -> List`，宿主里由生成类实现）。在这个转换结果上做过滤，
- * 既不需要重建分页结果对象，也不依赖任何混淆名：只按“结果里每个字符串字段是否包含关键字”
- * 判断，因此条目的文本或链接任一命中都算命中。
+ * 宿主布局 `res/IB.xml` 里，计数行本来是「左计数 + 右控件」的两端结构：
  *
- * 关键字为空的页面原样返回；命中的目标类限定为发起搜索时列表里已有条目的类型，
- * 避免影响同进程内其它分页列表。
+ * ```text
+ * tv_clip_count (13/∞)   end → tv_phrase_count.start           ← 左端计数
+ * tv_phrase_count        end → parent 右端，top 与计数同一行    ← 右端槽位
+ * ```
+ *
+ * 第 1 次尝试：**新建** View 加到面板根 → 面板根是 ConstraintLayout，新 View 一条约束都没有，
+ * 被摆到 (0,0)，表现为按钮飘在左上角。
+ *
+ * 第 2 次尝试：**接管**宿主那个右端槽位。这个方向是错的——那个控件是宿主
+ * 「剪贴板页 / 常用语页」**共用**的一位：
+ *  - 宿主每次切页都会给它 `setText`（常用语计数），于是我们的「搜索」字样被改写；
+ *  - 它一旦可见，计数控件的 `end` 锚点就被它挤住，`13/∞` 的居中随之偏掉。
+ *
+ * 第 3 次（本版）：**自己新建、把约束显式写全**。具体做法是
+ *  - 新按钮加进计数行所在的容器；
+ *  - `end → parent`（贴右端，与宿主右端槽位同一位置）；
+ *  - `top → 计数控件的 top`、`bottom → 计数控件的 bottom`（与计数行垂直居中对齐，
+ *    高度由计数行决定，不会向下延伸去贴住下面的列表项）；
+ *  - 宿主那个槽位**保持隐藏、一个字不碰** → 计数控件的锚点链完好 → `13/∞` 恢复居中。
+ *
+ * 宿主不认识这个新控件，因此不会再有人来改写它的文字。
+ *
+ * ## 过滤
+ *
+ * 剪贴板列表由分页数据源驱动，分页源会把查到的行「转换」成列表项。在该转换结果上按
+ * 「条目里任一字符串字段 / 无参字符串取值器是否包含关键字」过滤，不依赖任何混淆名。
+ * 另有一层行级兜底（`onBindViewHolder` 绑定后按命中与否收放行高），保证分页实现形态变化时
+ * 搜索仍然可用。
  */
 internal class ClipSearch(
+    /** 计数控件（`tv_clip_count`），即 “n/∞” 那一行；按钮与它垂直居中对齐。 */
     private val counterId: Int,
     private val listId: Int,
     private val label: String,
+    /** 创建宿主同款控件（拿不到时退回普通 TextView）。 */
+    private val createViewLike: ((View) -> TextView?)? = null,
     /** 创建宿主同款输入框（拿不到时退回普通输入框）。 */
     private val createInputField: ((android.content.Context) -> EditText)? = null,
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
@@ -46,100 +69,107 @@ internal class ClipSearch(
     @Volatile
     private var keyword: String? = null
 
-    private val panels: MutableMap<View, View> =
+    /** 面板 → 我们新建的搜索按钮。 */
+    private val buttons: MutableMap<ViewGroup, View> =
         Collections.synchronizedMap(WeakHashMap())
 
     // ------------------------------------------------------------------ UI
 
-    /** 面板每次排布后调用；按钮只在第一次创建。 */
+    /** 面板每次排布后调用；按钮只在第一次创建，之后只重申约束。 */
     fun attach(panel: ViewGroup) {
         val counter = panel.findViewById<View>(counterId) ?: run {
             log("clip-search: counter 0x${Integer.toHexString(counterId)} not found in panel")
             return
         }
-        val existing = panels[panel]
+        val existing = buttons[panel]
         if (existing != null && existing.parent === panel) {
-            alignToCounter(existing, counter)
-            bindCounter(counter, existing)
-            applyActiveStyle(existing)
+            // 宿主用「计数控件是否可见」表达当前是不是剪贴板页
+            // （`D.j(IZ)`：剪贴板页让计数可见、常用语页把它设成 INVISIBLE）。
+            // 这个面板是两页共用的，因此按钮只在剪贴板页显示。
+            val onClipboardPage = counter.visibility == View.VISIBLE
+            val want = if (onClipboardPage) View.VISIBLE else View.GONE
+            if (existing.visibility != want) existing.visibility = want
+            if (onClipboardPage) {
+                place(existing, counter)
+                applyActiveStyle(existing)
+            }
             return
         }
-        val button = createButton(counter) ?: return
+        val button = createButton(panel, counter) ?: return
         panel.addView(button)
-        alignToCounter(button, counter)
-        bindCounter(counter, button)
-        panels[panel] = button
+        buttons[panel] = button
+        place(button, counter)
         applyActiveStyle(button)
-        log("clip-search: button attached id=0x${Integer.toHexString(button.id)}")
+        if (counter.visibility != View.VISIBLE) button.visibility = View.GONE
+        log(
+            "clip-search: button created id=0x" + Integer.toHexString(button.id) +
+                " class=${button.javaClass.name} anchored to counter=0x" +
+                Integer.toHexString(counterId)
+        )
     }
 
-    private fun createButton(template: View): View? {
-        val context = template.context
-        val button = runCatching {
-            val cls = template.javaClass
-            val ctor = cls.constructors.firstOrNull {
-                it.parameterTypes.size == 1 && it.parameterTypes[0] == android.content.Context::class.java
-            }
-            (ctor?.newInstance(context) as? TextView)
-        }.getOrNull() ?: runCatching { TextView(context) }.getOrNull() ?: return null
+    private fun createButton(panel: ViewGroup, counter: View): TextView? {
+        val context = counter.context
+        val view = createViewLike?.invoke(counter) ?: TextView(context)
+        view.id = View.generateViewId()
+        view.text = label
+        view.gravity = Gravity.CENTER
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        view.isClickable = true
+        view.isFocusable = true
+        // 与宿主功能键一致：不吃系统点击音（宿主的反馈链自己会发声/震动）。
+        view.isSoundEffectsEnabled = false
+        view.setOnClickListener { onButtonClicked(view) }
 
-        button.id = View.generateViewId()
-        button.text = label
-        button.gravity = Gravity.CENTER
-        button.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        button.isClickable = true
-        button.isFocusable = true
-        applyButtonStyle(button, active = false)
-        button.setOnClickListener { onButtonClicked(it) }
-        val lp = template.layoutParams
-        if (lp != null) {
-            runCatching { button.layoutParams = lp.javaClass.getConstructor().newInstance() as ViewGroup.LayoutParams }
-        }
-        return button
+        // 与计数控件同族的 LayoutParams（约束布局的参数类型必须一致，否则写入的锚点字段无效）。
+        val lp = runCatching {
+            counter.layoutParams?.javaClass?.getConstructor()?.newInstance() as? ViewGroup.LayoutParams
+        }.getOrNull() ?: ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        view.layoutParams = lp
+        applyButtonStyle(view, active = false)
+        return view
     }
-
-    private fun alignToCounter(button: View, counter: View) {
-        val lp = button.layoutParams ?: return
-        Reflect.writeInt(lp, "startToStart", UNSET)
-        Reflect.writeInt(lp, "startToEnd", UNSET)
-        Reflect.writeInt(lp, "endToStart", UNSET)
-        Reflect.writeInt(lp, "endToEnd", PARENT_ID)
-        Reflect.writeInt(lp, "topToTop", counter.id)
-        Reflect.writeInt(lp, "bottomToBottom", counter.id)
-        Reflect.writeInt(lp, "leftToLeft", UNSET)
-        Reflect.writeInt(lp, "rightToRight", UNSET)
-        if (lp is ViewGroup.MarginLayoutParams) {
-            // 必须显式给尺寸：约束布局的参数默认宽高可能是 0dp（MATCH_CONSTRAINT），
-            // 那样按钮会被算成 0 宽而完全看不见。
-            lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
-            lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
-            lp.marginEnd = (8 * counter.resources.displayMetrics.density).toInt()
-        }
-        button.layoutParams = lp
-        button.requestLayout()
-    }
-
-    // -------------------------------------------------------------- 搜索开关与弹窗
 
     /**
-     * 点一次：进入搜索（弹窗输入关键字）。
-     * 再点一次：退出搜索，恢复全部条目，按钮回到未激活样式。
+     * 把按钮钉在计数行的右端、并与计数行垂直居中。
+     *
+     * 每次排布都重申一次（宿主重排会重置同容器内控件的解析结果），写入是幂等的：
+     * 目标状态唯一，重写不会引发新的重排。
      */
-    private fun onButtonClicked(anchor: View) {
-        if (keyword != null) {
-            applyKeyword("")
-            applyActiveStyle(anchor)
-            log("clip-search: search cleared by second tap")
-            return
-        }
-        showInput(anchor)
+    private fun place(button: View, counter: View) {
+        val lp = button.layoutParams ?: return
+        runCatching {
+            // 水平：贴父容器右端（与宿主自己的右端槽位同位置），不参与计数的锚点链。
+            Reflect.writeInt(lp, "startToStart", UNSET)
+            Reflect.writeInt(lp, "startToEnd", UNSET)
+            Reflect.writeInt(lp, "endToStart", UNSET)
+            Reflect.writeInt(lp, "endToEnd", PARENT_ID)
+            Reflect.writeInt(lp, "leftToLeft", UNSET)
+            Reflect.writeInt(lp, "rightToRight", UNSET)
+            // 垂直：与计数控件同顶同底 → 在计数行内垂直居中，不会向下延伸贴住列表项。
+            Reflect.writeInt(lp, "topToTop", counter.id)
+            Reflect.writeInt(lp, "bottomToBottom", counter.id)
+            Reflect.writeInt(lp, "topToBottom", UNSET)
+            Reflect.writeInt(lp, "bottomToTop", UNSET)
+            if (lp is ViewGroup.MarginLayoutParams) {
+                lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
+                lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
+                val density = counter.resources.displayMetrics.density
+                lp.marginEnd = (12 * density).toInt()
+            }
+            button.layoutParams = lp
+            button.requestLayout()
+        }.onFailure { log("clip-search: place button failed: ${it.message}") }
     }
 
     /** 未激活＝白底气泡黑字；激活＝浅蓝气泡蓝字（可一眼看出正在过滤）。 */
     private fun applyButtonStyle(button: TextView, active: Boolean) {
         val density = button.resources.displayMetrics.density
         val padH = (10 * density).toInt()
-        val padV = (4 * density).toInt()
+        val padV = (2 * density).toInt()
         button.setPadding(padH, padV, padH, padV)
         button.background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
@@ -154,41 +184,29 @@ internal class ClipSearch(
         applyButtonStyle(text, active = keyword != null)
     }
 
+    // -------------------------------------------------------------- 搜索开关与弹窗
+
     /**
-     * 计数行与按钮「左右护法」：计数留在左端（它自身的 start 锚在 parent 上），
-     * 搜索按钮贴右边缘，计数器的右端让给按钮。
-     *
-     * **每次排布都重写一次**：宿主的布局流程会自己重算计数控件的约束，只写一次会被覆盖回去，
-     * 表现为按钮位置乱跑。写入是幂等的（目标状态唯一），不会反复触发重排放大。
+     * 点一次：弹出搜索框（仿宿主的「添加常用语」弹窗形态）。
+     * 再点一次：退出搜索，恢复全部条目，按钮回到未激活样式。
      */
-    private fun bindCounter(counter: View, button: View) {
-        val lp = counter.layoutParams ?: return
-        runCatching {
-            var dirty = false
-            if (Reflect.readInt(lp, "endToEnd") != UNSET) {
-                Reflect.writeInt(lp, "endToEnd", UNSET)
-                dirty = true
-            }
-            if (Reflect.readInt(lp, "rightToRight") != UNSET) {
-                Reflect.writeInt(lp, "rightToRight", UNSET)
-                dirty = true
-            }
-            if (Reflect.readInt(lp, "endToStart") != button.id) {
-                Reflect.writeInt(lp, "endToStart", button.id)
-                dirty = true
-            }
-            if (dirty) counter.layoutParams = lp
-        }.onFailure { log("clip-search: bind counter failed: ${it.message}") }
+    private fun onButtonClicked(anchor: View) {
+        if (keyword != null) {
+            applyKeyword("")
+            applyActiveStyle(anchor)
+            log("clip-search: search cleared by second tap")
+            return
+        }
+        showInput(anchor)
     }
 
     /**
-     * 搜索弹窗：点按钮弹出 → 输入关键字 → 点「搜索」才开始过滤。
+     * 搜索弹窗：顶部标题 + 输入框 + 「取消 / 搜索」，样式对齐宿主自己的编辑弹窗。
      *
-     * 为什么不能只丢一个输入框就完事：输入法本身就是"输入源"，系统不会为输入法进程的窗口
-     * 弹出软键盘，所以"光标放上去键盘自己出来"在 IME 进程内走不通。这里的做法是——弹窗显示后
-     * 把输入框**注册成宿主自己的输入目标**（宿主自带一套 IME 内编辑框的输入链路，它自己的
-     * 常用语编辑界面用的就是这条链路），注册成功后键盘输入就会进入这个输入框。
-     * 注册失败时如实记日志，弹窗上的「取消 / 搜索」与后续过滤不受影响。
+     * 关于输入这件事必须说明白：输入法进程本身就是「输入源」，系统不会给它的窗口弹软键盘，
+     * 所以「光标点上去键盘自己出来」在 IME 进程内不成立。这里在弹窗显示后把输入框
+     * **注册成宿主自己的输入目标**（宿主自带一套 IME 内编辑框的输入链路），
+     * 注册成功时键盘输入会直接进入这个输入框。
      */
     private fun showInput(anchor: View) {
         runCatching {
@@ -203,46 +221,59 @@ internal class ClipSearch(
                 (12 * density).toInt(), (10 * density).toInt(),
                 (12 * density).toInt(), (10 * density).toInt(),
             )
-            val confirm = TextView(context).apply {
+
+            val title = TextView(context).apply {
                 text = "搜索"
                 gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                setTextColor(ACTIVE_FG)
-                setPadding(
-                    (18 * density).toInt(), (10 * density).toInt(),
-                    (18 * density).toInt(), (10 * density).toInt(),
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setTextColor(INACTIVE_FG)
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f,
                 )
-                isClickable = true
             }
             val cancel = TextView(context).apply {
                 text = "取消"
                 gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
                 setTextColor(INACTIVE_FG)
                 setPadding(
-                    (18 * density).toInt(), (10 * density).toInt(),
-                    (18 * density).toInt(), (10 * density).toInt(),
+                    (8 * density).toInt(), (6 * density).toInt(),
+                    (8 * density).toInt(), (6 * density).toInt(),
                 )
                 isClickable = true
             }
-            val actions = LinearLayout(context).apply {
+            val confirm = TextView(context).apply {
+                text = "搜索"
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                setTextColor(ACTIVE_FG)
+                setPadding(
+                    (8 * density).toInt(), (6 * density).toInt(),
+                    (8 * density).toInt(), (6 * density).toInt(),
+                )
+                isClickable = true
+            }
+            val header = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.END
+                gravity = Gravity.CENTER_VERTICAL
                 addView(cancel)
+                addView(title)
                 addView(confirm)
             }
-            val column = LinearLayout(context).apply {
+            val card = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(
-                    (14 * density).toInt(), (12 * density).toInt(),
-                    (14 * density).toInt(), (8 * density).toInt(),
+                    (14 * density).toInt(), (10 * density).toInt(),
+                    (14 * density).toInt(), (10 * density).toInt(),
                 )
+                addView(header)
                 addView(field)
-                addView(actions)
             }
             val popup = PopupWindow(
-                column,
-                (260 * density).toInt(),
+                card,
+                (300 * density).toInt(),
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 true,
             )
@@ -250,7 +281,7 @@ internal class ClipSearch(
             popup.setBackgroundDrawable(
                 GradientDrawable().apply {
                     setColor(Color.WHITE)
-                    cornerRadius = 12 * density
+                    cornerRadius = 16 * density
                 },
             )
             confirm.setOnClickListener {
@@ -259,7 +290,8 @@ internal class ClipSearch(
                 popup.dismiss()
             }
             cancel.setOnClickListener { popup.dismiss() }
-            popup.showAsDropDown(anchor, 0, -(anchor.height + (72 * density).toInt()))
+            // 放在按钮下方、向上偏移，避免被输入法面板本身遮住。
+            popup.showAsDropDown(anchor, 0, -(anchor.height + (56 * density).toInt()))
             field.requestFocus()
             val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
                 .getOrDefault(false)
@@ -277,13 +309,13 @@ internal class ClipSearch(
 
     /**
      * 让列表按新关键字重新走一遍：
-     *  1. `refresh()` 让分页层重新取数（关键字变化后分页过滤才会重新生效）；
+     *  1. `refresh()` 让分页层重新取数；
      *  2. 再触发一次重新绑定，让行级过滤对当前已加载的行重算。
      * PagingDataAdapter 禁用了 `notifyDataSetChanged`，只能用 `notifyItemRangeChanged`。
      */
     private fun reloadLists() {
-        synchronized(panels) {
-            panels.keys.forEach { panel ->
+        synchronized(buttons) {
+            buttons.keys.forEach { panel ->
                 val recycler = runCatching { panel.findViewById<ViewGroup>(listId) }.getOrNull()
                     ?: return@forEach
                 val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
@@ -352,9 +384,6 @@ internal class ClipSearch(
      * 分页源那一层（[installPagingFilter]）是「真过滤」，但依赖宿主分页实现的具体形态；
      * 这一层不关心数据从哪来——绑定时拿到条目，不命中就把这一行收成 0 高度并隐藏，
      * 命中则还原原始高度。两层叠加：分页层生效时这里基本无事可做，分页层没接上时这里保证搜得动。
-     *
-     * 适配器用继承链判定（链上出现 paging 包名即认为成立），条目的取用通过反射调用其
-     * `getItem(int)`，因此不写死任何宿主混淆名。
      */
     fun installRowFilter(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         val candidates = findMethods(bridge, "paging-adapter") {
@@ -467,24 +496,12 @@ internal class ClipSearch(
         .getOrDefault(emptyList())
         .also { log("$label candidates=${it.size}") }
 
-    private fun findClasses(
-        bridge: DexKitBridge,
-        label: String,
-        init: FindClass.() -> Unit,
-    ): List<ClassData> = runCatching { bridge.findClass(init).toList() }
-        .onFailure { log("$label query failed: ${it.message}") }
-        .getOrDefault(emptyList())
-        .also { log("$label candidates=${it.size}") }
-
     private companion object {
         /** ConstraintLayout.LayoutParams.PARENT_ID */
         const val PARENT_ID = 0
 
         /** ConstraintLayout.LayoutParams.UNSET */
         const val UNSET = -1
-
-        /** Room 分页包装查询的固定前缀（库层字符串，非宿主混淆名）。 */
-        const val PAGING_WRAPPER_SQL = "SELECT * FROM ("
 
         /** 行级过滤用来暂存「原始行高」的 tag key。 */
         val ROW_HEIGHT_TAG: Int = "oplusime_panel_row_height".hashCode()

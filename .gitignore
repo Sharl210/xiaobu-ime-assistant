@@ -8,3 +8,7 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+
+# 构建产物（发布走 Release 资产，不进源码树）
+dist/
+*.apk

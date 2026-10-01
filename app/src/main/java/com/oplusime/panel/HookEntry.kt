@@ -8,6 +8,7 @@ import android.util.DisplayMetrics
 import android.view.View
 import android.widget.EditText
 import android.view.ViewGroup
+import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
@@ -133,9 +134,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val clipLengthId = resolveIdentifier(apkPath, "string", NAME_CLIP_LENGTH)
         val clipCounterId = resolveIdentifier(apkPath, "id", NAME_CLIP_COUNTER)
         val clipListId = resolveIdentifier(apkPath, "id", NAME_CLIP_LIST)
-        log(
-            "resolved clip_length id=$clipLengthId counter=$clipCounterId list=$clipListId"
-        )
+        log("resolved clip_length id=$clipLengthId counter=$clipCounterId list=$clipListId")
 
         DexKitBridge.create(apkPath).use { bridge ->
             // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
@@ -176,13 +175,18 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             runCatching { HostLimits.install(bridge, hostClassLoader) }
                 .onFailure { log("host-limits install failed: ${it.message}") }
 
-            // 剪贴板面板：计数行最右侧加白底气泡「搜索」，点击按关键字过滤条目。
-            // 门槛只看计数控件：只要计数行在，按钮就一定能挂上去；
-            // 列表 id 只用于「重新加载」，取不到也不该让整个功能失效。
+            // 剪贴板面板：计数行最右端加白底气泡「搜索」，点击弹窗输入关键字过滤条目。
+            //
+            // 按钮是**本模块新建**的控件，不接管宿主任何既有控件——上一版抢宿主那个
+            // 两页共用的右端槽位，导致文字被宿主改写成常用语计数、计数被挤得不居中。
+            // 新建控件的代价是「ConstraintLayout 上无约束会被摆到 (0,0)」，
+            // 因此 [ClipSearch.place] 必须把锚点显式写全（本版已写：end→parent、
+            // 上下贴计数控件）。宿主不认识这个控件，就不会再改写它。
             val clipSearch = ClipSearch(
                 counterId = clipCounterId,
                 listId = clipListId,
                 label = SEARCH_LABEL,
+                createViewLike = { template -> cloneTextView(template) },
                 createInputField = resolveHostEditTextClass(bridge, hostClassLoader)?.let { cls ->
                     { context: Context ->
                         cls.constructors
@@ -229,6 +233,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 log("clip-search: counter/list id unresolved; search button skipped")
             }
 
+            // 本模块不抢宿主的任何槽位：按钮是自己新建的，宿主按页切换可见性时
+            // 不会碰它；由 [ClipSearch.attach] 自己按「计数控件是否可见」判断当前是不是
+            // 剪贴板页，再决定按钮显示还是隐藏。
+
             val onClickMethod = runCatching { onClick.getMethodInstance(hostClassLoader) }
                 .onFailure { log("panel onClick instance failed: ${it.message}") }
                 .getOrNull()
@@ -270,6 +278,22 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 log("panel layout method not found; arrangement will only run once per panel")
             }
         }
+    }
+
+    /**
+     * 克隆一个与模板同族的文字控件：用模板自己的类与 `(Context)` 构造器创建，
+     * 于是字体、行高、内边距默认值都随宿主控件体系走（拿不到时退回普通 `TextView`）。
+     */
+    private fun cloneTextView(template: View): TextView? {
+        if (template !is TextView) return null
+        val context = template.context
+        return runCatching {
+            val ctor = template.javaClass.constructors.firstOrNull {
+                it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == Context::class.java
+            } ?: return@runCatching null
+            ctor.newInstance(context) as? TextView
+        }.getOrNull()
     }
 
     /**
