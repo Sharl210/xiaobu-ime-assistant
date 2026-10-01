@@ -11,7 +11,7 @@ android {
         applicationId 'com.oplusime.panel'
         minSdk 23
         targetSdk 34
-        // 版本：1.20.0（versionCode 24）
+        // 版本：1.21.1（versionCode 26）
         versionCode 26
         versionName '1.21.1'
     }
