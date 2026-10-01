@@ -1,6 +1,10 @@
 package com.oplusime.panel
 
+import android.app.Dialog
+import android.content.Context
+import android.content.DialogInterface
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
@@ -65,6 +69,8 @@ internal class ClipSearch(
     private val createInputField: ((android.content.Context) -> EditText)? = null,
     /** 把输入框注册成宿主的当前输入目标；返回是否成功。 */
     private val registerInputTarget: ((EditText) -> Boolean)? = null,
+    /** 宿主自己的对话框构建器类（`COUIAlertDialogBuilder`）；拿不到时退回浮层。 */
+    private val dialogBuilderClass: Class<*>? = null,
 ) {
     @Volatile
     private var keyword: String? = null
@@ -85,28 +91,41 @@ internal class ClipSearch(
             log("clip-search: counter 0x${Integer.toHexString(counterId)} not found in panel")
             return
         }
+        // 真正该把按钮加进去的父容器，是**计数控件所在的那个容器**（宿主布局 IB.xml 的根，
+        // 是一个 ConstraintLayout），而不是面板本身。宿主面板类继承自 RelativeLayout，
+        // 把带约束锚点的按钮加到它身上，锚点一个都不生效 → 被摆到 (0,0)，就是左上角那个位置。
+        val host = counter.parent as? ViewGroup ?: panel
+        // 宿主用「计数控件是否可见」表达当前是不是剪贴板页（同一个方法里，剪贴板页让计数可见、
+        // 常用语页把它设成 INVISIBLE）。按钮只在剪贴板页显示。
+        val onClipboardPage = counter.visibility == View.VISIBLE
         val existing = buttons[panel]
-        if (existing != null && existing.parent === panel) {
-            // 每次都重申「文字 = 搜索」与锚点。重申文字这一步是必须的：交给宿主自己维护的话，
-            // 任何一次它自己的 setText 都会把我们的字样冲掉（上一版抢宿主槽位就是这么坏的）。
-            place(existing, counter)
-            if (existing.visibility != View.VISIBLE) existing.visibility = View.VISIBLE
-            applyActiveStyle(existing)
+        if (existing != null && existing.parent === host) {
+            if (onClipboardPage) {
+                // 每次都重申「文字 = 搜索」与锚点：宿主不认识这个控件，但重申一次成本极低，
+                // 且能挡住任何意外的文字覆盖。
+                place(existing, counter)
+                if (existing.visibility != View.VISIBLE) existing.visibility = View.VISIBLE
+                applyActiveStyle(existing)
+            } else if (existing.visibility != View.GONE) {
+                existing.visibility = View.GONE
+            }
             return
         }
-        val button = createButton(panel, counter) ?: return
-        panel.addView(button)
+        val button = createButton(counter) ?: return
+        host.addView(button)
         buttons[panel] = button
         place(button, counter)
         applyActiveStyle(button)
+        if (!onClipboardPage) button.visibility = View.GONE
         log(
             "clip-search: button created id=0x" + Integer.toHexString(button.id) +
-                " class=${button.javaClass.name} anchored to counter=0x" +
-                Integer.toHexString(counterId)
+                " class=${button.javaClass.name} parent=${host.javaClass.name}" +
+                " anchored to counter=0x" + Integer.toHexString(counterId) +
+                " clipboardPage=$onClipboardPage"
         )
     }
 
-    private fun createButton(panel: ViewGroup, counter: View): TextView? {
+    private fun createButton(counter: View): TextView? {
         val context = counter.context
         val view = createViewLike?.invoke(counter) ?: TextView(context)
         view.id = View.generateViewId()
@@ -248,14 +267,119 @@ internal class ClipSearch(
     }
 
     /**
-     * 搜索弹窗：顶部标题 + 输入框 + 「取消 / 搜索」，样式对齐宿主自己的编辑弹窗。
+     * 搜索弹窗。
      *
-     * 关于输入这件事必须说明白：输入法进程本身就是「输入源」，系统不会给它的窗口弹软键盘，
-     * 所以「光标点上去键盘自己出来」在 IME 进程内不成立。这里在弹窗显示后把输入框
-     * **注册成宿主自己的输入目标**（宿主自带一套 IME 内编辑框的输入链路），
-     * 注册成功时键盘输入会直接进入这个输入框。
+     * **必须是真正的 Dialog，而且必须是宿主那种 Dialog。** 原因（宿主自己的代码就是答案）：
+     *
+     * 输入法进程本身就是输入源，普通窗口在 IME 里拿不到键盘输入。宿主自己那些带输入框的弹窗
+     * （`input/view/body/D;->q(String, Function0)`）是这么做的：
+     *
+     * ```text
+     * COUIAlertDialogBuilder(context).setTitle(...)
+     *   .setBlurBackgroundDrawable(true)
+     *   .create()
+     * dialog.window.attributes.token = <IME 自己的 windowToken>   ← 关键一
+     * dialog.window.attributes.type  = 0x3eb (TYPE_APPLICATION_ATTACHED_DIALOG)  ← 关键二
+     * dialog.window.addFlags(0x20002)  // FLAG_DIM_BEHIND | FLAG_ALT_FOCUSABLE_IM  ← 关键三
+     * dialog.show()
+     * ```
+     *
+     * 把 IME 自己的 window token 交给弹窗、并声明成「附加在输入法窗口上的对话框」，
+     * 弹窗才真正活在输入法的窗口体系里；再配合宿主自己的「内部焦点」机制
+     * （`input/manager/h;->l(EditText, boolean)`，宿主自己的常用语编辑框用的就是它），
+     * 键盘敲的字才会进到弹窗的输入框里。
+     *
+     * 早期版本用的是 `PopupWindow`：那只是个挂在当前窗口上的浮层，既没有自己的 window token，
+     * 也不参与输入法的窗口层级，所以**永远收不到键盘输入**——这就是"弹窗里打不了字"的根因。
      */
     private fun showInput(anchor: View) {
+        if (showHostStyleDialog(anchor)) return
+        showPopupFallback(anchor)
+    }
+
+    /** 宿主同款 Dialog：取不到宿主 Dialog 类时返回 false，由 [showPopupFallback] 兜底。 */
+    private fun showHostStyleDialog(anchor: View): Boolean {
+        val cls = dialogBuilderClass ?: return false
+        return runCatching {
+            val context = anchor.context
+            val density = context.resources.displayMetrics.density
+            val field = createInputField?.invoke(context) ?: EditText(context)
+            field.hint = "输入要搜索的关键字"
+            field.setSingleLine()
+            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            field.setText(keyword ?: "")
+            field.setPadding(
+                (10 * density).toInt(), (14 * density).toInt(),
+                (10 * density).toInt(), (14 * density).toInt(),
+            )
+
+            val builder = cls.getConstructor(Context::class.java).newInstance(context)
+            cls.getMethod("setTitle", CharSequence::class.java).invoke(builder, "搜索")
+            cls.getMethod("setView", View::class.java).invoke(builder, field)
+            cls.getMethod(
+                "setNegativeButton",
+                CharSequence::class.java,
+                DialogInterface.OnClickListener::class.java,
+            ).invoke(builder, "取消", null)
+            cls.getMethod(
+                "setPositiveButton",
+                CharSequence::class.java,
+                DialogInterface.OnClickListener::class.java,
+            ).invoke(
+                builder,
+                "搜索",
+                DialogInterface.OnClickListener { _, _ ->
+                    applyKeyword(field.text?.toString().orEmpty())
+                    applyActiveStyle(anchor)
+                },
+            )
+            runCatching {
+                cls.getMethod("setBlurBackgroundDrawable", Boolean::class.javaPrimitiveType)
+                    .invoke(builder, true)
+            }
+
+            val dialog = cls.getMethod("create").invoke(builder) as? Dialog
+                ?: error("create() did not return a Dialog")
+            dialog.setCancelable(true)
+            attachToImeWindow(dialog, anchor)
+            dialog.setOnShowListener {
+                field.requestFocus()
+                field.setSelection(field.text?.length ?: 0)
+                val registered = runCatching { registerInputTarget?.invoke(field) ?: false }
+                    .getOrDefault(false)
+                log(
+                    "clip-search: host dialog shown, input-registered=$registered" +
+                        " token=${anchor.windowToken != null}"
+                )
+            }
+            dialog.show()
+            true
+        }.getOrElse {
+            log("clip-search: host dialog failed: ${it.message}")
+            false
+        }
+    }
+
+    /**
+     * 把弹窗挂到输入法自己的窗口上：token 取当前视图的 window token，
+     * 窗口类型声明为「附加对话框」，并加上 `FLAG_ALT_FOCUSABLE_IM`
+     * （与宿主 `D.q` 的做法逐条一致）。
+     */
+    private fun attachToImeWindow(dialog: Dialog, anchor: View) {
+        runCatching {
+            val window = dialog.window ?: return
+            val attrs = window.attributes
+            attrs.token = anchor.windowToken
+            attrs.type = TYPE_APPLICATION_ATTACHED_DIALOG
+            window.attributes = attrs
+            window.addFlags(FLAG_DIM_BEHIND or FLAG_ALT_FOCUSABLE_IM)
+            window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            window.setDimAmount(0.3f)
+        }.onFailure { log("clip-search: attach dialog to ime window failed: ${it.message}") }
+    }
+
+    /** 宿主 Dialog 类拿不到时的兜底：功能受限（键盘输入可能进不来），但至少能看能选。 */
+    private fun showPopupFallback(anchor: View) {
         runCatching {
             val context = anchor.context
             val density = context.resources.displayMetrics.density
@@ -552,6 +676,15 @@ internal class ClipSearch(
 
         /** 行级过滤用来暂存「原始行高」的 tag key。 */
         val ROW_HEIGHT_TAG: Int = "oplusime_panel_row_height".hashCode()
+
+        /** `WindowManager.LayoutParams.TYPE_APPLICATION_ATTACHED_DIALOG`（宿主 `D.q` 用的值）。 */
+        const val TYPE_APPLICATION_ATTACHED_DIALOG = 0x3eb
+
+        /** `WindowManager.LayoutParams.FLAG_DIM_BEHIND`。 */
+        const val FLAG_DIM_BEHIND = 0x2
+
+        /** `WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM`（宿主 `D.q` 加的 0x20002 里的一位）。 */
+        const val FLAG_ALT_FOCUSABLE_IM = 0x20000
 
         /** 搜索未激活：白底黑字。 */
         val INACTIVE_FG: Int = Color.parseColor("#E5000000")
