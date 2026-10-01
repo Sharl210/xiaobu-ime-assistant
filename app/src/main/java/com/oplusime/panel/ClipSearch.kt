@@ -877,6 +877,10 @@ internal class ClipSearch(
         val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
             ?: return
 
+        // 从 0 开始统计这次重绑的过滤结果，收尾日志里会写"藏了几行、留了几行"。
+        rowHidden = 0
+        rowShown = 0
+
         val refreshed = runCatching {
             adapter.javaClass.getMethod("refresh").invoke(adapter)
             true
@@ -909,6 +913,13 @@ internal class ClipSearch(
             "clip-search: rebind($reason) page=$page refresh=$refreshed" +
                 " setAdapter=$rebound notify=$notified adapter=${adapter.javaClass.name}"
         )
+        // 过滤是否真的落到界面上，必须能自证：绑定完成后报一次"藏了几行、留了几行"。
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            log(
+                "clip-search: row filter summary page=$page kw=${currentKeyword() ?: "<none>"}" +
+                    " hidden=$rowHidden shown=$rowShown"
+            )
+        }, 400L)
     }
 
     // -------------------------------------------------------------- 分页过滤
@@ -980,13 +991,31 @@ internal class ClipSearch(
                         val view = runCatching {
                             holder.javaClass.getMethod("getItemView").invoke(holder) as? View
                         }.getOrNull() ?: return
-                        val item = runCatching {
-                            param.thisObject.javaClass
-                                .getMethod("getItem", Int::class.javaPrimitiveType)
-                                .invoke(param.thisObject, position)
-                        }.getOrNull()
+                        val adapter = param.thisObject ?: return
                         val current = currentKeyword()
-                        applyRowVisibility(view, current == null || matches(item, current))
+
+                        // 没有关键字：一律还原，保证"取消搜索"后条目全部回来。
+                        if (current == null) {
+                            applyRowVisibility(view, true)
+                            rowShown++
+                            return
+                        }
+
+                        val item = readItem(adapter, position)
+                        if (item == null) {
+                            // 读不到条目（占位行、或宿主换了取值形态）时**保持可见**：
+                            // 宁可漏过滤，也不能把整屏清空 —— 1.25.0 的真机现象就是"列表看起来垮掉"。
+                            applyRowVisibility(view, true)
+                            if (!itemUnreadableLogged) {
+                                itemUnreadableLogged = true
+                                log("clip-search: row item unreadable adapter=${adapter.javaClass.name} pos=$position")
+                            }
+                            return
+                        }
+
+                        val hit = matches(item, current)
+                        applyRowVisibility(view, hit)
+                        if (hit) rowShown++ else rowHidden++
                     }
                 })
                 installed++
@@ -1016,6 +1045,46 @@ internal class ClipSearch(
             }
             if (view.visibility != View.GONE) view.visibility = View.GONE
         }
+    }
+
+    /**
+     * 从列表适配器读某一行的条目。
+     *
+     * ## 这是 1.25.0 搜索"看起来没用"的直接原因（真机日志 + 宿主形态）
+     *
+     * 之前用的是 `getMethod("getItem", int)`。而 `PagingDataAdapter#getItem(int)` 是
+     * **protected**，`Class.getMethod` 只返回 public 方法 —— 于是每次都抛
+     * `NoSuchMethodException`，被 `runCatching` 吞掉，`item` 恒为 null，
+     * `matches(null, kw)` 恒为 false，**每一行都被收成 0 高度隐藏**。
+     * 用户看到的就是"列表被清空/页面垮掉"，而不是"只剩匹配条目"。
+     *
+     * 现在按三条路依次取，全部拿到再判断：
+     *  1. 公开的 `peek(int)`（分页适配器自带的公开读取口，最稳）；
+     *  2. 沿继承链找 `getItem(int)`（含 protected），拿到后解除访问限制再调；
+     *  3. 都不行 → 返回 null，调用方按"保持可见"处理，绝不静默清空列表。
+     */
+    private fun readItem(adapter: Any, position: Int): Any? {
+        val cls = adapter.javaClass
+        runCatching {
+            cls.getMethod("peek", Int::class.javaPrimitiveType).invoke(adapter, position)
+        }.onSuccess { return it }
+
+        var current: Class<*>? = cls
+        var depth = 0
+        while (current != null && current != Any::class.java && depth < 12) {
+            val method = runCatching {
+                current!!.getDeclaredMethod("getItem", Int::class.javaPrimitiveType)
+            }.getOrNull()
+            if (method != null) {
+                return runCatching {
+                    method.isAccessible = true
+                    method.invoke(adapter, position)
+                }.getOrNull()
+            }
+            current = current.superclass
+            depth++
+        }
+        return null
     }
 
     /** 继承链上出现分页包名即为分页源；只做判定，不改任何行为。 */
@@ -1077,6 +1146,17 @@ internal class ClipSearch(
         /** 当前活动输入条里的输入框：确认/收尾时取它的文字，不依赖视图引用是否还在。 */
         @Volatile
         var activeField: EditText? = null
+
+        /** 本轮重绑里被隐藏 / 保留的行数（用于"过滤真的生效了吗"自证）。 */
+        @Volatile
+        var rowHidden: Int = 0
+
+        @Volatile
+        var rowShown: Int = 0
+
+        /** 条目读不到只提醒一次，避免刷屏。 */
+        @Volatile
+        var itemUnreadableLogged: Boolean = false
 
         /** 当前输入条所属的实例：返回键「取消搜索」要用（视图上拿不到实例）。 */
         @Volatile
