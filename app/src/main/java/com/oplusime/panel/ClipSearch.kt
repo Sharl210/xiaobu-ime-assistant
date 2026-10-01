@@ -415,8 +415,9 @@ internal class ClipSearch(
             )
             row.addView(buildBarButton(context, "取消") {
                 liveFilterHandler.removeCallbacks(liveFilterRunnable)
-                removeSearchBar()
-                reopenPanel(page)
+                applyKeyword("")
+                log("clip-search: cancel tapped page=$page")
+                finishSearch(page, "cancel")
             })
             row.addView(buildBarButton(context, "搜索") {
                 confirmSearch(field, page)
@@ -431,6 +432,7 @@ internal class ClipSearch(
             root.addView(row, lp)
             row.bringToFront()
             activeBar = row
+            activeField = field
 
             // 输入条被摘掉时同步"忘记"它。宿主此刻把内部输入目标指向了这个输入框，
             // 如果只摘视图、不解除指向，宿主会对着一个已脱离视图树的输入框继续操作，
@@ -439,6 +441,7 @@ internal class ClipSearch(
                 override fun onViewAttachedToWindow(v: View) = Unit
                 override fun onViewDetachedFromWindow(v: View) {
                     if (activeBar === v) activeBar = null
+                    if (activeField === field) activeField = null
                 }
             })
 
@@ -501,30 +504,102 @@ internal class ClipSearch(
             cornerRadius = 10 * density
         }
         button.isClickable = true
+        // 触摸留证：1.22/1.23 的日志里从未出现过"确认"这一步，无法判断是"按钮没被点到"
+        // 还是"点到了但处理没跑完"。加这一行之后，下次日志可以直接分辨。
+        button.setOnTouchListener { _, event ->
+            if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                log("clip-search: bar button '$label' touch down")
+            }
+            false
+        }
         button.setOnClickListener { onClick() }
         return button
     }
 
     /**
-     * 「确认搜索」的唯一实现：先应用关键字，延迟一点再收输入条、解除宿主的内部输入目标、回到面板。
+     * 「确认搜索」：应用关键字 → 摘输入条 → **重新打开面板** → 让列表按关键字重绑。
      *
-     * 顺序是有证据的（1.22.0 真机现象）：输入条是排在输入法窗口根视图上的普通 View，
-     * 宿主此时把内部输入目标指向了它。**先摘视图、后解除指向**会让宿主对着已脱离视图树的
-     * 输入框继续操作，于是输入法把整个窗口收下去；先解除指向、再摘视图就避免了这一点。
+     * 1.23.0 真机日志（18:46:04）给出的两条硬事实：
+     *  - 打字过程中关键字确实生效了（`live filter applied kw='计算机'`），所以过滤逻辑没问题；
+     *  - 紧接着 `refresh failed: com.oplus.keyboard.input.adapter.Q.refresh []` —— 列表刷新这一步
+     *    失败，界面因此看不到任何变化，用户的感觉就是"搜了没用"。
+     *
+     * 另外**不再调用"解除内部输入目标"**：那个调用会让宿主把键盘收下去（正是用户看到的
+     * "一点搜索整个界面就关掉"）。摘掉视图、重新打开面板这两步，宿主会自己把内部目标重新落回面板。
      */
     private fun confirmSearch(field: EditText, page: Page) {
         liveFilterHandler.removeCallbacks(liveFilterRunnable)
         val kw = field.text?.toString().orEmpty()
         applyKeyword(kw)
         log("clip-search: confirm tapped kw='$kw' page=$page")
+        finishSearch(page, "confirm")
+    }
+
+    /**
+     * 搜索收尾：摘掉输入条 → 重新打开面板 → 让列表重绑。
+     *
+     * 抽成一条路是必要的：不管是点输入条上的按钮、还是按键盘上的「搜索」键（那条会被宿主
+     * 自己接走并收起键盘），最终都必须落到同一组收尾动作，否则就会出现
+     * "界面关了、输入条还留在屏幕上、结果也没过滤"这种半成品状态。
+     */
+    private fun finishSearch(page: Page, reason: String) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
         runCatching {
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                runCatching { clearInputTarget?.invoke() }
-                    .onFailure { log("clip-search: clear input target failed: ${it.message}") }
+            handler.postDelayed({
                 removeSearchBar()
                 reopenPanel(page)
-            }, 120L)
-        }.onFailure { log("clip-search: confirm failed: ${it.message}") }
+                // 面板刚重建，行必须重走一遍绑定，行级过滤才会生效 —— 这一步就是
+                // "关键词生效了但屏幕上看不到结果"的解药。
+                handler.postDelayed({
+                    reloadLists(page)
+                    log(
+                        "clip-search: finish($reason) page=$page" +
+                            " kw=${keywordFor(page) ?: "<none>"}"
+                    )
+                }, 220L)
+            }, 90L)
+        }.onFailure { log("clip-search: finish($reason) failed: ${it.message}") }
+    }
+
+    /**
+     * 输入法窗口被系统收起时的收尾。
+     *
+     * 触发场景（真机日志已复现）：输入框带 `IME_ACTION_SEARCH`，键盘上因此出现「搜索」键；
+     * 那一按由**宿主自己**处理（不会走我们的监听器），宿主按常规行为把键盘收了下去，
+     * 于是屏幕上只剩一条没人清理的输入条。
+     *
+     * 这里把该做的事补齐：关键字生效 → 摘输入条 → 重新打开面板看过滤结果。
+     */
+    fun onImeWindowHidden() {
+        val bar = activeBar ?: return
+        val page = currentPage
+        val kw = activeField?.text?.toString().orEmpty()
+        liveFilterHandler.removeCallbacks(liveFilterRunnable)
+        applyKeyword(kw)
+        log("clip-search: ime window hidden while bar shown -> apply kw='$kw' page=$page bar=$bar")
+        removeSearchBar()
+        reopenPanel(page)
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            reloadLists(page)
+            log("clip-search: window-hidden cleanup done page=$page")
+        }, 220L)
+    }
+
+    /** 挂住输入法窗口隐藏事件；只在这一个进程内、只影响本模块自己。 */
+    fun installImeWindowHook() {
+        runCatching {
+            XposedBridge.hookAllMethods(
+                android.inputmethodservice.InputMethodService::class.java,
+                "onWindowHidden",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        runCatching { onImeWindowHidden() }
+                            .onFailure { log("clip-search: window-hidden cleanup failed: ${it.message}") }
+                    }
+                },
+            )
+            log("clip-search: ime window hidden hook installed")
+        }.onFailure { log("clip-search: ime window hidden hook failed: ${it.message}") }
     }
 
     /** 移除输入条；可重复调用。 */
@@ -709,35 +784,62 @@ internal class ClipSearch(
     }
 
     /**
-     * 让列表按新关键字重新走一遍：
-     *  1. `refresh()` 让分页层重新取数；
-     *  2. 再触发一次重新绑定，让行级过滤对当前已加载的行重算。
-     * PagingDataAdapter 禁用了 `notifyDataSetChanged`，只能用 `notifyItemRangeChanged`。
+     * 让列表按新关键字重新走一遍：**三条路依次尝试**，只要有一条成功，屏幕上就会看到过滤结果。
+     *
+     *  1. 宿主自己的 `refresh()` —— 1.23.0 真机日志显示这个签名在这版宿主上不存在
+     *     （`refresh failed: ...adapter.Q.refresh []`），保留但它已经不是主路；
+     *  2. 用同一个 adapter 再 `setAdapter` 一次 —— 强制所有可见行重走 `onBindViewHolder`，
+     *     行级过滤因此立即生效。这一条不依赖宿主任何混淆方法名，是当前的主路；
+     *  3. `notifyItemRangeChanged` 兜底。
+     *
+     * 三条各自写日志（`rebind(...) refresh=? setAdapter=? notify=?`），下次一眼就能看出
+     * 是哪一条真正在起作用。
      */
     private fun reloadLists(page: Page = currentPage) {
         synchronized(buttons) {
-            buttons.keys.forEach { panel ->
-                val targetId = if (page == Page.CLIPBOARD) listId else phraseListId
-                val recycler = runCatching { panel.findViewById<ViewGroup>(targetId) }.getOrNull()
-                    ?: return@forEach
-                val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
-                    ?: return@forEach
-                runCatching {
-                    adapter.javaClass.getMethod("refresh").invoke(adapter)
-                    log("clip-search: adapter refreshed page=$page")
-                }.onFailure { log("clip-search: refresh failed: ${it.message}") }
-                runCatching {
-                    val count = adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int ?: 0
-                    adapter.javaClass
-                        .getMethod(
-                            "notifyItemRangeChanged",
-                            Int::class.javaPrimitiveType,
-                            Int::class.javaPrimitiveType,
-                        )
-                        .invoke(adapter, 0, count)
-                }.onFailure { log("clip-search: rebind failed: ${it.message}") }
-            }
+            buttons.keys.forEach { panel -> rebindList(panel, page, "keyword") }
         }
+    }
+
+    private fun rebindList(panel: View, page: Page, reason: String) {
+        val targetId = if (page == Page.CLIPBOARD) listId else phraseListId
+        val recycler = runCatching { panel.findViewById<View>(targetId) }.getOrNull()
+            ?: return
+        val adapter = runCatching { Reflect.readObject(recycler, "mAdapter") }.getOrNull()
+            ?: return
+
+        val refreshed = runCatching {
+            adapter.javaClass.getMethod("refresh").invoke(adapter)
+            true
+        }.getOrElse { false }
+
+        val rebound = runCatching {
+            val loader = recycler.javaClass.classLoader
+            val rvClass = Class.forName("androidx.recyclerview.widget.RecyclerView", false, loader)
+            val adapterClass = Class.forName("androidx.recyclerview.widget.RecyclerView\$Adapter", false, loader)
+            rvClass.getMethod("setAdapter", adapterClass).invoke(recycler, adapter)
+            true
+        }.getOrElse {
+            log("clip-search: rebind($reason) setAdapter failed: ${it.message}")
+            false
+        }
+
+        val notified = runCatching {
+            val count = adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int ?: 0
+            adapter.javaClass
+                .getMethod(
+                    "notifyItemRangeChanged",
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                )
+                .invoke(adapter, 0, count)
+            true
+        }.getOrElse { false }
+
+        log(
+            "clip-search: rebind($reason) page=$page refresh=$refreshed" +
+                " setAdapter=$rebound notify=$notified adapter=${adapter.javaClass.name}"
+        )
     }
 
     // -------------------------------------------------------------- 分页过滤
@@ -902,6 +1004,10 @@ internal class ClipSearch(
         /** 当前显示中的搜索输入条（模块级：任何路径都能把它清掉，防止变成屏幕上的孤儿）。 */
         @Volatile
         var activeBar: View? = null
+
+        /** 当前活动输入条里的输入框：确认/收尾时取它的文字，不依赖视图引用是否还在。 */
+        @Volatile
+        var activeField: EditText? = null
 
         /** 输入条根视图上的标记，用于"引用丢了也能扫出来清掉"。 */
         val BAR_TAG: Int = "oplusime_panel_search_bar".hashCode()

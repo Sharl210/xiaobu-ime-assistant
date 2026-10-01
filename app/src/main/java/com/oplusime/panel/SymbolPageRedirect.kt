@@ -1,7 +1,5 @@
 package com.oplusime.panel
 
-import android.os.Handler
-import android.os.Looper
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
@@ -116,16 +114,22 @@ internal object SymbolPageRedirect {
             runCatching { (field.get(target) as? Enum<*>)?.name }.getOrNull()
         }.joinToString(",")
 
-    /** 本次切换是否"正要进入简洁符号页"（仅用于日志，不再参与判定）。 */
-    @Volatile
-    private var enteringSimplePage: Boolean = false
-
-    /** 已替用户按下「更多」的次数与节流时间。 */
+    /** 已替用户按下「更多」的次数。 */
     @Volatile
     private var fullPageCount: Int = 0
 
+    /**
+     * 正在替用户按「更多」。
+     *
+     * 我们自己调用 `h0(true)` 会再次进入被钩的切换方法，这个标记保证嵌套那一层直接返回，
+     * 不会无限递归。
+     */
     @Volatile
-    private var lastFullPageAt: Long = 0L
+    private var inPromote: Boolean = false
+
+    /** 记录过多少次"这一步之后没停在简洁页、因此不需要补"（把曾经的静默路径变成可查证据）。 */
+    @Volatile
+    private var skippedCount: Int = 0
 
     fun install(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         val enumClass = findSymbolEnum(bridge, hostClassLoader)
@@ -235,15 +239,29 @@ internal object SymbolPageRedirect {
                         // 这里是在 k0 **执行之后**、页面已经建好的那一刻调用宿主自己的入口，
                         // 与用户手点「更多」完全同一条路，因此不需要猜类型、也不会崩。
                         // 按**当前实际档位**实时判定：只有"这一步之后真的停在简洁符号页"才补一次「更多」。
-                        // 无论中间套了几层调用、几个线程交错，判定都与现场一致，
-                        // 不再依赖跨调用的布尔标记（那正是连点会偶尔失效的原因）。
+                        //
+                        // 1.23.0 真机日志（18:45:30.386 / 18:45:31.062 两次落在简洁页）证明：
+                        // 判定本身没错，错的是判定之后还有一道 **500ms 静默节流**——
+                        // 连点时间隔常在 300~470ms，正好被它吃掉，而且它返回时不写任何日志，
+                        // 所以表现为"偶尔落回简洁页、日志里看不出原因"。
+                        // 本版彻底删除该节流：判定完全按现场档位，调用是幂等的（只有停在简洁页才补）。
+                        if (inPromote) return
                         val manager = param.args?.getOrNull(0) ?: return
                         val target = (param.args?.firstOrNull {
                             it is Enum<*> && it.javaClass != enumClass
                         } as? Enum<*>) ?: return
                         if (!target.name.contains("SYMBOL", ignoreCase = true)) return
-                        if (describeField(manager, fields) != NAME_SIMPLE) return
-                        followFullPage(manager)
+                        val state = describeField(manager, fields)
+                        if (state != NAME_SIMPLE) {
+                            // 退出符号页（NONE_SYMBOL）或已经是完整页：不需要补，但要留一行，
+                            // 避免以后又出现"看不出原因的跳过"。
+                            skippedCount++
+                            if (skippedCount <= 20) {
+                                log("symbol-page: follow-up not needed state=$state target=${target.name}")
+                            }
+                            return
+                        }
+                        followFullPage(manager, "after-switch[" + target.name + "]")
                     }
                 })
                 hooked++
@@ -306,10 +324,17 @@ internal object SymbolPageRedirect {
     /**
      * 替用户按一次「更多」：调用宿主自己的符号页总入口 `h0(true)`。
      *
-     * 只在"刚从主键盘进入简洁符号页"之后调用一次，并做 500ms 节流；
-     * 调用本身走的是宿主自己的流程（与用户手点「更多」一致），因此不会改坏状态机。
+     * 与用户手点「更多」完全同一条路（宿主自己的状态机、自己的视图流程），因此不会改坏返回键。
+     *
+     * 三条纪律（都是真机日志换来的）：
+     *  1. **不做跨调用节流**：1.23.0 的 500ms 节流会在连点（300~470ms 间隔）时静默吃掉补调，
+     *     表现就是"偶尔落回简洁页"。这里只按现场档位判定，幂等。
+     *  2. **就地同步补，不用延迟任务**：延迟任务可能在用户已经离开符号页之后才触发，
+     *     那时再调 `h0(true)` 会把他重新拉进简洁页 —— 属于"模块自己造成掉页"。
+     *  3. **最多补两次**：宿主若在补调之后又把档位写回简洁页，再补一次；仍写回就放弃，
+     *     交给下一轮用 `not needed / invoked` 两类日志继续定位，不进入死循环。
      */
-    private fun followFullPage(manager: Any?) {
+    private fun followFullPage(manager: Any?, phase: String) {
         val method = entryMethod ?: run {
             log("symbol-page: follow-up 'more' skipped (entry unresolved)")
             return
@@ -318,27 +343,24 @@ internal object SymbolPageRedirect {
             log("symbol-page: follow-up 'more' skipped (manager instance unresolved)")
             return
         }
-        val now = System.currentTimeMillis()
-        if (now - lastFullPageAt < 500L) return
-        lastFullPageAt = now
-        runCatching {
-            method.isAccessible = true
-            method.invoke(instance, true)
-            fullPageCount++
-            log("symbol-page: follow-up 'more' invoked h0(true) (total=$fullPageCount)")
-        }.onFailure { log("symbol-page: follow-up 'more' failed: ${it.message}") }
-        // 复核并补一次：k0 之后宿主还可能把档位写回，连点时偶尔会落回简洁页。
-        // 180ms 后按当时**实际档位**判断，仍是 SYMBOL1 就再调一次（等价再按一次「更多」）。
-        runCatching {
-            Handler(Looper.getMainLooper()).postDelayed({
-                runCatching {
-                    if (describeField(instance, fieldList) != NAME_SIMPLE) return@postDelayed
-                    method.isAccessible = true
-                    method.invoke(instance, true)
-                    fullPageCount++
-                    log("symbol-page: follow-up 'more' retried h0(true) (total=$fullPageCount)")
-                }
-            }, 180L)
+        if (inPromote) return
+        inPromote = true
+        try {
+            var attempt = 0
+            while (attempt < 2 && describeField(instance, fieldList) == NAME_SIMPLE) {
+                attempt++
+                method.isAccessible = true
+                method.invoke(instance, true)
+                fullPageCount++
+                log(
+                    "symbol-page: follow-up 'more' invoked h0(true) phase=$phase" +
+                        " attempt=$attempt total=$fullPageCount"
+                )
+            }
+        } catch (t: Throwable) {
+            log("symbol-page: follow-up 'more' failed: ${t.message}")
+        } finally {
+            inPromote = false
         }
     }
 

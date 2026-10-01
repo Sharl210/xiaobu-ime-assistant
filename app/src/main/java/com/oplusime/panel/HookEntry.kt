@@ -241,6 +241,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 openPanel = { boxName -> opener.openByName(boxName) },
             )
             if (clipCounterId != 0) {
+                // 输入法窗口被系统收起（例如键盘上的「搜索」键被宿主自己接走）时，
+                // 由这条钩子把"关键字生效 + 摘输入条 + 回面板看结果"补齐，避免留下屏幕孤儿条。
+                runCatching { clipSearch.installImeWindowHook() }
+                    .onFailure { log("clip-search window hook install failed: ${it.message}") }
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
                 runCatching { clipSearch.installRowFilter(bridge, hostClassLoader) }
