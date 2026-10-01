@@ -11,9 +11,9 @@ android {
         applicationId 'com.oplusime.panel'
         minSdk 23
         targetSdk 34
-        // 版本：1.29.0（versionCode 34）
-        versionCode 34
-        versionName '1.29.0'
+        // 版本：1.30.0（versionCode 35）
+        versionCode 35
+        versionName '1.30.0'
     }
 
     // 本模块自带的签名库（自建，与宿主无关）。如要换成自己的，替换下面四项即可。

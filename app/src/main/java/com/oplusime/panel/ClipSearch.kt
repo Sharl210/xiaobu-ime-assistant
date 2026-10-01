@@ -115,7 +115,47 @@ internal class ClipSearch(
         }
         // 关键字一变，所有过滤快照立即作废（下一轮列表询问时重建）。
         dataVersion++
-        synchronized(dataAdaptersLock) { dataSnapshots.clear() }
+        synchronized(dataAdaptersLock) {
+            dataSnapshots.clear()
+            registeredAdapters().forEach { adapter ->
+                // 提前在后台算好快照：否则重建会发生在**列表布局过程中**
+                // （宿主询问条目数时就落在那一帧），一次遍历全部条目 + 递归取正文，
+                // 正是"搜一下卡一下"的来源。
+                prebuildSnapshotAsync(adapter)
+            }
+        }
+    }
+
+    /** 已经登记过的适配器（来自我们自己的两张列表）。 */
+    private fun registeredAdapters(): List<Any> =
+        synchronized(dataAdaptersLock) { dataAdapterPages.keys.toList() }
+
+    /**
+     * 后台预构建快照：把"遍历全部条目 + 递归取正文"的开销挪出布局帧。
+     *
+     * 列表随时会来问条目数/取值，因此这里先算好放进缓存；算好之前列表继续用原数据
+     * （[ensureSnapshot] 在缓存未就绪时也不会强行现算），所以不会出现"空白一帧"。
+     */
+    private fun prebuildSnapshotAsync(adapter: Any) {
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        runCatching {
+            worker.execute {
+                runCatching { buildSnapshot(adapter) }
+                    .onFailure { log("paging-data: prebuild failed: ${it.message}") }
+                // 快照算好后**必须再通知列表一次**：此前那次通知发生在快照就绪之前，
+                // 列表问到的还是原始条目数。少了这一步，用户会看到"搜了但列表没变"。
+                val pageOfAdapter = runCatching {
+                    synchronized(dataAdaptersLock) { dataAdapterPages[adapter] }
+                }.getOrNull()
+                if (pageOfAdapter != null) {
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        runCatching { notifyRebind(adapter, pageOfAdapter, "snapshot-ready") }
+                            .onFailure { log("paging-data: post-prebuild notify failed: ${it.message}") }
+                    }
+                }
+            }
+        }.onFailure { log("paging-data: prebuild schedule failed: ${it.message}") }
+        worker.shutdown()
     }
 
     /** 上一次锚点校验的结果，只在变化时打日志（避免每帧刷屏）。 */
@@ -1143,6 +1183,8 @@ internal class ClipSearch(
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val adapter = param.thisObject ?: return
                         val snapshot = ensureSnapshot(adapter) ?: return
+                        // 命中 0 条 → 报告真实条目数，不改写（宁可"没筛掉"，也不把列表清空）。
+                        if (snapshot.degraded) return
                         param.result = snapshot.items.size
                         logThrottled("paging-data", 1_000L) {
                             "paging-data: adapter=${adapter.javaClass.name}" +
@@ -1165,12 +1207,100 @@ internal class ClipSearch(
                         val adapter = param.thisObject ?: return
                         val position = param.args?.getOrNull(0) as? Int ?: return
                         val snapshot = ensureSnapshot(adapter) ?: return
+                        // 同样：放弃改写时放行原实现，不返回 null（否则会得到整屏空白行）。
+                        if (snapshot.degraded) return
                         param.result = snapshot.items.getOrNull(position)
                     }
                 })
                 log("paging-data: item hooked ${candidate.declaredClassName}")
             }.onFailure { log("paging-data item hook failed: ${it.message}") }
         }
+    }
+
+    /**
+     * 搜索框「退格无效」修复。
+     *
+     * ## 真机现象
+     *
+     * 搜索框能打字，但按删除键删不掉已输入的内容（只能继续往后加字）。
+     *
+     * ## 根因（宿主删除链与插入链不同一条）
+     *
+     * 输入法把搜索框当**内部输入目标**（`input/manager/h;->l(EditText, true)`）之后，
+     * 键盘上的按键不再直接写控件：
+     *  - **插入**走宿主把文本层内容写回控件，所以能看见；
+     *  - **删除**走的是另一条静态方法（参数形状 `(int, int, boolean) → void`），签名里
+     *    根本没有 `EditText` —— 它改的是宿主自己维护的那份"文本快照"，**不保证**落到
+     *    我们搜索框的 `Editable` 上，于是按删除键在界面上完全没有反应。
+     *
+     * ## 做法（只补差值，不抢宿主的行为）
+     *
+     * 挂住所有「静态 + `(int,int,boolean)` + 返回 void」的方法：
+     *  - 调用前记下搜索框当时的文字；
+     *  - 调用后如果文字**一个字都没变**，说明这次删除没落到控件上 → 由我们按"删掉光标前
+     *    一个字符"补一次，并让既有的输入监听重新过滤。
+     *
+     * 文字变了就什么都不做——宿主自己删成功时不重复删、不叠加。搜索框没显示时整条逻辑
+     * 立即返回，不影响输入法任何正常按键。
+     */
+    fun installSearchFieldDeleteFix(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = findMethods(bridge, "delete-shape") {
+            matcher {
+                paramTypes("int", "int", "boolean")
+                returnType("void")
+            }
+        }
+        var installed = 0
+        candidates.forEach { candidate ->
+            val method = runCatching { candidate.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            if (!java.lang.reflect.Modifier.isStatic(method.modifiers)) return@forEach
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        deleteProbe.set(activeField?.text?.toString())
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val field = activeField ?: return
+                        val before = deleteProbe.getAndSet(null) ?: return
+                        val after = field.text?.toString()
+                        if (after != before) return
+                        // 宿主这次删除没有落到搜索框上 → 我们自己补一次（只删一个字符）。
+                        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                        handler.post {
+                            runCatching { backspaceActiveField(field) }
+                                .onFailure { log("clip-search: backspace fix failed: ${it.message}") }
+                        }
+                        logThrottled("delete-fix", 1_000L) {
+                            "clip-search: delete not applied by host, self-backspace (len=${before.length})"
+                        }
+                    }
+                })
+                installed++
+                log("clip-search: delete fix hooked ${candidate.declaredClassName}")
+            }.onFailure { log("clip-search: delete fix hook failed: ${it.message}") }
+        }
+        log("clip-search: delete-shape candidates=${candidates.size} installed=$installed")
+    }
+
+    /** 删掉搜索框里光标前的一个字符（有选区时删选区）。 */
+    private fun backspaceActiveField(field: EditText) {
+        val editable = field.text ?: return
+        val start = field.selectionStart
+        val end = field.selectionEnd
+        if (start < 0 || end < 0) return
+        if (start != end) {
+            editable.delete(minOf(start, end), maxOf(start, end))
+            return
+        }
+        if (start == 0) return
+        // 按字符（而不是按 UTF-16 码元）删，避免删掉代理对的一半。
+        val chars = android.text.TextUtils.substring(editable, 0, start)
+        val cut = if (chars.isNotEmpty() && Character.isLowSurrogate(chars[chars.length - 1]) &&
+            chars.length >= 2 && Character.isHighSurrogate(chars[chars.length - 2])
+        ) 2 else 1
+        editable.delete(start - cut, start)
     }
 
     /** 登记：只有从我们那两张列表上取到的适配器实例才参与过滤。 */
@@ -1192,8 +1322,16 @@ internal class ClipSearch(
         val kw = dataKeywordFor(adapter) ?: return null
         synchronized(dataAdaptersLock) {
             val cached = dataSnapshots[adapter]
-            if (cached != null && cached.version == dataVersion && cached.keyword == kw) return cached
+            // 只认已经算好的快照：关键字/版本一变就在后台重建（见 prebuildSnapshotAsync），
+            // 这里**绝不现算** —— 本方法处于列表布局路径上，现算会直接把那一帧拖住。
+            if (cached == null || cached.version != dataVersion || cached.keyword != kw) return null
+            return cached
         }
+    }
+
+    /** 真正遍历条目、构造过滤快照（只在后台线程调用）。 */
+    private fun buildSnapshot(adapter: Any): DataSnapshot? {
+        val kw = dataKeywordFor(adapter) ?: return null
         val countMethod = pagingCountMethod ?: return null
         val itemMethod = pagingItemMethod ?: return null
         val originalCount = runCatching {
@@ -1207,6 +1345,23 @@ internal class ClipSearch(
             // 占位行（分页尚未加载到的位置）保持原样，交给宿主自己按占位处理。
             if (item == null || matches(item, kw)) items.add(item)
         }
+        // 一条都没命中时**不做任何改写**（1.30.0 的关键纠正）。
+        //
+        // 真机反馈：条目里明明有 `123456789`，搜 `1234` 却是"空列表"。这条路径有两种坏结局，
+        // 而它们对用户来说都是"数据不见了"：
+        //   - 判定全部落空 → 报的条目数变成 0 → 列表被清空；
+        //   - 报的条目数没变、取值被换成空 → 整屏空白行。
+        // 两者都不该发生：搜索最多"没筛掉东西"，绝不该把列表弄空。
+        // 因此凡是"命中 0 条"或"取不到原始条目数"，一律放弃本次改写并留证，让列表保持原样。
+        if (items.isEmpty() || originalCount <= 0) {
+            val degraded = DataSnapshot(dataVersion, kw, originalCount, emptyList(), degraded = true)
+            synchronized(dataAdaptersLock) { dataSnapshots[adapter] = degraded }
+            log(
+                "paging-data: no match, filter skipped (count=$originalCount matched=${items.size}" +
+                    " kw=$kw) —— 保持列表原样，绝不置空"
+            )
+            return null
+        }
         val snapshot = DataSnapshot(dataVersion, kw, originalCount, items)
         synchronized(dataAdaptersLock) { dataSnapshots[adapter] = snapshot }
         log("paging-data: snapshot adapter=${adapter.javaClass.name} $originalCount -> ${items.size} kw=$kw")
@@ -1218,6 +1373,8 @@ internal class ClipSearch(
         val keyword: String,
         val originalCount: Int,
         val items: List<Any?>,
+        /** 命中 0 条而放弃改写时置真：此时钩子必须以"不干预"的方式放行。 */
+        val degraded: Boolean = false,
     )
 
     // -------------------------------------------------------------- 分页过滤（旧路径：源转换）
@@ -1258,95 +1415,22 @@ internal class ClipSearch(
         log("clip-search: convert candidates=${candidates.size} filterHooks=$installed")
     }
 
-    // ------------------------------------------------------ 行级过滤（兜底保证）
+    // ------------------------------------------------------ 行级过滤（已移除）
+    //
+    // 1.30.0 把「绑定时把不匹配的行收成 0 高度并隐藏」这条路**整条删除**。原因是它在真机上
+    // 同时造成两个坏结果，而且都不是"搜索不好用"这么轻：
+    //
+    //  1. **滑动卡顿**：它在列表**已经完成布局之后**改写已上屏行的 `layoutParams.height`
+    //     与 `visibility`，破坏 RecyclerView 的布局缓存与回收池对"行由绑定流程决定"的假设，
+    //     每一帧都要重新测量/布局，滑动因此发涩；
+    //  2. **整屏空白**：它和数据层过滤（重写适配器报告的条目数）同时存在，两者对"第 i 行
+    //     应该显示什么"给出不同答案 —— 用户看到的就是"搜了以后结果为空"。
+    //
+    // 过滤现在只有一条路：[installPagingDataFilter] 在数据层改写（只对登记过的适配器生效），
+    // 由列表自己按新的条目数重新布局。不需要、也不允许再从视图侧插手。
 
     /**
-     * 行级过滤：直接挂在列表适配器的 `onBindViewHolder` 上。
-     *
-     * 分页源那一层（[installPagingFilter]）是「真过滤」，但依赖宿主分页实现的具体形态；
-     * 这一层不关心数据从哪来——绑定时拿到条目，不命中就把这一行收成 0 高度并隐藏，
-     * 命中则还原原始高度。两层叠加：分页层生效时这里基本无事可做，分页层没接上时这里保证搜得动。
-     */
-    fun installRowFilter(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
-        val candidates = findMethods(bridge, "paging-adapter") {
-            matcher {
-                name("onBindViewHolder")
-                paramTypes("androidx.recyclerview.widget.RecyclerView\$ViewHolder", "int")
-            }
-        }
-        var installed = 0
-        candidates.forEach { bind ->
-            val owner = runCatching { bind.declaredClass?.getInstance(hostClassLoader) }.getOrNull()
-                ?: return@forEach
-            if (!isPagingSource(owner)) return@forEach
-            val method = runCatching { bind.getMethodInstance(hostClassLoader) }.getOrNull()
-                ?: return@forEach
-            runCatching {
-                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val holder = param.args.getOrNull(0) ?: return
-                        val position = param.args.getOrNull(1) as? Int ?: return
-                        val view = runCatching {
-                            holder.javaClass.getMethod("getItemView").invoke(holder) as? View
-                        }.getOrNull() ?: return
-                        val adapter = param.thisObject ?: return
-                        val current = currentKeyword()
-
-                        // 没有关键字：一律还原，保证"取消搜索"后条目全部回来。
-                        if (current == null) {
-                            applyRowVisibility(view, true)
-                            rowShown++
-                            return
-                        }
-
-                        val item = readItem(adapter, position)
-                        if (item == null) {
-                            // 读不到条目（占位行、或宿主换了取值形态）时**保持可见**：
-                            // 宁可漏过滤，也不能把整屏清空 —— 1.25.0 的真机现象就是"列表看起来垮掉"。
-                            applyRowVisibility(view, true)
-                            if (!itemUnreadableLogged) {
-                                itemUnreadableLogged = true
-                                log("clip-search: row item unreadable adapter=${adapter.javaClass.name} pos=$position")
-                            }
-                            return
-                        }
-
-                        val hit = matches(item, current)
-                        applyRowVisibility(view, hit)
-                        if (hit) rowShown++ else rowHidden++
-                    }
-                })
-                installed++
-                log("clip-search: row filter hooked ${bind.declaredClassName}")
-            }.onFailure { log("clip-search: row hook failed: ${it.message}") }
-        }
-        log("clip-search: adapter candidates=${candidates.size} rowHooks=$installed")
-    }
-
-    /**
-     * 命中 → 还原原始高度；未命中 → 收成 0 高度并隐藏。
-     * 原始高度记在 itemView 的 tag 上，避免行被回收复用后还原失真。
-     */
-    private fun applyRowVisibility(view: View, visible: Boolean) {
-        val lp = view.layoutParams ?: return
-        if (visible) {
-            val saved = view.getTag(ROW_HEIGHT_TAG) as? Int ?: return
-            view.setTag(ROW_HEIGHT_TAG, null)
-            lp.height = saved
-            view.layoutParams = lp
-            if (view.visibility != View.VISIBLE) view.visibility = View.VISIBLE
-        } else {
-            if (view.getTag(ROW_HEIGHT_TAG) == null) view.setTag(ROW_HEIGHT_TAG, lp.height)
-            if (lp.height != 0) {
-                lp.height = 0
-                view.layoutParams = lp
-            }
-            if (view.visibility != View.GONE) view.visibility = View.GONE
-        }
-    }
-
-    /**
-     * 从列表适配器读某一行的条目。
+     * 从列表适配器读某一行的条目（数据层快照重建时用）。
      *
      * ## 这是 1.25.0 搜索"看起来没用"的直接原因（真机日志 + 宿主形态）
      *
@@ -1515,6 +1599,10 @@ internal class ClipSearch(
          */
         @Volatile
         var dataVersion: Int = 0
+
+        /** 删除链探针：调用前记下搜索框文字，调用后比对是否真的被删掉。 */
+        private val deleteProbe: java.util.concurrent.atomic.AtomicReference<String?> =
+            java.util.concurrent.atomic.AtomicReference()
 
         /** 分页适配器用来报告条目数/取条目的原始方法：重建快照时要拿它们取真实数据。 */
         @Volatile

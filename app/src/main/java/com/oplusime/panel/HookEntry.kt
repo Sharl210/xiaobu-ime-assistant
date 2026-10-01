@@ -262,8 +262,9 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 // 列表行的「超大正文」渲染护栏：只影响看得见的那点文字，不影响复制到的内容。
                 runCatching { ListRenderGuard.install(bridge, hostClassLoader) }
                     .onFailure { log("render-guard install failed: ${it.message}") }
-                runCatching { clipSearch.installRowFilter(bridge, hostClassLoader) }
-                    .onFailure { log("clip-search row install failed: ${it.message}") }
+                // 搜索框「退格无效」修复（宿主删除链不落到内部输入框上时由我们补一次）。
+                runCatching { clipSearch.installSearchFieldDeleteFix(bridge, hostClassLoader) }
+                    .onFailure { log("clip-search delete fix install failed: ${it.message}") }
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)
                 if (clipPanelClass != null) {
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {

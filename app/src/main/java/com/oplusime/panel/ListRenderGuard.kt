@@ -44,7 +44,7 @@ internal object ListRenderGuard {
      * 只有真正的"超长粘贴"才会被截断，而它恰恰是卡顿的来源。若将来觉得需要看得更多，
      * 只改这一个数即可。
      */
-    private const val MAX_RENDER_CHARS: Int = 4000
+    private const val MAX_RENDER_CHARS: Int = 1500
 
     /** 已挂过的类，避免重复挂（宿主可能多次触发安装）。 */
     private val hooked = java.util.Collections.synchronizedSet(HashSet<String>())
