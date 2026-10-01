@@ -245,6 +245,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 // 由这条钩子把"关键字生效 + 摘输入条 + 回面板看结果"补齐，避免留下屏幕孤儿条。
                 runCatching { clipSearch.installImeWindowHook() }
                     .onFailure { log("clip-search window hook install failed: ${it.message}") }
+                // 输入法窗口的「可触摸区域」是宿主自己算的，而且宿主覆写的第一句就是调用基类
+                //（详见 ClipSearch.installImeInsetsHook 的说明），所以必须挂宿主那份覆写。
+                runCatching { clipSearch.installImeInsetsHook(bridge, hostClassLoader) }
+                    .onFailure { log("clip-search insets hook install failed: ${it.message}") }
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
                 runCatching { clipSearch.installRowFilter(bridge, hostClassLoader) }

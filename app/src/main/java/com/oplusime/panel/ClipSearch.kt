@@ -438,10 +438,15 @@ internal class ClipSearch(
             lp.gravity = Gravity.TOP
             row.tag = BAR_TAG
             root.addView(row, lp)
-            row.bringToFront()
+            root.bringToFront()
             activeBar = row
             activeField = field
             activeInstance = this
+            // 记下窗口根视图：过滤收尾时要用它**实时**找出屏幕上那个列表
+            // （面板会重建，缓存的面板实例可能已经脱离屏幕）。
+            lastRoot = java.lang.ref.WeakReference(root)
+            installTouchableInsetsOverride()
+            refreshImeInsets(root)
 
             // 输入条被摘掉时同步"忘记"它。宿主此刻把内部输入目标指向了这个输入框，
             // 如果只摘视图、不解除指向，宿主会对着一个已脱离视图树的输入框继续操作，
@@ -671,6 +676,124 @@ internal class ClipSearch(
         }.onFailure { log("clip-search: ime window hidden hook failed: ${it.message}") }
     }
 
+    /**
+     * 输入条显示期间，把输入法窗口的**可触摸区域**扩到整个窗口。
+     *
+     * ## 这是 1.26.0「点搜索没反应、界面还垮掉」的直接原因
+     *
+     * 宿主在 `ImeService.onComputeInsets` 里显式设置了窗口的 touchable region：
+     * 输入法窗口是**整屏**的，但只有下面那一块键盘被声明为可触摸，其余部分（窗口顶部）
+     * 摸上去等于摸到了下面的应用。
+     *
+     * 我的输入条被放在窗口顶部（键盘上方），正好落在那个区域之外。于是 1.26.0 真机日志里
+     * 出现了这样一对现象：点「搜索」的那一刻 **`bar button '搜索' touch down` 一次都没出现**
+     * （触摸没送进输入法），同一秒却出现 `hideWindow blocked while bar shown`
+     * （这一摸被系统当成"点了输入法外面"，应用一反应就要收输入法，被我们的守卫挡住了）。
+     *
+     * 修法：只在这条输入条显示期间，把 touchable region 扩成整窗；输入条一移除立刻恢复宿主原本
+     * 的计算结果，因此不影响正常使用键盘。
+     */
+    private fun installTouchableInsetsOverride() {
+        if (insetsGuardInstalled) return
+        insetsGuardInstalled = true
+        runCatching {
+            XposedBridge.hookAllMethods(
+                android.inputmethodservice.InputMethodService::class.java,
+                "onComputeInsets",
+                insetsHook(),
+            )
+            log("clip-search: touchable region guard installed (base)")
+        }.onFailure { log("clip-search: touchable region guard failed: ${it.message}") }
+    }
+
+    /**
+     * 挂宿主自己那份 `onComputeInsets`。
+     *
+     * ## 为什么不能只挂基类（这是一次静态可证的顺序错误）
+     *
+     * 宿主覆写的 `ImeService.onComputeInsets` **第一句就是 `invoke-super`**（调用基类）。
+     * 我若只挂基类，after 钩子会在"宿主写入自己的触摸区域**之前**"跑完，
+     * 紧接着宿主就把区域覆盖回去 —— 等于白改，用户那一下点击照样穿透。
+     *
+     * 因此这里用 DexKit 结构匹配（方法名 `onComputeInsets` + 声明类是 `InputMethodService` 子类）
+     * 找到宿主那个覆写，并在它**执行之后**改，才真正生效。
+     */
+    fun installImeInsetsHook(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = findMethods(bridge, "ime-insets") {
+            matcher {
+                name("onComputeInsets")
+                paramTypes("android.inputmethodservice.InputMethodService\$Insets")
+                returnType("void")
+            }
+        }
+        var installed = 0
+        candidates.forEach { data ->
+            val cls = runCatching { data.declaredClass?.getInstance(hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            if (!android.inputmethodservice.InputMethodService::class.java.isAssignableFrom(cls)) return@forEach
+            runCatching {
+                XposedBridge.hookAllMethods(cls, "onComputeInsets", insetsHook())
+                installed++
+                log("clip-search: ime insets host hook installed ${cls.name}")
+            }.onFailure { log("clip-search: ime insets host hook failed ${cls.name}: ${it.message}") }
+        }
+        log("clip-search: ime insets candidates=${candidates.size} hostHooks=$installed")
+    }
+
+    /** 输入法窗口 insets 钩子：抓服务实例 + 输入条显示期间把触摸区域扩到整窗。 */
+    private fun insetsHook() = object : XC_MethodHook() {
+        override fun afterHookedMethod(param: MethodHookParam) {
+            (param.thisObject as? android.inputmethodservice.InputMethodService)?.let {
+                imeServiceRef = java.lang.ref.WeakReference(it)
+            }
+            if (activeBar == null) return
+            val insets = param.args?.getOrNull(0) ?: return
+            runCatching {
+                val cls = insets.javaClass
+                val touchable = runCatching {
+                    cls.getField("touchableInsets").getInt(insets)
+                }.getOrDefault(0)
+                val region = runCatching {
+                    cls.getField("touchableRegion").get(insets) as? android.graphics.Region
+                }.getOrNull() ?: return
+                val root = lastRoot?.get() ?: return
+                val width = root.width
+                val height = root.height
+                if (width <= 0 || height <= 0) return
+                region.set(0, 0, width, height)
+                runCatching { cls.getField("touchableInsets").setInt(insets, TOUCHABLE_INSETS_REGION) }
+                log(
+                    "clip-search: ime touchable region widened while bar shown" +
+                        " old=$touchable size=${width}x$height by=${param.thisObject?.javaClass?.name}"
+                )
+            }.onFailure { log("clip-search: widen touchable failed: ${it.message}") }
+        }
+    }
+
+    /**
+     * 让宿主重新计算一次窗口 insets。
+     *
+     * `onComputeInsets` 只在窗口显示/尺寸变化时由框架回调；输入条是在窗口**已经显示之后**才加进去的，
+     * 所以必须主动触发一次重算，否则扩过的触摸区域要等下一次窗口变化才生效 —— 用户那一下点击
+     * 仍然会穿透出去。
+     */
+    private fun refreshImeInsets(root: View) {
+        runCatching {
+            val service = imeServiceRef?.get()
+            if (service != null) {
+                // `InputMethodService.updateInputViewShown()` 是框架公开方法，会让框架重新
+                // 评估输入视图与窗口 insets —— 我们的触摸区域扩写因此立刻生效。
+                runCatching { service.javaClass.getMethod("updateInputViewShown").invoke(service) }
+                    .onSuccess { log("clip-search: ime insets refresh requested (updateInputViewShown)") }
+                    .onFailure { log("clip-search: ime insets refresh call failed: ${it.message}") }
+                return
+            }
+            // 还没抓到服务实例：至少让根视图重新走一次布局，框架随后会重算 insets。
+            root.requestLayout()
+            log("clip-search: ime insets refresh pending (service not captured yet); layout requested")
+        }.onFailure { log("clip-search: ime insets refresh failed: ${it.message}") }
+    }
+
     /** 移除输入条；可重复调用。 */
     private fun removeSearchBar() {
         val bar = activeBar
@@ -868,6 +991,12 @@ internal class ClipSearch(
         synchronized(buttons) {
             buttons.keys.forEach { panel -> rebindList(panel, page, "keyword") }
         }
+        // 关键补充（1.26.0 的教训）：rebind 只能作用在**缓存里那个面板实例**上，而面板
+        // 重建后缓存里那个已经脱离屏幕 —— 1.26.0 日志里 `row filter summary … hidden=0 shown=0`
+        // 就是这么来的。因此这里再对**屏幕上真正显示着的那个列表**直接施加一次过滤。
+        runCatching { filterLiveRows(page, "reload") }
+            .onFailure { log("clip-search: reload live rows failed: ${it.message}") }
+        scheduleLiveFilter(page, "reload")
     }
 
     private fun rebindList(panel: View, page: Page, reason: String) {
@@ -913,13 +1042,122 @@ internal class ClipSearch(
             "clip-search: rebind($reason) page=$page refresh=$refreshed" +
                 " setAdapter=$rebound notify=$notified adapter=${adapter.javaClass.name}"
         )
-        // 过滤是否真的落到界面上，必须能自证：绑定完成后报一次"藏了几行、留了几行"。
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            log(
-                "clip-search: row filter summary page=$page kw=${currentKeyword() ?: "<none>"}" +
-                    " hidden=$rowHidden shown=$rowShown"
-            )
-        }, 400L)
+        // 过滤必须落到「屏幕上那个列表」上。
+        //
+        // 1.26.0 真机日志（19:27:22 / 19:28:58）显示 rebind 之后跟着的是
+        // `row filter summary … hidden=0 shown=0` —— 一次行绑定都没有发生。原因是重绑时
+        // 只按 `buttons` 里缓存的**面板实例**去找列表：面板重建后缓存里那个已经是
+        // **脱离屏幕的旧实例**，于是"重绑"发生在没人看的列表上，行级过滤从未执行。
+        //
+        // 现在不再依赖"重绑一定触发绑定"这一假设：直接对**屏幕上的可见行**做收放，
+        // 并在数据异步到达后分几个时间点各重复一次（分页数据是异步提交的）。
+        scheduleLiveFilter(page, "rebind($reason)")
+    }
+
+    /** 在若干时间点对屏幕上的可见行重复施加过滤（分页数据异步到达，单次不够）。 */
+    private fun scheduleLiveFilter(page: Page, reason: String) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        listOf(150L, 400L, 800L, 1400L).forEach { delay ->
+            handler.postDelayed({
+                runCatching { filterLiveRows(page, reason) }
+                    .onFailure { log("clip-search: live rows failed: ${it.message}") }
+            }, delay)
+        }
+    }
+
+    /**
+     * 找出**当前屏幕上真正显示着**的那个列表。
+     *
+     * 顺序：先找窗口根视图（输入法窗口自己的 DecorView）里的那个，再退回各面板实例里的。
+     * 判定标准是"已上屏 + 可见"，避免拿到已经脱离屏幕的旧列表（这正是 1.26.0 的问题）。
+     */
+    private fun findLiveList(targetId: Int): View? {
+        val candidates = ArrayList<View?>()
+        candidates.add(runCatching { lastRoot?.get()?.findViewById<View>(targetId) }.getOrNull())
+        synchronized(buttons) {
+            buttons.keys.forEach { panel ->
+                candidates.add(runCatching { panel.findViewById<View>(targetId) }.getOrNull())
+            }
+        }
+        var fallback: View? = null
+        candidates.forEach { view ->
+            if (view == null) return@forEach
+            if (!view.isAttachedToWindow) return@forEach
+            if (view.isShown) return view
+            if (fallback == null) fallback = view
+        }
+        return fallback
+    }
+
+    /**
+     * 对可见行直接施加过滤：命中 → 还原行高；未命中 → 收成 0 高度并隐藏。
+     *
+     * 这一层不依赖适配器的绑定时机，也不依赖任何混淆方法名（只用到框架公开的
+     * `getChildAdapterPosition` 与分页适配器的取值口），因此"重绑没触发绑定"不再是故障点。
+     */
+    private fun filterLiveRows(page: Page, reason: String) {
+        val targetId = if (page == Page.CLIPBOARD) listId else phraseListId
+        if (targetId == 0) return
+        val kw = keywordFor(page)
+        val list = findLiveList(targetId)
+        rowPass++
+        val pass = rowPass
+        if (list == null || list !is ViewGroup) {
+            log("clip-search: live rows pass=$pass reason=$reason page=$page list not found id=0x${Integer.toHexString(targetId)}")
+            return
+        }
+        val adapter = runCatching { Reflect.readObject(list, "mAdapter") }.getOrNull()
+        var hidden = 0
+        var shown = 0
+        var unreadable = 0
+        for (i in 0 until list.childCount) {
+            val child = list.getChildAt(i) ?: continue
+            val position = adapterPositionOf(list, child)
+            if (position < 0) continue
+            if (kw == null) {
+                applyRowVisibility(child, true)
+                shown++
+                continue
+            }
+            val item = if (adapter != null) readItem(adapter, position) else null
+            if (item == null) {
+                // 读不到条目时保持可见：宁可漏过滤，也不能把整屏清空。
+                applyRowVisibility(child, true)
+                unreadable++
+                continue
+            }
+            val hit = matches(item, kw)
+            applyRowVisibility(child, hit)
+            if (hit) shown++ else hidden++
+        }
+        rowHidden += hidden
+        rowShown += shown
+        log(
+            "clip-search: live rows pass=$pass reason=$reason page=$page" +
+                " kw=${kw ?: "<none>"} hidden=$hidden shown=$shown unreadable=$unreadable" +
+                " total=$rowHidden/$rowShown"
+        )
+    }
+
+    /** 取某一子行在适配器里的位置（框架公开方法，不涉及宿主混淆名）。 */
+    private fun adapterPositionOf(list: View, child: View): Int {
+        var current: Class<*>? = list.javaClass
+        var depth = 0
+        while (current != null && current != Any::class.java && depth < 12) {
+            val method = runCatching {
+                current!!.getDeclaredMethod(
+                    "getChildAdapterPosition",
+                    View::class.java,
+                )
+            }.getOrNull()
+            if (method != null) {
+                method.isAccessible = true
+                return runCatching { (method.invoke(list, child) as? Int) ?: -1 }.getOrDefault(-1)
+            }
+            current = current.superclass
+            depth++
+        }
+        return -1
     }
 
     // -------------------------------------------------------------- 分页过滤
@@ -1143,6 +1381,21 @@ internal class ClipSearch(
         @Volatile
         var activeBar: View? = null
 
+        /**
+         * 输入条所在的那个窗口根视图（输入法窗口自己的 DecorView）。
+         *
+         * 1.26.0 真机日志暴露的问题：过滤结果看不到（`row filter summary … hidden=0 shown=0`）。
+         * 原因是重绑时只按 `buttons` 里缓存的**面板实例**去找列表 —— 面板重建后，
+         * 缓存里那个还是**已经脱离屏幕的旧实例**，于是"重绑"发生在没人看的列表上，行级过滤
+         * 一次都没执行。现在改从窗口根视图下**实时**找出屏幕上的那个列表来重绑。
+         */
+        @Volatile
+        var lastRoot: java.lang.ref.WeakReference<ViewGroup>? = null
+
+        /** 重绑轮次（只用于日志对照，避免"藏了几行"被后续轮次覆盖后看不出是哪一轮）。 */
+        @Volatile
+        var rowPass: Int = 0
+
         /** 当前活动输入条里的输入框：确认/收尾时取它的文字，不依赖视图引用是否还在。 */
         @Volatile
         var activeField: EditText? = null
@@ -1153,6 +1406,17 @@ internal class ClipSearch(
 
         @Volatile
         var rowShown: Int = 0
+
+        /** 可触摸区域守卫是否已装（只装一次）。 */
+        @Volatile
+        var insetsGuardInstalled: Boolean = false
+
+        /** 输入法服务实例（弱引用）：主动触发窗口 insets 重算要用。 */
+        @Volatile
+        var imeServiceRef: java.lang.ref.WeakReference<android.inputmethodservice.InputMethodService>? = null
+
+        /** `InputMethodService.Insets.TOUCHABLE_INSETS_REGION` = 3（框架公开常量）。 */
+        const val TOUCHABLE_INSETS_REGION: Int = 3
 
         /** 条目读不到只提醒一次，避免刷屏。 */
         @Volatile
