@@ -68,6 +68,14 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         /** 剪贴板计数的格式化串（`%1$d/%2$d`），用于把上限显示改成 ∞。 */
         private const val NAME_CLIP_LENGTH = "clip_length"
 
+        /**
+         * 主键盘回车键上的文字（宿主为 `换行`）。
+         *
+         * 用户要求把它换成回车**箭头符号**。这里按资源名定位（不是数字 id），
+         * 由 [HostTweaks] 只改这一个字符串的结果，其它文案一律原样放行。
+         */
+        private const val NAME_ENTER_TITLE = "enter_btn_title_enter"
+
         /** 剪贴板面板底部的计数控件与列表（搜索按钮挂在计数行最右侧）。 */
         private const val NAME_CLIP_COUNTER = "tv_clip_count"
 
@@ -159,6 +167,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         log("resolved panel back id=$backId")
         val labelId = resolveIdentifier(apkPath, "string", NAME_CLIPBOARD_LABEL)
         val clipLengthId = resolveIdentifier(apkPath, "string", NAME_CLIP_LENGTH)
+        val enterTitleId = resolveIdentifier(apkPath, "string", NAME_ENTER_TITLE)
         val clipCounterId = resolveIdentifier(apkPath, "id", NAME_CLIP_COUNTER)
         val clipListId = resolveIdentifier(apkPath, "id", NAME_CLIP_LIST)
         val phraseCounterId = resolveIdentifier(apkPath, "id", NAME_PHRASE_COUNTER)
@@ -219,7 +228,12 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             )
 
             // 容量与计数相关修正（计数显示改 ∞、剪切/粘贴条件返回键盘）。
-            val tweaks = HostTweaks(clipLengthId = clipLengthId, closePanel = closePath)
+            val tweaks = HostTweaks(
+                clipLengthId = clipLengthId,
+                enterTitleId = enterTitleId,
+                closePanel = closePath,
+            )
+            tweaks.bindHost(bridge, hostClassLoader)
             tweaks.install()
 
             // 解除宿主的两处容量上限（记录表到顶裁剪、正文长度上限），全部结构匹配。
@@ -283,8 +297,16 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     .onFailure { log("clip-search delete fix install failed: ${it.message}") }
                 // 剪贴板条目的「编辑」：在行内动作排最前面插一个编辑按钮，
                 // 弹出宿主同款输入框，确认后写回宿主剪贴板表。
-                runCatching { ClipboardEdit.install(bridge, hostClassLoader, addToPhraseId) }
-                    .onFailure { log("clip-edit install failed: ${it.message}") }
+                runCatching {
+                    ClipboardEdit.install(
+                        bridge,
+                        hostClassLoader,
+                        addToPhraseId,
+                        registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
+                        clearInputTarget = resolveInputTargetClearer(bridge, hostClassLoader),
+                        restoreFocus = resolveFocusRestorer(bridge, hostClassLoader),
+                    )
+                }.onFailure { log("clip-edit install failed: ${it.message}") }
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)
                 if (clipPanelClass != null) {
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {

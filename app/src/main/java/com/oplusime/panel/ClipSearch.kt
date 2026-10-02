@@ -138,6 +138,20 @@ internal class ClipSearch(
         synchronized(dataAdaptersLock) { dataAdapterPages.keys.toList() }
 
     /**
+     * 作废全部过滤快照，并让已登记的适配器在后台提前重算。
+     *
+     * 与 [setKeyword] 里那段等价，但**不比较关键字**：面板重开之后适配器是新实例、
+     * 缓存命中与否取决于构建时机，光靠关键字比较不足以保证"这一刻一定按新关键字重算"。
+     * 收尾路径（弹窗确认/取消）走这里，把"过滤没反应"的可能性从根上消掉。
+     */
+    private fun invalidateSnapshots() {
+        dataVersion++
+        val adapters = synchronized(dataAdaptersLock) { dataSnapshots.clear(); registeredAdapters() }
+        adapters.forEach { prebuildSnapshotAsync(it) }
+        log("clip-search: snapshots invalidated version=$dataVersion adapters=${adapters.size}")
+    }
+
+    /**
      * 后台预构建快照：把"遍历全部条目 + 递归取正文"的开销挪出布局帧。
      *
      * 列表随时会来问条目数/取值，因此这里先算好放进缓存；算好之前列表继续用原数据
@@ -207,22 +221,75 @@ internal class ClipSearch(
 
     /** 按「当前是不是剪贴板页」决定按钮显隐；剪贴板页首次出现时顺便创建。 */
     private fun syncButtonVisibility(panel: ViewGroup) {
-        val clipCounter = panel.findViewById<View>(counterId)
-        val onClipboardPage = clipCounter?.visibility == View.VISIBLE
-        if (!onClipboardPage) {
-            // 常用语页：**不显示搜索按钮**（用户明确要求）。按钮是在剪贴板页建出来的，
-            // 宿主切页只改可见性、不重建面板，所以必须靠布局监听主动收起来。
-            val button = buttons[panel] ?: return
-            if (button.visibility != View.GONE) {
-                button.visibility = View.GONE
-                log("clip-search: search button hidden (page=PHRASE)")
+        if (!isOnClipboardPage(panel)) {
+            // 常用语页：**不显示搜索按钮**（用户反复明确要求，已强调多次）。
+            //
+            // 这里必须**把控件摘掉**，而不是只改自己的 visibility：宿主两页共用同一行，
+            // 容器/兄弟控件的可见性会让它照样出现在屏幕上（这正是上一版失效的原因）。
+            // 切回剪贴板页时重新创建即可，创建成本可以忽略。
+            val button = buttons.remove(panel)
+            runCatching { (button?.parent as? ViewGroup)?.removeView(button) }
+            if (button != null) {
+                log("clip-search: search button removed (page=PHRASE)")
             }
             return
         }
         currentPage = Page.CLIPBOARD
-        if (clipCounter == null) return
-        createAndPlace(panel, clipCounter)
+        val anchor = panel.findViewById<View>(counterId) ?: return
+        createAndPlace(panel, anchor)
         buttons[panel]?.let { if (it.visibility != View.VISIBLE) it.visibility = View.VISIBLE }
+    }
+
+    /**
+     * 当前是不是剪贴板页。
+     *
+     * ## 为什么不用计数控件判定（上一版的错）
+     *
+     * 看宿主自己的面板布局 `res/IB.xml` 就能确定：
+     *
+     * ```text
+     * tv_clip_count  (0x7f0905aa)  剪贴板计数，且常用语页会把提示文字写进**同一个** TextView
+     * tv_phrase_count(0x7f0905dd)  布局里默认 gone
+     * rv_clipboard   (0x7f090483)  剪贴板列表，顶层、默认可见
+     * rv_phrase_directory(0x7f090494) 常用语列表，嵌在一个默认 gone 的容器里
+     * ```
+     *
+     * 也就是说：**两页共用同一个计数控件**，所以「计数可见」永远为真，
+     * 用它判页必然把常用语页也判成剪贴板页 —— 按钮于是跟着跑了过去。
+     *
+     * ## 现在的判据
+     *
+     * 用**两条列表的实际可见性**（自己 + 所有祖先都 VISIBLE 才算显示）。
+     * 列表是各自独占的，且常用语列表天然藏在默认隐藏的容器里，
+     * 因此在剪贴板页它一定不可见。两页万一同时可见（宿主切换的中间态），
+     * 也一律按「常用语页」处理 —— 宁可不显示，也不要在常用语页冒出来。
+     */
+    private fun isOnClipboardPage(panel: ViewGroup): Boolean {
+        val clipVisible = isEffectivelyVisible(panel, listId)
+        val phraseVisible = isEffectivelyVisible(panel, phraseListId)
+        if (clipVisible || phraseVisible) return clipVisible && !phraseVisible
+        // 视图还没挂完时退回计数控件判定（新装面板的短暂瞬间）。
+        val clipCounter = panel.findViewById<View>(counterId) ?: return false
+        val phraseCounter = if (phraseCounterId != 0) {
+            panel.findViewById<View>(phraseCounterId)
+        } else {
+            null
+        }
+        return clipCounter.visibility == View.VISIBLE &&
+            (phraseCounter == null || phraseCounter.visibility != View.VISIBLE)
+    }
+
+    /** 目标控件是否真的显示在屏幕上：自己与所有祖先都 VISIBLE。 */
+    private fun isEffectivelyVisible(panel: ViewGroup, id: Int): Boolean {
+        if (id == 0) return false
+        var node: View? = panel.findViewById(id) ?: return false
+        var depth = 0
+        while (node != null && depth < 24) {
+            if (node.visibility != View.VISIBLE) return false
+            node = node.parent as? View
+            depth++
+        }
+        return true
     }
 
     /** 已经挂过页观察者的面板（幂等）。 */
@@ -425,8 +492,23 @@ internal class ClipSearch(
      * 2. 输入框用宿主自己的编辑框类，并交给宿主的内部焦点切换；
      * 3. 键盘本来就是输入法窗口的一部分，它一直在下面，卡片不会把它盖住。
      */
+    /**
+     * 点「搜索」→ **弹窗**（与宿主自己的「编辑」「删除」同一个 `COUIAlertDialogBuilder`）。
+     *
+     * ## 为什么不是"输入条"
+     *
+     * 1.33.1 之前走的是"在输入法窗口里插一条输入条"。那条路有两个无法根治的毛病：
+     *  - 宿主的剪贴板面板是 match_parent（占满整个键盘区），插条前后都要收/开面板，
+     *    切来切去很容易把宿主的页状态弄乱；
+     *  - 用过一次之后宿主的**内部输入目标**指向了那条已经消失的输入条，键盘从此打不出字。
+     *
+     * 用户也明确要求过：要像「添加常用语」那样的**独立弹窗**。
+     * 宿主 `input/view/body/D;->q(String, Function0)` 就是它的实现：`COUIAlertDialogBuilder`
+     * ＋ 输入法窗口 token ＋ type 0x3eb ＋ 透明背景 ＋ dim 0.3 ＋ `updateViewAfterShown()`。
+     * 本版就照这条来：弹窗里放宿主自己的编辑框，交给宿主的内部输入目标，关窗时成对还原。
+     */
     private fun showInput(anchor: View) {
-        showSearchBar(anchor)
+        showDialog(anchor)
     }
 
     /**
@@ -725,6 +807,9 @@ internal class ClipSearch(
      *     关键字生效 → 摘输入条 → 重新打开面板看过滤结果。
      */
     fun onImeWindowHidden(reason: String = "ime-window-hidden") {
+        // 只处理"输入条还活着"的情形。弹窗式搜索（本版默认路径）没有输入条，
+        // 窗口被系统收起（用户自己按了收起、或切到别的应用）时不应该被当成"搜索结束"
+        // 去强行重开面板 —— 那会在用户已经离开输入法之后又把面板推出来。
         val bar = activeBar ?: return
         val page = currentPage
         val kw = activeField?.text?.toString().orEmpty()
@@ -762,6 +847,9 @@ internal class ClipSearch(
                 "hideWindow",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        // **只在输入条还活着的时候拦**（`activeBar != null`）。
+                        // 弹窗式搜索（本版默认路径）没有输入条，这里什么都不做；
+                        // 于是弹窗自己 `dismiss()` 引起的窗口收起能正常完成，不会卡住。
                         if (activeBar == null) return
                         param.result = null
                         log("clip-search: hideWindow blocked while bar shown")
@@ -792,6 +880,8 @@ internal class ClipSearch(
                 "onWindowHidden",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        // 同上：只在输入条还活着时兜底，弹窗路径不参与。
+                        if (activeBar == null) return
                         runCatching { onImeWindowHidden("window-hidden") }
                             .onFailure { log("clip-search: window-hidden cleanup failed: ${it.message}") }
                     }
@@ -959,6 +1049,13 @@ internal class ClipSearch(
             val context = anchor.context
             val density = context.resources.displayMetrics.density
             val page = currentPage
+            // **必须记下窗口根视图**。面板在搜索结束后会被宿主重建，新的分页适配器是一个
+            // **新实例**，过滤只对"登记过的适配器"生效；而登记发生在 [reloadLists] 里，
+            // 它靠 [findLiveList] 从窗口根视图找出屏幕上那个列表。
+            // 上一版只在输入条那条路径里记了根视图，弹窗这条路径没记 ——
+            // 于是弹窗收尾时找不到列表、新适配器从未登记，**过滤等于没执行**
+            // （用户实测："点击搜索以后没有过滤，看到的还是原原本本的全部记录"）。
+            (anchor.rootView as? ViewGroup)?.let { lastRoot = java.lang.ref.WeakReference(it) }
             // 先收起面板：`res/IB.xml` 的根布局是 match_parent，剪贴板/常用语面板**占满整个
             // 键盘区域**（面板里只有标题栏 + 列表 + 底栏，没有任何按键）。面板开着的时候屏幕上一个
             // 键都没有 —— 所以"键盘弹不出来"的直接原因不是弹窗的窗口标志，而是面板把键盘的位置占了。
@@ -973,13 +1070,14 @@ internal class ClipSearch(
             field.isFocusableInTouchMode = true
             field.setShowSoftInputOnFocus(true)
             field.setSingleLine(true)
-            // 与宿主自己的搜索框 `input.view.head.h0`（SearchView / emoji 搜索）逐字一致的三件事：
-            //   setImeOptions(3)                    → IME_ACTION_SEARCH
-            //   setOnEditorActionListener(...)      → 回车=发起搜索（这里由内部焦点链处理）
+            // 与宿主自己的搜索框 `input.view.head.h0`（SearchView / emoji 搜索）一致的两件事：
+            //   setImeOptions(3)                    → IME_ACTION_SEARCH（键盘右下角显示「搜索」）
             //   input/manager/h;->l(editText,true)  → 注册成输入法内部输入目标（见构造参数）
-            // 前两件决定"看起来像搜索框"，第三件才是"键盘上的按键进到这个输入框"的开关。
+            // 第二件才是"键盘上的按键进到这个输入框"的开关。
+            //
+            // 注意：这里**不改 inputType**。宿主自己的输入框用默认值，
+            // 而我们手写 `TYPE_CLASS_TEXT` 会让某些输入法分支走"外部编辑框"那条路，反而收不到内部按键。
             field.imeOptions = EditorInfo.IME_ACTION_SEARCH
-            field.inputType = InputType.TYPE_CLASS_TEXT
             field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             field.setText(currentKeyword() ?: "")
             field.setSelectAllOnFocus(false)
@@ -1002,8 +1100,6 @@ internal class ClipSearch(
                 if (method.name == "onClick") {
                     applyKeyword(field.text?.toString().orEmpty())
                     dialogBox[0]?.dismiss()
-                    // 结果要看得见：过滤已生效，把面板重新打开就是过滤后的列表。
-                    reopenPanel(page)
                 }
                 null
             } as DialogInterface.OnClickListener
@@ -1013,8 +1109,6 @@ internal class ClipSearch(
             ) { _, method, _ ->
                 if (method.name == "onClick") {
                     dialogBox[0]?.dismiss()
-                    // 取消也要回到面板，不能把用户丢在空键盘上。
-                    reopenPanel(page)
                 }
                 null
             } as DialogInterface.OnClickListener
@@ -1024,6 +1118,9 @@ internal class ClipSearch(
 
             val dialog = builderClass.getMethod("create").invoke(builder) as Dialog
             dialogBox[0] = dialog
+            // 弹窗被任何方式关掉（确认 / 取消 / 点外面 / 返回键）都要**成对还原输入目标**，
+            // 否则会留下"用过一次搜索之后键盘怎么按都打不出字"。
+            dialog.setOnDismissListener { finishDialogSearch(page, "dismiss") }
             val window = dialog.window
             val token = anchor.windowToken ?: error("search anchor has no window token")
             if (window != null) {
@@ -1073,6 +1170,51 @@ internal class ClipSearch(
         val box = if (page == Page.CLIPBOARD) BOX_CLIP else BOX_PHRASE
         val ok = runCatching { openPanel?.invoke(box) }.getOrDefault(false)
         log("clip-search: panel reopened=$ok box=$box page=$page")
+    }
+
+    /**
+     * 弹窗式搜索（与宿主「添加常用语」同一套 `COUIAlertDialogBuilder`）的收尾。
+     *
+     * ## 为什么必须有这一步（1.33.1 的两个真机故障）
+     *
+     * 1. **「搜了没有任何过滤」**：面板被重新打开时，宿主会**新建**面板与适配器实例。
+     *    我们登记过的旧适配器已经脱离屏幕，新适配器既没登记、也没收到通知 ——
+     *    而数据层过滤的门槛正是「这个适配器登记过」，于是关键字生效了、列表却仍是全量。
+     *    这里在面板重开之后补一次 `reloadLists`（登记 + 通知），过滤才会落到屏幕上。
+     *
+     * 2. **「用过一次搜索之后键盘就打不出字」**：弹窗期间输入框被登记成宿主的**内部输入目标**。
+     *    弹窗关闭后，宿主仍以为输入目标是那个已经不存在的输入框，键盘按键被分发到一个
+     *    脱离视图树的控件上，字哪儿都没去。所以关窗时必须**成对还原**：
+     *    先解除内部输入目标，再把焦点交还外部编辑器。
+     */
+    private fun finishDialogSearch(page: Page, reason: String) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        runCatching {
+            val released = runCatching { clearInputTarget?.invoke() }.getOrNull()
+            val restored = runCatching { restoreFocus?.invoke() }.getOrNull()
+            log("clip-search: dialog focus released clear=$released restore=$restored")
+            handler.postDelayed({
+                reopenPanel(page)
+                handler.postDelayed({
+                    // 面板刚重建完，适配器是新的：这里必须真正找到**屏幕上那个列表**并把
+                    // 新适配器登记进过滤表，否则关键字算出来了也不会生效。
+                    reloadLists(page)
+                    // 再补两拍：宿主重建面板/首次填充数据可能晚于我们这一次通知，
+                    // 于是刚登记完又被它自己的数据流覆盖回去。多两拍是幂等的（只登记+通知）。
+                    handler.postDelayed({
+                        reloadLists(page)
+                        handler.postDelayed({
+                            reloadLists(page)
+                            log(
+                                "clip-search: dialog finish($reason) page=$page" +
+                                    " kw=${keywordFor(page) ?: "<none>"}" +
+                                    " registered=${registeredAdapters().size}"
+                            )
+                        }, 320L)
+                    }, 320L)
+                }, 260L)
+            }, 120L)
+        }.onFailure { log("clip-search: dialog finish($reason) failed: ${it.message}") }
     }
 
     private fun invokeDialogButton(
@@ -1137,6 +1279,12 @@ internal class ClipSearch(
     private fun reloadLists(page: Page = currentPage) {
         rowHidden = 0
         rowShown = 0
+        // **先把缓存作废**。1.33.2 之前的顺序是"先重绑、后 invalidate"，
+        // 但过滤的判定发生在 `ensureSnapshot` 里：缓存还带着旧关键字时它会直接返回旧快照
+        // （只有 keyword 与 version 同时匹配才复用，keyword 变了本该重算，
+        //  但面板重开后适配器**是新实例**、缓存命中与否取决于构建时机）。
+        // 先 invalidate 再重绑，才能保证"这一刻的问询一定按新关键字重算"。
+        invalidateSnapshots()
         synchronized(buttons) {
             buttons.keys.forEach { panel -> rebindList(panel, page, "keyword") }
         }
@@ -1146,7 +1294,11 @@ internal class ClipSearch(
         if (targetId != 0) {
             val live = findLiveList(targetId)
             val adapter = live?.let { runCatching { Reflect.readObject(it, "mAdapter") }.getOrNull() }
-            if (adapter != null) notifyRebind(adapter, page, "live")
+            if (adapter != null) {
+                notifyRebind(adapter, page, "live")
+            } else {
+                log("clip-search: live list not found for page=$page (id=0x${Integer.toHexString(targetId)})")
+            }
         }
     }
 

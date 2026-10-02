@@ -39,16 +39,20 @@ import org.luckypray.dexkit.result.MethodData
 internal object SoftKeySwipeMap {
 
     /**
-     * 英文逗号上滑的标记 —— 百度那一枚「小册子」图标。
+     * 英文逗号上滑的标记 —— 一枚大写字母 A（功能标记，非字符）。
      *
-     * 百度 `en_26.ini` 里英文逗号键是 `UP=F25`：F25 不是字符，而是一个**功能图标**
-     * （小册子＝英文联想/候选开关）。小布这枚图标**不在资源表里**（全库没有任何与它对应的
-     * drawable），而宿主键面的「上滑小字」这个槽位（`base/entity/c.t`）**只接受字符串**、
-     * 不接受图片，所以这里用书本字形 U+1F4D6 近似它。
+     * 关闭态 = 零宽空格 + `A`；开启态 = 零宽空格 + **粗体 A**（U+1D400）。
+     * 两者是**同一个字形 A 的两种字重**，所以视觉上是"这一枚字变实/变立体了"，
+     * 而不是换成另一个不相干的图标 —— 这正是用户要的效果。
      *
-     * 完整字符串是候选词表里不可能产出的，因此在**上屏出口**按它精确拦截、零误伤。
+     * 为什么前面要带一个零宽空格：上滑标记最终是**以文本形式提交**出去的，
+     * 而这个提交口无法区分"滑出来的 A"和"手打出来的 A"。加一个不可见、键盘上
+     * 永远不会产出的前缀，标记就变成整条链上唯一的字符串，拦截因此**零误伤**。
      */
-    const val CN_COMMA_MARK: String = "\uD83D\uDCD6"
+    const val EN_SUGGEST_MARK_OFF: String = "\u200BA"
+
+    /** 开启态：零宽空格 + 粗体大写 A（同一字形，加粗）。 */
+    const val EN_SUGGEST_MARK_ON: String = "\u200B\uD835\uDC00"
 
     /**
      * 英文页 —— 逐字抄自**百度输入法自己的布局文件**。
@@ -69,8 +73,9 @@ internal object SoftKeySwipeMap {
         'h' to "&", 'j' to "*", 'k' to "(", 'l' to ")",
         'z' to "'", 'x' to "/", 'c' to "-", 'v' to "_", 'b' to ":",
         'n' to ";", 'm' to "?",
-        // 英文页逗号：百度这里是**功能图标**（小册子＝英文联想开关），不是符号。
-        ',' to CN_COMMA_MARK,
+        // 英文页逗号：**功能标记**（大写 A，开启时变粗体 A），由 applyLang 按开关实时决定，
+        // 这里放关闭态作为默认值。
+        ',' to EN_SUGGEST_MARK_OFF,
         // 英文页句号：百度是半角问号。
         '.' to "?",
     )
@@ -98,8 +103,8 @@ internal object SoftKeySwipeMap {
         'h' to "&", 'j' to "*", 'k' to "\uFF08", 'l' to "\uFF09",
         'z' to "'", 'x' to "/", 'c' to "-", 'v' to "_",
         'b' to "\uFF1A", 'n' to "\uFF1B", 'm' to "\u3001",
-        // 中文页逗号：百度这里是**功能图标**（小册子＝英文联想/候选开关），不是符号。
-        ',' to CN_COMMA_MARK, '\uFF0C' to CN_COMMA_MARK,
+        // 中文页逗号：全角叹号（用户明确要求中文逗号上滑就是**符号本身**，不是开关功能）。
+        ',' to "\uFF01", '\uFF0C' to "\uFF01",
         // 中文页句号：全角问号。
         '.' to "\uFF1F", '\u3002' to "\uFF1F",
     )
@@ -261,12 +266,10 @@ internal object SoftKeySwipeMap {
         }.onFailure { log("swipe-map: internal commit hook failed: ${it.message}") }
     }
 
-    /** 文本是不是中文逗号上滑那枚标记（容忍首尾空白）。 */
+    /** 文本是不是英文逗号上滑那枚标记（容忍首尾空白）。 */
     private fun isCommaMarker(text: CharSequence?): Boolean {
         val value = text?.toString()?.trim() ?: return false
-        if (value == CN_COMMA_MARK) return true
-        // 有些路径会带回车或零宽字符，这里放宽一点：包含标记即命中。
-        return value.contains(CN_COMMA_MARK)
+        return value == EN_SUGGEST_MARK_OFF || value == EN_SUGGEST_MARK_ON
     }
 
     /** 命中标记：切开关 + 吞掉这次提交，并留一行证据。 */
@@ -277,6 +280,9 @@ internal object SoftKeySwipeMap {
             return true
         }
         toggleEnglishSuggestion(ctx)
+        // 开关状态变了 → 键面那枚 A 的字重必须跟着变（关=普通 A，开=粗体 A）。
+        // 逐键判重的记录必须先作废，否则 applyLang 会认为"这一帧已经刷过"而跳过。
+        appliedLang.clear()
         log("swipe-map: comma swipe toggled english suggestion (source=$source, submission suppressed)")
         return true
     }
@@ -314,16 +320,30 @@ internal object SoftKeySwipeMap {
      * 结构特征：`(android.graphics.Canvas, 键实体类) → void`，且是**实例方法**
      * （静态那些拿不到视图、判不了语言）。宿主自己的 `f/g(Canvas, SoftKey)` 就是这条。
      */
-    private fun installDrawHook(bridge: DexKitBridge, hostClassLoader: ClassLoader) {        val candidates: List<MethodData> = runCatching {
+    /**
+     * 结构特征：`(android.graphics.Canvas, 键实体类) → void`，且是**实例方法**
+     * （静态那些拿不到视图、判不了语言）。宿主自己的 `f/g(Canvas, SoftKey)` 就是这条。
+     *
+     * 键实体类**不写死类名**：由 DexKit 按「实体形状」反查 ——
+     * 该类含 `String keyText` / `String keyMark` 两个公开字符串字段（宿主自己的构造器
+     * 参数名就是这两个词），并且存在 `(int, String, String)` 构造器。
+     * 这样即使宿主换版本改了混淆名，匹配依然成立。
+     */
+    private fun installDrawHook(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val entityName = resolveSoftKeyClass(bridge, hostClassLoader) ?: run {
+            log("swipe-map: SoftKey class unresolved; swipe map keeps host behaviour")
+            return
+        }
+        val candidates: List<MethodData> = runCatching {
             bridge.findMethod {
                 matcher {
-                    paramTypes("android.graphics.Canvas", "com.oplus.keyboard.base.entity.c")
+                    paramTypes("android.graphics.Canvas", entityName)
                     returnType("void")
                 }
             }.toList()
         }.onFailure { log("swipe-map: query failed: ${it.message}") }
             .getOrDefault(emptyList())
-        log("swipe-map: draw candidates=${candidates.size}")
+        log("swipe-map: draw candidates=${candidates.size} entity=$entityName")
 
         var hooks = 0
         candidates.forEach { candidate ->
@@ -376,7 +396,20 @@ internal object SoftKeySwipeMap {
             if (text.length != 1) return
             val ch = text[0]
             val table = if (lang == "en") TABLE_EN else TABLE_CN
-            val mapped = table[ch.lowercaseChar()] ?: return
+            var mapped = table[ch.lowercaseChar()] ?: return
+            // 逗号位是**功能标记**，不是固定字符：关=普通 A，开=粗体 A。
+            // 必须每帧按当前开关重取，否则用户上滑开关之后键面还是旧字重。
+            // **只有英文页**的逗号位才是功能标记。
+            //
+            // 这里踩过一个真实的坑：原判据写成 `lang == "en" || ch == ','`，于是中文页上
+            // 只要该键的字符是半角逗号，也会被替换成标记 —— 中文页逗号上滑因此变成了
+            // "切英文候选"而不是用户明确要的「感叹号」。用户原话：
+            // 「中文模式下它是对应的一个符号（感叹号），并不是开启候选的一个功能」。
+            // 判据必须以**当前页面语言**为准，不能看字符本身。
+            if (lang == "en" && (ch == ',' || ch == '\uFF0C')) {
+                val on = readFlag() ?: false
+                mapped = if (on) EN_SUGGEST_MARK_ON else EN_SUGGEST_MARK_OFF
+            }
             val mark = readString(key, "t") ?: ""
             if (mark != mapped) {
                 writeString(key, "t", mapped)
@@ -407,8 +440,57 @@ internal object SoftKeySwipeMap {
         return lang
     }
 
+    /** 键实体类的类名（DexKit 反查，不写死混淆名）。 */
+    @Volatile
+    private var softKeyClassName: String? = null
+
     /**
-     * 中文逗号上滑 → 切换"英文候选"开关（实时生效）。
+     * 结构化反查「键位实体类」（宿主自己的 SoftKey）。
+     *
+     * ## 为什么不写死类名
+     *
+     * 全局硬约束：本模块**不允许**把宿主混淆类名写进匹配表达式。这里改成按**实体形状**查：
+     *
+     * ```text
+     * 1. 存在构造器 (int, String, String)          —— keyCode + keyText + keyMark
+     * 2. 该类有 ≥2 个 public String 实例字段        —— 就是 keyText / keyMark
+     * 3. 该类没有父类实体（排除继承来的容器类）
+     * ```
+     *
+     * 这三条一起，在整个宿主里只命中一个类（宿主自己的 SoftKey）。
+     * 命中后把类名缓存下来，绘制匹配语句用它当参数类型。
+     */
+    private fun resolveSoftKeyClass(bridge: DexKitBridge, hostClassLoader: ClassLoader): String? {
+        softKeyClassName?.let { return it }
+        // 定位走方法签名：凡声明了 `(int, String, String)` 构造器的类都是候选
+        // （keyCode + keyText + keyMark 是这个实体的唯一形状）。
+        val ctorOwners = runCatching {
+            bridge.findMethod {
+                matcher {
+                    paramTypes("int", "java.lang.String", "java.lang.String")
+                    returnType("void")
+                }
+            }.toList().mapNotNull { it.declaredClassName }
+        }.getOrDefault(emptyList())
+        log("swipe-map: softkey candidate owners=${ctorOwners.size}")
+        ctorOwners.forEach { owner ->
+            val cls = runCatching { Class.forName(owner, false, hostClassLoader) }.getOrNull()
+                ?: return@forEach
+            val strings = cls.declaredFields.count {
+                it.type == String::class.java && !java.lang.reflect.Modifier.isStatic(it.modifiers)
+            }
+            // 两个字符串字段 + 直接继承 Object —— 就是键位实体（排除带父类的容器/包装类）。
+            if (strings >= 2 && cls.superclass == Any::class.java) {
+                softKeyClassName = owner
+                log("swipe-map: softkey class resolved=$owner stringFields=$strings")
+                return owner
+            }
+        }
+        return null
+    }
+
+    /**
+     * 逗号上滑 → 切换"英文候选"开关（实时生效）。
      *
      * ## 为什么必须走宿主自己的写入口
      *
@@ -428,14 +510,12 @@ internal object SoftKeySwipeMap {
     fun toggleEnglishSuggestion(context: Context): Boolean {
         val current = readFlag() ?: runCatching {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getBoolean(KEY_EN_SUGGESTION, true)
-        }.getOrDefault(true)
+                .getBoolean(KEY_EN_SUGGESTION, false)
+        }.getOrDefault(false)
         val next = !current
         val viaHost = writeFlag(next)
         if (!viaHost) {
-            // 宿主入口没定位到时的兜底：至少把值写对，并**自己通知一次**
-            // （找一个宿主进程里注册过该键的监听者做不到，所以这里只落盘 + 记日志，
-            //  用户下次进设置页手动切换一次即可让引擎同步）。
+            // 宿主入口没定位到时的兜底：至少把值写对，并记日志说明引擎本次不会同步。
             runCatching {
                 context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     .edit().putBoolean(KEY_EN_SUGGESTION, next).apply()
@@ -530,7 +610,7 @@ internal object SoftKeySwipeMap {
     private fun readFlag(): Boolean? {
         if (!resolveFlagAccessors()) return null
         return runCatching {
-            flagReader?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, true) as? Boolean
+            flagReader?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, false) as? Boolean
         }.getOrNull()
     }
 

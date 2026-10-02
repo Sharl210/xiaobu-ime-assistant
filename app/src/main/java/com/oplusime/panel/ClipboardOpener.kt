@@ -172,49 +172,17 @@ internal class ClipboardOpener private constructor(
     }
 
     /**
-     * 版本绑定兜底：本版宿主中「打开剪贴板」的最短调用链。
-     * 仅在结构化主路径不可用时尝试；每一步都做存在性校验，失败即放弃。
+     * 版本绑定兜底路径 —— **已删除**（1.33.2）。
+     *
+     * 它把宿主混淆类名直接写进代码（`input.view.c0` / `base.manager.g` / `input.view.b0` …），
+     * 违反本项目的全局硬约束：**任何功能都只能由 DexKit 通用结构匹配定位，不得硬编码宿主混淆类名**。
+     * 这种写法在宿主升级改名后必然静默失效，还会掩盖主路径的真实问题。
+     *
+     * 现在只有一条路：按 `BoxEnums` 常量名 + 分发方法参数形状定位的**结构路径**。
+     * 结构路径不可用时如实记日志（`clipboard could not be opened by any known path`），
+     * 不靠猜测兜底。
      */
-    private class LegacyPath(private val hostClassLoader: ClassLoader) {
-        fun open(): Boolean {
-            val c0Class = load("com.oplus.keyboard.input.view.c0") ?: return false
-            val lazyField = Reflect.field(c0Class, "c") ?: return false
-            val lazy = runCatching { lazyField.get(null) }.getOrNull() ?: return false
-            val c0 = runCatching { lazy.javaClass.getMethod("getValue").invoke(lazy) }.getOrNull()
-                ?: return false
-            val manager = runCatching { c0Class.getMethod("b").invoke(c0) }.getOrNull()
-                ?: return false
-
-            val eventClass = load("com.oplus.keyboard.base.manager.g") ?: return false
-            val event = Reflect.field(eventClass, "a")?.let { runCatching { it.get(null) }.getOrNull() }
-                ?: return false
-
-            val lambdaClass = load("com.oplus.keyboard.input.view.b0") ?: return false
-            val lambda = runCatching {
-                lambdaClass.getConstructor(Int::class.javaPrimitiveType).newInstance(1)
-            }.getOrNull() ?: return false
-
-            val eventBase = load("com.oplus.keyboard.base.manager.r") ?: return false
-            val functionInterface = load("kotlin.jvm.functions.l") ?: return false
-            val dispatch = manager.javaClass.methods.firstOrNull {
-                it.name == "q" &&
-                    it.parameterTypes.size == 2 &&
-                    it.parameterTypes[0].isAssignableFrom(eventBase) &&
-                    it.parameterTypes[1].isAssignableFrom(functionInterface)
-            } ?: manager.javaClass.methods.firstOrNull {
-                it.name == "q" && it.parameterTypes.size == 2
-            } ?: return false
-            runCatching { dispatch.invoke(manager, event, lambda) }.getOrElse { return false }
-
-            val managerStateClass = load("com.oplus.keyboard.input.manager.i") ?: return true
-            val stateManager = runCatching {
-                managerStateClass.getMethod("e").invoke(null)
-            }.getOrNull() ?: return true
-            Reflect.writeBoolean(stateManager, "A", true)
-            return true
-        }
-
-        private fun load(name: String): Class<*>? =
-            runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
+    private class LegacyPath(@Suppress("UNUSED_PARAMETER") hostClassLoader: ClassLoader) {
+        fun open(): Boolean = false
     }
 }

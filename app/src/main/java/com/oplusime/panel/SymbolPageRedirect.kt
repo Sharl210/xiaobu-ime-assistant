@@ -108,8 +108,21 @@ internal object SymbolPageRedirect {
     /** 观察日志上限，避免每次按键刷屏。 */
     private const val SWITCH_LOG_LIMIT = 20
 
-    /** 当前档位字段的可读值，仅用于日志取证。 */
+    /**
+     * 档位字段当前值（**只取第一个**枚举类型字段）。
+     *
+     * 上一版把**所有**枚举类型字段拼成一个逗号串再和 `NAME_SIMPLE` 比较，
+     * 结果是 `"SYMBOL1,SYMBOL1"` 这类串永远不等于 `"SYMBOL1"`，
+     * `after-switch` 的补调判定因此恒为"不需要"，静默跳过。
+     * 对单个字段的档位判断必须返回单个常量名。
+     */
     private fun describeField(target: Any, fields: List<Field>): String =
+        fields.firstNotNullOfOrNull { field ->
+            runCatching { (field.get(target) as? Enum<*>)?.name }.getOrNull()
+        }.orEmpty()
+
+    /** 全部枚举字段的取值（仅日志取证用，不参与判等）。 */
+    private fun describeAll(target: Any, fields: List<Field>): String =
         fields.mapNotNull { field ->
             runCatching { (field.get(target) as? Enum<*>)?.name }.getOrNull()
         }.joinToString(",")
@@ -159,6 +172,12 @@ internal object SymbolPageRedirect {
         fields.forEach { runCatching { it.isAccessible = true } }
         holderClass = holder
         fieldList = fields
+        // **必须有这一行**：下面所有"取值/判档"都要靠 `constantOfField`，
+        // 而它读的就是 `enumClassRef`。1.33.1 之前这里漏了赋值，
+        // 于是 `constantOfField(NAME_SIMPLE)` 恒为 null，`promoteToFull` 在第一行就返回 ——
+        // 「符号键直达完整页」这个功能**从来没真正执行过一次**。
+        // 这就是用户说的"改了三四个版本，体感没有任何区别"的直接原因。
+        enumClassRef = enumClass
         entryMethod = findEntryMethod(bridge, hostClassLoader, holder)
         log(
             "symbol-page: entryMethod=" + (
@@ -203,13 +222,26 @@ internal object SymbolPageRedirect {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val target = param.args?.getOrNull(0) ?: return
-                        // 管理器实例直接从切换调用的第 0 个参数拿。
-                        // 1.21.1 真机日志里的 `back ignored (holder instance unresolved)` 就是因为
-                        // 之前靠"自类型静态单例"去猜这个实例、而宿主的管理器并不是 Kotlin object。
-                        // 宿主的切换调用一定会把实例当第 0 个参数传进来，所以这里是可靠来源。
                         if (holderInstance == null) holderInstance = target
                         val keyboardType = param.args?.firstOrNull {
                             it is Enum<*> && it.javaClass != enumClass
+                        }
+                        // **符号键直达完整页（1.33.2）**
+                        //
+                        // 宿主 `h0` 的每一个"打开符号页"分支都是：先把档位写成 `SYMBOL1`（简洁页），
+                        // 再调 `k0` 建页；只有用户手点「更多」时才走 `v(type, true)` 把档位写成整洁页。
+                        //
+                        // 既然决定建哪一页的是这个**档位字段**，那就在建页之前把它从简洁抬到完整即可 ——
+                        // 这与用户手点「更多」之后的状态完全等价，因此宿主自己的返回箭头、
+                        // 状态机、后续切页都不受影响。
+                        //
+                        // 关键：**不改参数**。1.21.0 曾把参数里的键盘类型换成通用 `SYMBOLS`，
+                        // 结果走进一条需要 T9 键位的分支，抛
+                        // `lateinit property t9PinYin has not been initialized` 当场闪退。
+                        // 这里只改宿主自己的字段，参数原样放行，所以不会触发那条分支。
+                        val targetName = (keyboardType as? Enum<*>)?.name.orEmpty()
+                        if (targetName.contains("SYMBOL", ignoreCase = true)) {
+                            promoteToFull(target, "before-build[$targetName]")
                         }
                         switchLogCount++
                         if (switchLogCount <= SWITCH_LOG_LIMIT) {
@@ -217,12 +249,9 @@ internal object SymbolPageRedirect {
                                 "symbol-page: switch observed ${method.declaringClass.simpleName}#" +
                                     "${method.name} args=" + method.parameterTypes.size +
                                     " current=" + describeField(target, fields) +
-                                    " target=" + (keyboardType as? Enum<*>)?.name
+                                    " target=" + targetName
                             )
                         }
-                        // 判定不在这里做（见 after）：快速连点时 before/after 会跨调用交错，
-                        // 用布尔标记会出现"后一次 before 置位、前一次 after 消费掉"的竞态，
-                        // 表现就是用户实测的"连点有概率落回简洁页"。
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
@@ -281,12 +310,52 @@ internal object SymbolPageRedirect {
     }
 
     /**
+     * 把宿主自己的「符号页档位」从简洁抬到完整。
+     *
+     * 档位枚举三档（常量名未被混淆，本身就是语义）：
+     *
+     * ```text
+     * SymbolKeyboardType.a = NONE   → 非符号页
+     * SymbolKeyboardType.b = SYMBOL1 → 简洁符号页（宿主「符号」键默认落这里）
+     * SymbolKeyboardType.c = SYMBOL2 → 完整符号页（宿主「更多」才升到这里）
+     * ```
+     *
+     * 证据：宿主 `input/manager/l;->v(KeyboardType, boolean)` 里，`shown=true` 分支写的正是 `c`，
+     * 而 `shown=false` 写 `a`；所有"打开符号页"的分支（`h0` 内）一律先写 `b`。
+     *
+     * 只动档位字段、不动任何参数，因此与用户手点「更多」后的状态完全等价。
+     */
+    private fun promoteToFull(manager: Any?, phase: String) {
+        if (manager == null) return
+        val simple = constantOfField(NAME_SIMPLE) ?: return
+        val full = constantOfField(NAME_FULL) ?: return
+        fieldList.forEach { field ->
+            val current = runCatching { field.get(manager) }.getOrNull() ?: return@forEach
+            if (current !== simple) return@forEach
+            val ok = runCatching {
+                field.set(manager, full)
+                true
+            }.getOrDefault(false)
+            if (ok) {
+                promoteCount++
+                log("symbol-page: promoted SYMBOL1 -> SYMBOL2 (phase=$phase)")
+            }
+        }
+    }
+
+    /** 档位枚举里某个常量名对应的值（惰性取，避免安装顺序耦合）。 */
+    private fun constantOfField(name: String): Any? = runCatching {
+        enumClassRef?.enumConstants?.firstOrNull { (it as? Enum<*>)?.name == name }
+    }.getOrNull()
+
+    /** 档位枚举类（install 时记下来，供上面的常量取值复用）。 */
+    @Volatile
+    private var enumClassRef: Class<*>? = null
+
+    /**
      * 已删除：1.21.0 在这里把参数里的「简洁符号键盘类型」替换成通用符号页类型 `SYMBOLS`，
      * 结果是宿主 `k0` 抛出 `lateinit property t9PinYin has not been initialized`，
      * 点「符号」当场闪退。本模块不再从外部改写宿主参数。
-     *
-     * 同理也删除了「把档位字段 SYMBOL1 抬成 SYMBOL2」的做法：1.20.0 真机日志证明它执行成功
-     * 但界面不变（`promoted SYMBOL1 -> SYMBOL2` 出现两次，画面仍是简洁页），属于无效且多余的改动。
      */
 
     /**
