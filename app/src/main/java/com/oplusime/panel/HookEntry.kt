@@ -130,7 +130,17 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 先刷新一次跨进程开关：日志是否开启由用户在 App 界面控制，
             // 不刷这一下会沿用编译期默认值最多 5 秒。
             val logOn = runCatching { ModuleSwitches.refreshNow() }.getOrDefault(true)
+            // 把宿主 Context 提前存下来：诊断点位的落盘需要一个 Context，
+            // 而安装阶段之后有些点位是在没有 View 的线程里记录的。
+            HookDiagnostics.hostContextOverride = runCatching {
+                Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication")
+                    .invoke(null) as? android.content.Context
+            }.getOrNull()
+        HookDiagnostics.record(null, "日志开关", true, "enabled=$logOn")
             val startedAt = System.currentTimeMillis()
+            val installDetail = "host=${TARGET_PACKAGE}; apk=$apkPath; classLoader=${hostClassLoader.javaClass.name}"
+            HookDiagnostics.record(null, "模块安装入口", true, installDetail)
             runCatching { install(apkPath, hostClassLoader) }
                 .onFailure { log("install failed: ${it.stackTraceToString()}") }
             log("install finished in ${System.currentTimeMillis() - startedAt} ms (logEnabled=$logOn)")
@@ -181,6 +191,18 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             runCatching { SoftKeySwipeMap.install(bridge, hostClassLoader) }
                 .onFailure { log("swipe-map install failed: ${it.message}") }
 
+            // 「回到打字主键盘」与「让键盘设置立刻生效」共用的宿主切键盘入口。
+            // 必须早于 PanelBackRouter：返回键流程要用它。
+            runCatching { HostKeyboardSwitch.install(bridge, hostClassLoader) }
+                .onSuccess { HookDiagnostics.record(null, "键盘类型切换", true, "HostKeyboardSwitch installed") }
+                .onFailure { HookDiagnostics.record(null, "键盘类型切换", false, it.message.orEmpty()); log("keyboard-switch install failed: ${it.message}") }
+
+            // 候选拼音区域字符级光标定位：按自绘候选 View 的结构特征匹配，
+            // 点击后通过当前 InputConnection.setSelection 把光标放到对应字符位置。
+            runCatching { PinyinCursorEditor.install(bridge, hostClassLoader) }
+                .onSuccess { HookDiagnostics.record(null, "候选拼音光标", true, "PinyinCursorEditor installed") }
+                .onFailure { HookDiagnostics.record(null, "候选拼音光标", false, it.message.orEmpty()); log("pinyin-cursor install failed: ${it.message}") }
+
             // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
             // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
             runCatching { QuotePairSuppressor.attachHostImplementations(bridge, hostClassLoader) }
@@ -195,17 +217,21 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 「符号」键直达完整符号页：在旁边把符号分档抬到最高档，
             // 于是键盘上的「符号」键一按就是完整符号页，不再先落简洁页。
             runCatching { SymbolPageRedirect.install(bridge, hostClassLoader) }
-                .onFailure { log("symbol-page install failed: ${it.message}") }
+                .onSuccess { HookDiagnostics.record(null, "符号键盘切换入口", true, "SymbolPageRedirect installed") }
+                .onFailure { HookDiagnostics.record(null, "符号键盘切换入口", false, it.message.orEmpty()); log("symbol-page install failed: ${it.message}") }
 
             // 「返回 = 回键盘主页面」：面板显示期间接管系统返回键。
-            runCatching { PanelBackRouter.install(bridge, hostClassLoader) }
-                .onFailure { log("panel-back install failed: ${it.message}") }
+            runCatching { PanelBackRouter.install(bridge, hostClassLoader, backId) }
+                .onSuccess { HookDiagnostics.record(null, "返回键路由", true, "PanelBackRouter installed") }
+                .onFailure { HookDiagnostics.record(null, "返回键路由", false, it.message.orEmpty()); log("panel-back install failed: ${it.message}") }
 
             val onClick = resolvePanelOnClick(bridge, ids)
             if (onClick == null) {
+                HookDiagnostics.record(null, "文本编辑面板点击", false, "onClick structural match unavailable")
                 log("panel onclick unresolved, abort")
                 return@use
             }
+            HookDiagnostics.record(null, "文本编辑面板点击", true, "${onClick.declaredClass?.name ?: "unknown"}#${onClick.name}")
             val panelClass = runCatching { onClick.declaredClass?.getInstance(hostClassLoader) }
                 .onFailure { log("panel class load failed: ${it.message}") }
                 .getOrNull()
@@ -214,6 +240,8 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 return@use
             }
             val layoutMethod = resolvePanelLayoutMethod(bridge, hostClassLoader)
+            HookDiagnostics.record(null, "文本编辑面板排版", layoutMethod != null,
+                layoutMethod?.let { "${it.declaringClass.name}#${it.name}" } ?: "layout method unresolved")
             val keyFeedback = resolveKeyFeedback(onClick, hostClassLoader)
             val closePath = resolveClosePath(onClick, hostClassLoader)
             PanelState.closePanel = closePath
@@ -235,10 +263,12 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             )
             tweaks.bindHost(bridge, hostClassLoader)
             tweaks.install()
+            HookDiagnostics.record(null, "输入提交拦截", true, "HostTweaks installed")
 
             // 解除宿主的两处容量上限（记录表到顶裁剪、正文长度上限），全部结构匹配。
             runCatching { HostLimits.install(bridge, hostClassLoader) }
-                .onFailure { log("host-limits install failed: ${it.message}") }
+                .onSuccess { HookDiagnostics.record(null, "容量限制解除", true, "HostLimits installed") }
+                .onFailure { HookDiagnostics.record(null, "容量限制解除", false, it.message.orEmpty()); log("host-limits install failed: ${it.message}") }
 
             // 剪贴板面板：计数行最右端加白底气泡「搜索」，点击弹窗输入关键字过滤条目。
             //
@@ -247,6 +277,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 新建控件的代价是「ConstraintLayout 上无约束会被摆到 (0,0)」，
             // 因此 [ClipSearch.place] 必须把锚点显式写全（本版已写：end→parent、
             // 上下贴计数控件）。宿主不认识这个控件，就不会再改写它。
+            HostPhraseEditor.install(bridge, hostClassLoader)
             val clipSearch = ClipSearch(
                 counterId = clipCounterId,
                 phraseCounterId = phraseCounterId,
@@ -272,11 +303,14 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 restoreFocus = resolveFocusRestorer(bridge, hostClassLoader),
                 closePanel = closePath,
                 openPanel = { boxName -> opener.openByName(boxName) },
+                // 宿主自己的页状态值（剪贴板 / 常用语那个分段开关的真实档位）。
+                readHostPage = resolveHostPageReader(bridge, hostClassLoader),
             )
             if (clipCounterId != 0) {
                 // 输入法窗口被系统收起（例如键盘上的「搜索」键被宿主自己接走）时，
                 // 由这条钩子把"关键字生效 + 摘输入条 + 回面板看结果"补齐，避免留下屏幕孤儿条。
                 runCatching { clipSearch.installImeWindowHook() }
+                    .onSuccess { HookDiagnostics.record(null, "返回键路由", true, "IME window hook installed") }
                     .onFailure { log("clip-search window hook install failed: ${it.message}") }
                 // 输入法窗口的「可触摸区域」是宿主自己算的，而且宿主覆写的第一句就是调用基类
                 //（详见 ClipSearch.installImeInsetsHook 的说明），所以必须挂宿主那份覆写。
@@ -286,8 +320,10 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 // 匹配项。1.28.0 之前的"把行藏起来"这条路已证伪 —— 列表只认适配器报的条目数，
                 // 行被藏了条目数没变，列表就认为"什么都没变"，所以界面上永远没反应。
                 runCatching { clipSearch.installPagingDataFilter(bridge, hostClassLoader) }
-                    .onFailure { log("clip-search paging-data install failed: ${it.message}") }
+                    .onSuccess { HookDiagnostics.record(null, "搜索过滤适配器", true, "paging data filter installed") }
+                    .onFailure { HookDiagnostics.record(null, "搜索过滤适配器", false, it.message.orEmpty()); log("clip-search paging-data install failed: ${it.message}") }
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
+                    .onSuccess { HookDiagnostics.record(null, "剪贴板写回", true, "paging filter fallback installed") }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
                 // 列表行的「超大正文」渲染护栏：只影响看得见的那点文字，不影响复制到的内容。
                 runCatching { ListRenderGuard.install(bridge, hostClassLoader) }
@@ -297,23 +333,31 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     .onFailure { log("clip-search delete fix install failed: ${it.message}") }
                 // 剪贴板条目的「编辑」：在行内动作排最前面插一个编辑按钮，
                 // 弹出宿主同款输入框，确认后写回宿主剪贴板表。
-                runCatching {
-                    ClipboardEdit.install(
+                runCatching { ClipboardEdit.install(
                         bridge,
                         hostClassLoader,
                         addToPhraseId,
                         registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
                         clearInputTarget = resolveInputTargetClearer(bridge, hostClassLoader),
                         restoreFocus = resolveFocusRestorer(bridge, hostClassLoader),
-                    )
-                }.onFailure { log("clip-edit install failed: ${it.message}") }
+                    ) }
+                    .onSuccess { HookDiagnostics.record(null, "剪贴板编辑绑定", true, "ClipboardEdit installed") }
+                    .onFailure { HookDiagnostics.record(null, "剪贴板编辑绑定", false, it.message.orEmpty()); log("clip-edit install failed: ${it.message}") }
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)
                 if (clipPanelClass != null) {
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             (param.thisObject as? ViewGroup)?.let {
                                 PanelState.remember(it)
+                                arranger.apply(it)
                                 clipSearch.attach(it)
+                                if (backId != 0) {
+                                    it.findViewById<View>(backId)?.setOnClickListener {
+                                        log("panel back view clicked -> close panel and restore main keyboard")
+                                        runCatching { closePath?.invoke() }
+                                        SymbolPageRedirect.backToMainKeyboard()
+                                    }
+                                }
                             }
                         }
                     })
@@ -339,26 +383,47 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                             }
                         },
                     )
-                    // 宿主在同一个面板实例内通过“一个 int + 一个 boolean”的页切换方法
-                    // 更新 tv_clip_count / tv_phrase_count；切页后必须重新识别当前页面，
-                    // 否则常用语页的按钮和关键词会继续沿用剪贴板页状态。
-                    clipPanelClass.declaredMethods
-                        .filter { method ->
-                            method.parameterTypes.size == 2 &&
-                                method.parameterTypes[0] == Int::class.javaPrimitiveType &&
-                                method.parameterTypes[1] == Boolean::class.javaPrimitiveType
+                    val pageSwitchMethods = bridge.findMethod {
+                        matcher {
+                            declaredClass(clipPanelClass.name)
+                            paramTypes("int", "boolean")
+                            returnType("void")
                         }
-                        .forEach { method ->
-                            runCatching {
-                                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                                    override fun afterHookedMethod(param: MethodHookParam) {
-                                        (param.thisObject as? ViewGroup)?.let { clipSearch.attach(it) }
-                                    }
-                                })
-                            }.onFailure {
-                                log("clip-search: page-switch hook failed ${method.name}: ${it.message}")
-                            }
+                    }.mapNotNull { data ->
+                        runCatching { data.getMethodInstance(hostClassLoader).apply { isAccessible = true } }.getOrNull()
+                    }
+                    pageSwitchMethods.forEach { method ->
+                        runCatching {
+                            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                                override fun afterHookedMethod(param: MethodHookParam) {
+                                    val panel = param.thisObject as? ViewGroup
+                                    panel?.let { clipSearch.attach(it) }
+                                    clipSearch.onHostPageChanged()
+                                }
+                            })
+                        }.onFailure { log("clip-search: page-switch hook failed ${method.name}: ${it.message}") }
+                    }
+                    // Segment selector: resolve the host callback through DexKit's declared-class and signature matcher.
+                    val segmentMethods = bridge.findMethod {
+                        matcher {
+                            declaredClass(clipPanelClass.name)
+                            paramTypes("int", "int", "float")
+                            returnType("void")
                         }
+                    }.mapNotNull { data ->
+                        runCatching { data.getMethodInstance(hostClassLoader).apply { isAccessible = true } }.getOrNull()
+                    }
+                    segmentMethods.forEach { method ->
+                        runCatching {
+                            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                                override fun afterHookedMethod(param: MethodHookParam) {
+                                    log("clip-search: segment changed -> ${param.args?.getOrNull(0)}")
+                                    (param.thisObject as? ViewGroup)?.let { clipSearch.attach(it) }
+                                    clipSearch.onHostPageChanged()
+                                }
+                            })
+                        }.onFailure { log("clip-search: segment hook failed ${method.name}: ${it.message}") }
+                    }
                     log("clip-search: panel constructor/page-switch hooks installed ${clipPanelClass.name}")
                 } else {
                     log("clip-search: clipboard panel class unresolved")
@@ -376,22 +441,27 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 .getOrNull()
             if (onClickMethod != null) {
                 XposedBridge.hookMethod(onClickMethod, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val clicked = param.args.getOrNull(0) as? View ?: return
+                        if (backId == 0 || clicked.id != backId) return
+                        param.result = null
+                        runCatching { PanelState.closePanel?.invoke() }
+                            .onFailure { log("panel back click close failed: ${it.message}") }
+                        clicked.post {
+                            SymbolPageRedirect.backToMainKeyboard()
+                            log("panel back click intercepted -> main keyboard")
+                        }
+                    }
+
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val clicked = param.args.getOrNull(0) as? View ?: return
+                        if (backId != 0 && clicked.id == backId) return
                         tweaks.onHostButtonClick(
                             clickedId = clicked.id,
                             panelIds = ids,
                             panel = param.thisObject as? View,
                         )
-                        // 文本编辑面板的返回箭头（iv_back）：宿主只做「隐藏当前容器」，
-                        // 用户实测按完之后输入法一路退了出去。这里等宿主动作落地，再借宿主
-                        // 自己的「重置键盘」入口把键盘恢复成主键盘页 —— 即「返回 = 回键盘主页面」。
-                        if (backId != 0 && clicked.id == backId) {
-                            clicked.postDelayed({
-                                log("panel back tapped -> restoring main keyboard")
-                                SymbolPageRedirect.backToMainKeyboard()
-                            }, 180L)
-                        }
+                        // 普通按钮保持宿主行为；返回箭头已在 beforeHookedMethod 中拦截。
                     }
                 })
                 log("panel onClick hooked for conditional close: ${onClickMethod.declaringClass.name}")
@@ -401,13 +471,21 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
             XposedBridge.hookAllConstructors(panelClass, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    (param.thisObject as? View)?.let {
+                    (param.thisObject as? ViewGroup)?.let {
                         PanelState.remember(it)
                         arranger.apply(it)
-                    }
-                }
-            })
-            log("panel constructor hooked: ${panelClass.name}")
+                        clipSearch.attach(it)
+                        if (backId != 0) {
+                            it.findViewById<View>(backId)?.setOnClickListener { backView ->
+                                log("panel back view clicked -> close panel and restore main keyboard")
+                                runCatching { closePath?.invoke() }
+                                backView.post { SymbolPageRedirect.backToMainKeyboard() }
+                            }
+                        }
+                            }
+                        }
+                    })
+                    log("panel constructor hooked: ${panelClass.name}")
 
             // 本模块不接管"关闭面板"：宿主的按钮本来就是动作做完、面板留在原地，
             // 退出面板由用户按返回箭头完成。曾经在此挂 after 钩子自动收面板，已按用户
@@ -614,33 +692,34 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         bridge: DexKitBridge,
         hostClassLoader: ClassLoader,
     ): (() -> Boolean)? {
-        val registrarOwner = findMethods(bridge, "focus-restore") {
+        val candidates = findMethods(bridge, "focus-restore") {
             matcher {
+                usingStrings(listOf("switchToExternal"), StringMatchType.Equals, false)
                 returnType("void")
-                paramTypes("android.widget.EditText", "boolean")
             }
         }
+        val semantic = candidates
             .mapNotNull { runCatching { it.getMethodInstance(hostClassLoader) }.getOrNull() }
-            .firstOrNull { candidate ->
-                java.lang.reflect.Modifier.isStatic(candidate.modifiers)
+            .filter { method ->
+                Modifier.isStatic(method.modifiers) &&
+                    method.returnType == Void.TYPE &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0] == Int::class.javaPrimitiveType
             }
-            ?.declaringClass
-        if (registrarOwner == null) {
-            log("focus-restore: registrar owner unresolved; keyboard focus will not be restored")
+        val fallback = if (semantic.isEmpty()) {
+            findMethods(bridge, "focus-restore-shape") {
+                matcher {
+                    returnType("void")
+                    paramTypes("int")
+                }
+            }.mapNotNull { runCatching { it.getMethodInstance(hostClassLoader) }.getOrNull() }
+                .filter { Modifier.isStatic(it.modifiers) }
+        } else emptyList()
+        val restorer = (semantic + fallback).firstOrNull() ?: run {
+            log("focus-restore: no semantic or shape-matched static (int)->void restorer")
             return null
         }
-        val intPrimitive = Int::class.javaPrimitiveType ?: return null
-        val restorer = registrarOwner.declaredMethods.firstOrNull { candidate ->
-            java.lang.reflect.Modifier.isStatic(candidate.modifiers) &&
-                candidate.returnType == Void.TYPE &&
-                candidate.parameterTypes.size == 1 &&
-                candidate.parameterTypes[0] == intPrimitive
-        }
-        if (restorer == null) {
-            log("focus-restore: no static (int)->void on ${registrarOwner.name}")
-            return null
-        }
-        log("focus-restore: bound to ${registrarOwner.name}#${restorer.name}(int)")
+        log("focus-restore: bound to ${restorer.declaringClass.name}#${restorer.name}(int)")
         return {
             runCatching {
                 restorer.isAccessible = true
@@ -675,6 +754,67 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             }
             .distinct()
             .firstOrNull { ViewGroup::class.java.isAssignableFrom(it) }
+    }
+
+    /**
+     * 宿主自己的「当前页」状态读取口 —— 也就是剪贴板 / 常用语那个分段开关的真实档位。
+     *
+     * ## 为什么必须拿到它
+     *
+     * 用户原话：「常用语跟剪贴板它只是点一点按钮的，它那个按钮是一个单刀双掷开关，
+     * 那我点到那里它就会有一个状态值，你去逆向出来这个值绑定好它不就能够很简单
+     * 很轻松地区分了吗」。这个判断是对的，dex 事实也支持：
+     *
+     * ```text
+     * input/view/body/D  implements COUISegmentButtonLayout$OnSelectedSegmentChangeListener
+     *   onSelectedSegmentChange(IIF)V   ← 分段按钮（单刀双掷）的选中回调
+     *   getPrimaryPage()I               ← 内部页状态值（读了它就知道在哪一段）
+     * ```
+     *
+     * 前面几版全靠猜（"计数可见"、"列表可见"），真机上两类猜法都会把常用语页判成
+     * 剪贴板页，所以按钮怎么删都删不干净。这里改成直接问宿主。
+     *
+     * 定位全部走结构：先按「`(int,int,float) -> void` 且声明类是 View」找到那枚面板类，
+     * 再在它上面找「无参 → int、名字带 Page」的实例方法当读取口（名字是语义名，
+     * 不是混淆名；万一将来名字变了，退化为该类上唯一一个无参返回 int 的实例方法）。
+     */
+    private fun resolveHostPageReader(
+        bridge: DexKitBridge,
+        hostClassLoader: ClassLoader,
+    ): ((ViewGroup) -> Int?)? {
+        val ownerName = findMethods(bridge, "segment-listener") {
+            matcher {
+                paramTypes("int", "int", "float")
+                returnType("void")
+            }
+        }.mapNotNull { it.declaredClassName }
+            .distinct()
+            .firstOrNull { name ->
+                val cls = runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
+                cls != null && ViewGroup::class.java.isAssignableFrom(cls)
+            } ?: run {
+            log("clip-search: host page reader unresolved (no segment listener class)")
+            return null
+        }
+        val cls = runCatching { Class.forName(ownerName, false, hostClassLoader) }.getOrNull()
+            ?: return null
+        val noArgInt = cls.declaredMethods.filter {
+            it.parameterTypes.isEmpty() &&
+                it.returnType == Int::class.javaPrimitiveType &&
+                !Modifier.isStatic(it.modifiers)
+        }
+        val reader = noArgInt.firstOrNull { it.name.contains("Page", ignoreCase = true) }
+            ?: noArgInt.singleOrNull()
+            ?: run {
+                log("clip-search: host page reader unresolved owner=$ownerName candidates=${noArgInt.size}")
+                return null
+            }
+        reader.isAccessible = true
+        log(
+            "clip-search: host page reader resolved owner=$ownerName" +
+                " method=${reader.name} candidates=${noArgInt.map { it.name }}"
+        )
+        return { panel -> runCatching { reader.invoke(panel) as? Int }.getOrNull() }
     }
 
     // ---------------------------------------------------------------- queries

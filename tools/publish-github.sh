@@ -1,88 +1,64 @@
 #!/usr/bin/env bash
-# 把「小布输入法助手」发布到 GitHub（公开仓库，中文 README 与中文 Release，Release 附 APK）。
-#
-# 为什么需要你手动执行：本机没有 GitHub 凭据，且 api.github.com 被拦截，无法代为建仓与发布。
-#
-# 用法：
-#   export GITHUB_TOKEN=ghp_xxxxxxxx        # 需要 repo 权限
-#   ./tools/publish-github.sh <你的GitHub用户名> [仓库名]
-#
-# 默认仓库名：OplusImePanel
-
+# Build and publish a signed GitHub Release for this existing repository.
+# Usage: GITHUB_TOKEN=... tools/publish-github.sh OWNER/REPO [VERSION]
+# This script does not create repositories, commit files, or force-push branches/tags.
 set -euo pipefail
 
-OWNER="${1:-}"
-REPO="${2:-OplusImePanel}"
-VERSION="1.17.0"
+SLUG="${1:-}"
+VERSION="${2:-1.33.50}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+APK="$ROOT/app/build/outputs/apk/release/app-release.apk"
+NOTES="$ROOT/RELEASE_NOTES_${VERSION}.md"
+TOKEN="${GITHUB_TOKEN:-}"
+
+if [[ -z "$SLUG" || "$SLUG" != */* ]]; then
+  echo "Usage: GITHUB_TOKEN=... $0 OWNER/REPO [VERSION]" >&2
+  exit 2
+fi
+if [[ -z "$TOKEN" ]]; then
+  echo "GITHUB_TOKEN is required (repo permission). No repository changes were made." >&2
+  exit 2
+fi
+if [[ ! -f "$NOTES" ]]; then
+  echo "Release notes missing: $NOTES" >&2
+  exit 2
+fi
+
+cd "$ROOT"
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Working tree is not clean. Commit and push the reviewed source before publishing." >&2
+  exit 2
+fi
+
+echo "Building signed Release $VERSION (release logging default must remain disabled)..."
+./gradlew :app:assembleRelease --no-daemon
+[[ -f "$APK" ]] || { echo "Release APK missing: $APK" >&2; exit 1; }
+sha256sum "$APK"
+
 TAG="v${VERSION}"
-APK="/workspace/OplusImePanel/app/build/outputs/apk/release/app-release.apk"
-NOTES="/workspace/OplusImePanel/RELEASE_NOTES_${VERSION}.md"
-SRC="/workspace/OplusImePanel"
-
-if [ -z "$OWNER" ]; then
-  echo "用法: GITHUB_TOKEN=... $0 <GitHub用户名> [仓库名]" >&2
-  exit 1
-fi
-if [ -z "${GITHUB_TOKEN:-}" ]; then
-  echo "缺少 GITHUB_TOKEN（需要 repo 权限）" >&2
-  exit 1
-fi
-for f in "$APK" "$NOTES"; do
-  [ -f "$f" ] || { echo "缺少文件: $f" >&2; exit 1; }
-done
-
 API="https://api.github.com"
-
-echo "== 1/4 创建公开仓库 =="
-curl -sS -X POST "$API/user/repos" \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
+RESPONSE="$(curl -fsS -X POST "$API/repos/$SLUG/releases" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.github+json" \
-  -d "{\"name\":\"$REPO\",\"description\":\"小布输入法助手：文本编辑面板重排、剪贴板搜索与容量上限解除\",\"private\":false,\"has_issues\":true}" \
-  | head -c 400; echo
-
-echo "== 2/4 推送源码 =="
-cd "$SRC"
-if [ ! -d .git ]; then
-  git init -q
-  git add -A
-  git -c user.name="publish" -c user.email="publish@local" commit -q -m "小布输入法助手 v${VERSION}"
-fi
-git remote remove origin 2>/dev/null || true
-git remote add origin "https://${OWNER}:${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git"
-git branch -M main
-git push -u origin main
-
-echo "== 3/4 创建标签 =="
-git tag -f "$TAG"
-git push -f origin "$TAG"
-
-echo "== 4/4 发布 Release（附 APK，中文说明）=="
-curl -sS -X POST "$API/repos/${OWNER}/${REPO}/releases" \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  -d "$(python3 - "$TAG" "$NOTES" <<'PY'
-import json, sys
-tag, notes_path = sys.argv[1], sys.argv[2]
-body = open(notes_path, encoding="utf-8").read()
+  -H "Content-Type: application/json" \
+  --data-binary "$(python3 - "$TAG" "$VERSION" "$NOTES" <<'PY'
+import json, pathlib, sys
+tag, version, notes = sys.argv[1:]
 print(json.dumps({
     "tag_name": tag,
-    "name": f"小布输入法助手 {tag}",
-    "body": body,
+    "target_commitish": "main",
+    "name": f"小布输入法助手 {version}",
+    "body": pathlib.Path(notes).read_text(encoding="utf-8"),
     "draft": False,
     "prerelease": False,
 }, ensure_ascii=False))
 PY
-)" | head -c 400; echo
+)")"
+UPLOAD_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"].split("{")[0])' <<<"$RESPONSE")"
 
-echo "== 上传 APK 资产 =="
-UPLOAD_URL=$(curl -sS "$API/repos/${OWNER}/${REPO}/releases/tags/${TAG}" \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['upload_url'].split('{')[0])")
-
-curl -sS -X POST "${UPLOAD_URL}?name=$(basename "$APK")" \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
+curl -fsS -X POST "${UPLOAD_URL}?name=OplusImePanel-${VERSION}-release.apk" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/vnd.android.package-archive" \
-  --data-binary @"$APK" | head -c 300; echo
+  --data-binary "@$APK" >/dev/null
 
-echo
-echo "完成：https://github.com/${OWNER}/${REPO}/releases/tag/${TAG}"
+echo "Release uploaded: https://github.com/$SLUG/releases/tag/$TAG"

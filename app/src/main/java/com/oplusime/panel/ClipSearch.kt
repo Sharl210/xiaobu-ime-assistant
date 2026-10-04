@@ -93,11 +93,59 @@ internal class ClipSearch(
     private val closePanel: (() -> Boolean)? = null,
     /** 按 BoxEnums 常量名重新打开面板（搜索结果要看得到，就必须回到面板）。 */
     private val openPanel: ((String) -> Boolean)? = null,
+    /**
+     * 读宿主**自己**的当前页状态值。
+     *
+     * ## 为什么非要它不可（这是"常用语搜索按钮删不掉"的真根因）
+     *
+     * 宿主这一枚面板（`com.oplus.keyboard.input.view.body.D`）顶部有一个分段按钮，
+     * 剪贴板 / 常用语就是它的两段 —— 用户说的"单刀双掷开关"正是它。面板内部用一个
+     * 页状态值（`getPrimaryPage()`）表示当前在哪一段，`onSelectedSegmentChange` 是它的
+     * 切换回调。
+     *
+     * 之前几版都在**猜**这个状态：先猜"计数控件可见就是剪贴板页"（两页共用同一个计数
+     * 控件，必错），再猜"剪贴板列表可见就是剪贴板页"（真机上剪贴板列表在常用语页
+     * 也可能仍为 VISIBLE，还是错）。所以按钮怎么删都删不干净。
+     *
+     * 由 [com.oplusime.panel.HookEntry] 按结构匹配解析出这个读取口传进来。
+     */
+    private val readHostPage: ((ViewGroup) -> Int?)? = null,
 ) {
     private enum class Page { CLIPBOARD, PHRASE }
 
     @Volatile
     private var currentPage: Page = Page.CLIPBOARD
+
+    /**
+     * 面板实例 → 宿主最近一次告知的页面。
+     *
+     * ## 为什么必须是「按实例」而不是一个全局值
+     *
+     * 真机日志（1.33.32）里同一个时刻出现过两个面板实例：
+     *
+     * ```text
+     * page probe panel=…body.D  clipVisible=true  phraseVisible=false forced=CLIPBOARD
+     * page probe panel=…body.A0 clipVisible=false phraseVisible=false forced=CLIPBOARD
+     * ```
+     *
+     * `D` 是剪贴板面板、`A0` 是常用语面板，而宿主的切页回调只报了一个全局的
+     * `forced=CLIPBOARD`。上一版把这个全局值当成"当前是剪贴板页"的依据，于是在
+     * **常用语面板上也建出了搜索按钮** —— 用户反复反馈"常用语那边的搜索按钮还在"。
+     *
+     * 现在提示只按实例记录，而且只用来**压制**（说自己是常用语页就一定不显示），
+     * 从不用来创建；创建与否只认该实例自己的剪贴板列表是否真的显示着。
+     */
+    private val pageHints: MutableMap<ViewGroup, Page> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    fun setPageHint(panel: ViewGroup?, phrase: Boolean) {
+        val page = if (phrase) Page.PHRASE else Page.CLIPBOARD
+        if (panel != null) pageHints[panel] = page
+        log("clip-search: page hint=$page panel=${panel?.javaClass?.name}")
+        knownPanels.toList().forEach { known ->
+            runCatching { syncButtonVisibility(known) }
+        }
+    }
 
     @Volatile
     private var clipboardKeyword: String? = null
@@ -192,6 +240,7 @@ internal class ClipSearch(
 
     /** 面板每次排布后调用；按钮只在第一次创建，之后只重申约束。 */
     fun attach(panel: ViewGroup) {
+        knownPanels.add(panel)
         ensurePageWatcher(panel)
         syncButtonVisibility(panel)
     }
@@ -222,16 +271,15 @@ internal class ClipSearch(
     /** 按「当前是不是剪贴板页」决定按钮显隐；剪贴板页首次出现时顺便创建。 */
     private fun syncButtonVisibility(panel: ViewGroup) {
         if (!isOnClipboardPage(panel)) {
-            // 常用语页：**不显示搜索按钮**（用户反复明确要求，已强调多次）。
-            //
-            // 这里必须**把控件摘掉**，而不是只改自己的 visibility：宿主两页共用同一行，
-            // 容器/兄弟控件的可见性会让它照样出现在屏幕上（这正是上一版失效的原因）。
-            // 切回剪贴板页时重新创建即可，创建成本可以忽略。
+            // 只移除“当前常用语面板实例”自己创建的按钮。
+            // 不能扫描 DecorView 根节点，否则会把剪贴板页按钮一起删掉。
             val button = buttons.remove(panel)
-            runCatching { (button?.parent as? ViewGroup)?.removeView(button) }
             if (button != null) {
-                log("clip-search: search button removed (page=PHRASE)")
+                log("clip-search: remove phrase-owned button id=0x${Integer.toHexString(button.id)}")
+                (button.parent as? ViewGroup)?.removeView(button)
             }
+            if (panel.isShown) currentPage = Page.PHRASE
+            log("clip-search: phrase page search controls removed without touching clipboard root")
             return
         }
         currentPage = Page.CLIPBOARD
@@ -264,19 +312,57 @@ internal class ClipSearch(
      * 因此在剪贴板页它一定不可见。两页万一同时可见（宿主切换的中间态），
      * 也一律按「常用语页」处理 —— 宁可不显示，也不要在常用语页冒出来。
      */
+    /**
+     * 宿主页状态值的语义（"0 是不是剪贴板页"）。
+     *
+     * 由实际观测校正，不写死：第一次遇到"两条列表里明确只有一条可见"的时刻，
+     * 拿当时的宿主页值对一次，就知道 0 对应哪一页了。校正结果进程内复用。
+     */
+    @Volatile
+    private var pageZeroIsClipboard: Boolean? = null
+
+    /** 宿主页状态变化（分段按钮被点）时立刻按新状态重算所有面板。 */
+    fun onHostPageChanged() {
+        knownPanels.toList().forEach { panel ->
+            runCatching { syncButtonVisibility(panel) }
+        }
+    }
+
     private fun isOnClipboardPage(panel: ViewGroup): Boolean {
+        val hint = pageHints[panel]
         val clipVisible = isEffectivelyVisible(panel, listId)
         val phraseVisible = isEffectivelyVisible(panel, phraseListId)
-        if (clipVisible || phraseVisible) return clipVisible && !phraseVisible
-        // 视图还没挂完时退回计数控件判定（新装面板的短暂瞬间）。
-        val clipCounter = panel.findViewById<View>(counterId) ?: return false
-        val phraseCounter = if (phraseCounterId != 0) {
-            panel.findViewById<View>(phraseCounterId)
-        } else {
-            null
+
+        // ① 首选：读宿主自己的页状态值（那个"单刀双掷开关"的真实档位）。
+        val hostPage = runCatching { readHostPage?.invoke(panel) }.getOrNull()
+        if (hostPage != null) {
+            // 语义还没学到时，抓一次"只有一条列表可见"的干净时刻来自我校正。
+            if (pageZeroIsClipboard == null && clipVisible != phraseVisible) {
+                val learned = if (clipVisible) hostPage == 0 else hostPage != 0
+                pageZeroIsClipboard = learned
+                log("clip-search: host page semantics learned page0=clipboard -> $learned (sample=$hostPage clip=$clipVisible phrase=$phraseVisible)")
+            }
+            val zeroIsClipboard = pageZeroIsClipboard
+            if (zeroIsClipboard != null) {
+                val onClipboard = if (zeroIsClipboard) hostPage == 0 else hostPage != 0
+                log(
+                    "clip-search: page probe panel=${panel.javaClass.name}" +
+                        " hostPage=$hostPage -> clipboard=$onClipboard" +
+                        " (clipVisible=$clipVisible phraseVisible=$phraseVisible)"
+                )
+                return onClipboard
+            }
         }
-        return clipCounter.visibility == View.VISIBLE &&
-            (phraseCounter == null || phraseCounter.visibility != View.VISIBLE)
+
+        // ② 兜底：拿不到宿主的页值（或语义还没校正出来）时，仍按列表可见性判。
+        log(
+            "clip-search: page probe panel=${panel.javaClass.name}" +
+                " clipVisible=$clipVisible phraseVisible=$phraseVisible" +
+                " hint=$hint hostPage=$hostPage"
+        )
+        if (hint == Page.PHRASE) return false
+        if (phraseVisible) return false
+        return clipVisible
     }
 
     /** 目标控件是否真的显示在屏幕上：自己与所有祖先都 VISIBLE。 */
@@ -292,8 +378,13 @@ internal class ClipSearch(
         return true
     }
 
-    /** 已经挂过页观察者的面板（幂等）。 */
+    private val searchButtonTag = "oplusime_panel_clip_search_button"
+
     private val watched: MutableSet<ViewGroup> =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<ViewGroup, Boolean>())
+
+    /** 所有见过的面板实例；宿主把剪贴板页和常用语页拆成不同 View 时，必须跨实例清理。 */
+    private val knownPanels: MutableSet<ViewGroup> =
         java.util.Collections.newSetFromMap(java.util.WeakHashMap<ViewGroup, Boolean>())
 
     /** 建按钮 + 摆位置（只在剪贴板页第一次出现时调用）。 */
@@ -322,6 +413,7 @@ internal class ClipSearch(
         val context = counter.context
         val view = createViewLike?.invoke(counter) ?: TextView(context)
         view.id = View.generateViewId()
+        view.tag = searchButtonTag
         view.text = label
         view.gravity = Gravity.CENTER
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -1045,124 +1137,14 @@ internal class ClipSearch(
     }
 
     private fun showDialog(anchor: View) {
-        runCatching {
-            val context = anchor.context
-            val density = context.resources.displayMetrics.density
-            val page = currentPage
-            // **必须记下窗口根视图**。面板在搜索结束后会被宿主重建，新的分页适配器是一个
-            // **新实例**，过滤只对"登记过的适配器"生效；而登记发生在 [reloadLists] 里，
-            // 它靠 [findLiveList] 从窗口根视图找出屏幕上那个列表。
-            // 上一版只在输入条那条路径里记了根视图，弹窗这条路径没记 ——
-            // 于是弹窗收尾时找不到列表、新适配器从未登记，**过滤等于没执行**
-            // （用户实测："点击搜索以后没有过滤，看到的还是原原本本的全部记录"）。
-            (anchor.rootView as? ViewGroup)?.let { lastRoot = java.lang.ref.WeakReference(it) }
-            // 先收起面板：`res/IB.xml` 的根布局是 match_parent，剪贴板/常用语面板**占满整个
-            // 键盘区域**（面板里只有标题栏 + 列表 + 底栏，没有任何按键）。面板开着的时候屏幕上一个
-            // 键都没有 —— 所以"键盘弹不出来"的直接原因不是弹窗的窗口标志，而是面板把键盘的位置占了。
-            // 收起面板走宿主自己的返回键链路（与 HostTweaks 关闭面板用的是同一条），键盘立刻回来，
-            // 弹窗里的输入框才有键可按。搜索结果仍然正常：确认后重新打开面板即见到过滤后的列表。
-            val closed = runCatching { closePanel?.invoke() }.getOrNull()
-            log("clip-search: panel closed before input=$closed page=$page")
-            val builderClass = Class.forName("com.coui.appcompat.dialog.COUIAlertDialogBuilder", false, context.classLoader)
-            val builder = builderClass.getConstructor(android.content.Context::class.java).newInstance(context)
-            val field = createInputField?.invoke(context) ?: EditText(context)
-            field.hint = "输入要搜索的关键字"
-            field.isFocusableInTouchMode = true
-            field.setShowSoftInputOnFocus(true)
-            field.setSingleLine(true)
-            // 与宿主自己的搜索框 `input.view.head.h0`（SearchView / emoji 搜索）一致的两件事：
-            //   setImeOptions(3)                    → IME_ACTION_SEARCH（键盘右下角显示「搜索」）
-            //   input/manager/h;->l(editText,true)  → 注册成输入法内部输入目标（见构造参数）
-            // 第二件才是"键盘上的按键进到这个输入框"的开关。
-            //
-            // 注意：这里**不改 inputType**。宿主自己的输入框用默认值，
-            // 而我们手写 `TYPE_CLASS_TEXT` 会让某些输入法分支走"外部编辑框"那条路，反而收不到内部按键。
-            field.imeOptions = EditorInfo.IME_ACTION_SEARCH
-            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            field.setText(currentKeyword() ?: "")
-            field.setSelectAllOnFocus(false)
-            field.setPadding(
-                (12 * density).toInt(), (10 * density).toInt(),
-                (12 * density).toInt(), (10 * density).toInt(),
-            )
-
-            builderClass.getMethod("setTitle", CharSequence::class.java).invoke(builder, "搜索")
-            builderClass.getMethod("setView", View::class.java).invoke(builder, field)
-            builderClass.getMethod("setCancelable", Boolean::class.javaPrimitiveType).invoke(builder, true)
-            runCatching { builderClass.getMethod("setBlurBackgroundDrawable", Boolean::class.javaPrimitiveType).invoke(builder, true) }
-
-            val dialogBox = arrayOfNulls<Dialog>(1)
-            val listenerType = DialogInterface.OnClickListener::class.java
-            val confirm = java.lang.reflect.Proxy.newProxyInstance(
-                listenerType.classLoader,
-                arrayOf(listenerType),
-            ) { _, method, _ ->
-                if (method.name == "onClick") {
-                    applyKeyword(field.text?.toString().orEmpty())
-                    dialogBox[0]?.dismiss()
-                }
-                null
-            } as DialogInterface.OnClickListener
-            val cancel = java.lang.reflect.Proxy.newProxyInstance(
-                listenerType.classLoader,
-                arrayOf(listenerType),
-            ) { _, method, _ ->
-                if (method.name == "onClick") {
-                    dialogBox[0]?.dismiss()
-                }
-                null
-            } as DialogInterface.OnClickListener
-
-            invokeDialogButton(builderClass, builder, "setNeutralButton", "搜索", confirm)
-            invokeDialogButton(builderClass, builder, "setNegativeButton", "取消", cancel)
-
-            val dialog = builderClass.getMethod("create").invoke(builder) as Dialog
-            dialogBox[0] = dialog
-            // 弹窗被任何方式关掉（确认 / 取消 / 点外面 / 返回键）都要**成对还原输入目标**，
-            // 否则会留下"用过一次搜索之后键盘怎么按都打不出字"。
-            dialog.setOnDismissListener { finishDialogSearch(page, "dismiss") }
-            val window = dialog.window
-            val token = anchor.windowToken ?: error("search anchor has no window token")
-            if (window != null) {
-                val attrs = window.attributes
-                attrs.token = token
-                // 逐字照抄宿主「添加常用语」弹窗 `body/D;->q(String, Function0)`：
-                //   token = 当前输入法窗口的 token，type = 0x3eb，
-                //   addFlags(0x20002) = FLAG_NOT_FOCUSABLE | FLAG_ALT_FOCUSABLE_IM。
-                // 关键是 0x20002：弹窗**不抢焦点**，输入法窗口因此不会被压下去，
-                // 文字改由宿主的内部焦点切换送进输入框（见 registerInputTarget）。
-                attrs.type = 0x3eb
-                window.attributes = attrs
-                // 与宿主「添加常用语」弹窗（body/D;->q）唯一的差别：**不要 0x20000**。
-                // 0x20000 = FLAG_ALT_FOCUSABLE_IM，含义是"这个窗口不要让输入法弹出来"。
-                // 宿主那个弹窗里没有输入框，所以它加上没问题；我们这个弹窗是要打字的，
-                // 带上这个标志系统就会把输入法窗口收下去 —— 实测表现就是"只有一个光标，键盘不出来"。
-                // 因此这里只保留 FLAG_DIM_BEHIND（0x2），并显式清掉 0x20000。
-                window.clearFlags(0x20000)
-                window.addFlags(0x2)
-                window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-                window.setDimAmount(0.3f)
-            }
-            dialog.show()
-            // show() 之后窗口标志才是最终值，这里再清一次并留证。
-            runCatching { dialog.window?.clearFlags(0x20000) }
-            runCatching { builderClass.getMethod("updateViewAfterShown").invoke(builder) }
-            field.requestFocus()
-            field.setSelection(field.text?.length ?: 0)
-            val registered = registerInputTarget?.invoke(field) == true
-            // 宿主自己的流程（比如面板重建）可能把内部输入目标换回它自己的编辑框，
-            // 所以稍后再确认一次；成功与否都如实写日志，不靠"应该没问题"。
-            field.postDelayed({
-                val again = runCatching { registerInputTarget?.invoke(field) == true }.getOrDefault(false)
-                log("clip-search: input target re-register=$again")
-            }, 250L)
-            log(
-                "clip-search: host dialog shown, input-registered=$registered" +
-                    " windowType=${window?.attributes?.type}" +
-                    " flags=0x${window?.attributes?.flags?.let { Integer.toHexString(it) }}" +
-                    " imeOptions=${field.imeOptions} inputType=${field.inputType}"
-            )
-        }.onFailure { log("clip-search: host dialog failed: ${it.message}") }
+        val page = currentPage
+        (anchor.rootView as? ViewGroup)?.let { lastRoot = java.lang.ref.WeakReference(it) }
+        val shown = HostPhraseEditor.show(
+            anchor, "搜索", currentKeyword().orEmpty(), registerInputTarget,
+            onConfirm = { applyKeyword(it, page) },
+            onClose = { finishDialogSearch(page, "native-close") },
+        )
+        if (!shown) log("clip-search: native editor unavailable; no custom dialog fallback")
     }
 
     /** 搜索结束后回到面板：过滤结果只有面板里才看得到。 */
@@ -1190,9 +1172,9 @@ internal class ClipSearch(
     private fun finishDialogSearch(page: Page, reason: String) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         runCatching {
-            val released = runCatching { clearInputTarget?.invoke() }.getOrNull()
-            val restored = runCatching { restoreFocus?.invoke() }.getOrNull()
-            log("clip-search: dialog focus released clear=$released restore=$restored")
+            val released = runCatching { restoreFocus?.invoke() }.getOrNull() == true
+            val cleared = if (!released) runCatching { clearInputTarget?.invoke() }.getOrNull() else false
+            log("clip-search: dialog focus released restore=$released clearFallback=$cleared")
             handler.postDelayed({
                 reopenPanel(page)
                 handler.postDelayed({
@@ -1238,8 +1220,7 @@ internal class ClipSearch(
     }
 
 
-    private fun applyKeyword(raw: String) {
-        val page = currentPage
+    private fun applyKeyword(raw: String, page: Page = currentPage) {
         val next = raw.trim().ifEmpty { null }
         if (next == keywordFor(page)) return
         setKeyword(page, next)
@@ -1323,8 +1304,12 @@ internal class ClipSearch(
         // 这里同时是"关键字已生效"的标记点：登记之后，列表下一次询问条目数就会被过滤。
         registerDataAdapter(adapter, page)
         val count = runCatching {
-            adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int
-        }.getOrNull() ?: 0
+            pagingCountMethod?.let { method ->
+                if (method.declaringClass.isAssignableFrom(adapter.javaClass)) {
+                    method.invoke(adapter) as? Int
+                } else null
+            } ?: 0
+        }.getOrDefault(0)
         // 首选 notifyDataSetChanged：1.29.0 起过滤发生在**数据层**（重写分页适配器的
         // getItemCount/getItem），条目数本身会变，必须让列表重问一次；只发
         // notifyItemRangeChanged 的话列表仍以为条目数是原来那个，计数对不上会直接不刷新。
@@ -1624,18 +1609,27 @@ internal class ClipSearch(
     /** 真正遍历条目、构造过滤快照（只在后台线程调用）。 */
     private fun buildSnapshot(adapter: Any): DataSnapshot? {
         val kw = dataKeywordFor(adapter) ?: return null
-        val countMethod = pagingCountMethod ?: return null
-        val itemMethod = pagingItemMethod ?: return null
         val originalCount = runCatching {
-            XposedBridge.invokeOriginalMethod(countMethod, adapter, arrayOfNulls<Any>(0)) as? Int
+            adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int
         }.getOrNull() ?: return null
         val items = ArrayList<Any?>(maxOf(originalCount, 0))
+        var unreadable = false
         for (i in 0 until originalCount) {
-            val item = runCatching {
-                XposedBridge.invokeOriginalMethod(itemMethod, adapter, arrayOf<Any?>(i))
-            }.getOrNull()
-            // 占位行（分页尚未加载到的位置）保持原样，交给宿主自己按占位处理。
-            if (item == null || matches(item, kw)) items.add(item)
+            val item = readItem(adapter, i)
+            if (item == null) {
+                unreadable = true
+                break
+            }
+            if (matches(item, kw)) items.add(item)
+        }
+        // 任一条目无法读取时，禁止把 null 写回适配器；否则宿主会按空对象绑定，
+        // 结果就是剪贴板整页出现空白。此时完全放行原列表。
+        if (unreadable) {
+            synchronized(dataAdaptersLock) {
+                dataSnapshots[adapter] = DataSnapshot(dataVersion, kw, originalCount, emptyList(), degraded = true)
+            }
+            log("paging-data: unreadable item; filter skipped count=$originalCount kw=$kw")
+            return null
         }
         // 一条都没命中时**不做任何改写**（1.30.0 的关键纠正）。
         //
@@ -1738,27 +1732,9 @@ internal class ClipSearch(
      *  3. 都不行 → 返回 null，调用方按"保持可见"处理，绝不静默清空列表。
      */
     private fun readItem(adapter: Any, position: Int): Any? {
-        val cls = adapter.javaClass
-        runCatching {
-            cls.getMethod("peek", Int::class.javaPrimitiveType).invoke(adapter, position)
-        }.onSuccess { return it }
-
-        var current: Class<*>? = cls
-        var depth = 0
-        while (current != null && current != Any::class.java && depth < 12) {
-            val method = runCatching {
-                current!!.getDeclaredMethod("getItem", Int::class.javaPrimitiveType)
-            }.getOrNull()
-            if (method != null) {
-                return runCatching {
-                    method.isAccessible = true
-                    method.invoke(adapter, position)
-                }.getOrNull()
-            }
-            current = current.superclass
-            depth++
-        }
-        return null
+        val method = pagingItemMethod ?: return null
+        if (!method.declaringClass.isAssignableFrom(adapter.javaClass)) return null
+        return runCatching { method.invoke(adapter, position) }.getOrNull()
     }
 
     /** 继承链（含接口）上出现分页包名即为分页源；只做判定，不改任何行为。 */

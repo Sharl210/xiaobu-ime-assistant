@@ -46,33 +46,47 @@ class MainActivity : Activity() {
         addGroup(
             root, "文本编辑面板",
             listOf(
-                "排版即百度输入法排版：左列 全选／复制／粘贴，右列 删除／回车／剪贴板",
-                "左列第一格双态：没选中是「全选」，选中后变「剪切」并真的剪切",
-                "六个按钮加宽 1.2 倍，左侧白色面板自动让位",
-                "「剪切」点完回键盘；「粘贴」只有真粘到内容才回",
+                "排版参考百度输入法：六个操作按钮分两列排列，保留宿主原有点击行为",
+                "左上操作格随选择状态在「全选」与「剪切」之间切换",
+                "剪切完成回到打字键盘；只有实际粘贴成功才自动返回",
+                "系统返回手势从文本编辑面板返回打字主键盘，不主动收起输入法",
             ),
         )
         addGroup(
             root, "剪贴板面板",
             listOf(
-                "计数行右侧新增「搜索」按钮，点击弹出搜索框，输入后点「搜索」开始过滤",
-                "搜索生效时按钮变浅蓝气泡＋蓝字，再点一次取消搜索",
-                "条目数量上限解除：计数显示 ∞，存满时不再丢掉最旧的条目",
-                "超长条目不再整段渲染：显示层只排版前面一段，列表滑动不再卡顿（复制到的仍是完整正文）",
+                "条目数量上限解除，计数显示 ∞；不再达到上限时挤掉最旧记录",
+                "超长条目采用受控预览渲染，复制和剪切仍保留完整原文",
+                "剪贴板页可搜索并过滤条目；常用语页不显示此搜索入口",
+                "剪贴板条目可通过宿主原生编辑界面修改并写回",
             ),
         )
         addGroup(
             root, "常用语",
             listOf(
-                "单条正文 500 字上限解除，字数显示 ∞，超长也能保存",
-                "条目数量上限解除",
+                "单条正文 500 字输入上限与条目数量上限解除",
+                "输入超长内容时宿主计数和截断限制一并处理",
             ),
         )
         addGroup(
-            root, "符号",
+            root, "键盘输入与符号",
             listOf(
-                "成对符号不再自动补全：引号、括号、书名号等点哪个上屏哪个，不会替你再补一个、也不会把光标夹在中间",
-                "「符号」键（键盘左下）直接进入完整符号页，不再先落简洁页",
+                "中英文 26 键上滑字符采用各自键位表；中文逗号上滑输入感叹号",
+                "英文书册键切换宿主的英文候选设置，并按设置结果显示状态",
+                "候选拼音行支持点选编辑位置、占位光标及中间插入/退格",
+                "抑制引号、括号等字符的自动成对补全",
+                "中文、英文、数字符号键跳转到宿主完整符号页；实际兼容状态可查诊断页",
+                "主键盘回车键显示回车箭头，按键行为仍走宿主逻辑",
+            ),
+        )
+
+        addGroup(
+            root, "诊断与设备适配",
+            listOf(
+                "「Hook诊断」页面展示已匹配、匹配失败或尚未回传的点位；点开可查看匹配详情",
+                "面向小布输入法宿主包；设备需实际安装兼容版本并由 LSPosed 成功注入",
+                "宿主升级或匹配失败时，可在诊断页查看具体点位；状态不等同于功能验收",
+                "日志由本页开关控制；Debug 测试包默认开启，正式 Release 默认关闭",
             ),
         )
 
@@ -91,11 +105,28 @@ class MainActivity : Activity() {
         return ScrollView(this).apply { addView(root) }
     }
 
-    private fun header(): View = TextView(this).apply {
-        text = getString(R.string.module_title)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-        setTextColor(FG)
-        setTypeface(typeface, android.graphics.Typeface.BOLD)
+    private fun header(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        val titleView = TextView(this@MainActivity).apply {
+            text = getString(R.string.module_title)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            setTextColor(FG)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        addView(titleView)
+        addView(TextView(this@MainActivity).apply {
+            text = "Hook诊断"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(ACCENT)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                startActivity(android.content.Intent(this@MainActivity, HookDiagnosticsActivity::class.java))
+            }
+        })
     }
 
     private fun caption(): View = TextView(this).apply {

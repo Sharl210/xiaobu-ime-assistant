@@ -2,13 +2,24 @@ package com.oplusime.panel
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.AssetManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.view.View
+import android.widget.Toast
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.query.FindMethod
+import org.luckypray.dexkit.query.enums.StringMatchType
 import org.luckypray.dexkit.result.MethodData
+import java.lang.reflect.Method
 
 /**
  * 26 键键盘的**上滑字符**，按百度输入法一一对应（中文页、英文页各一套）。
@@ -39,20 +50,13 @@ import org.luckypray.dexkit.result.MethodData
 internal object SoftKeySwipeMap {
 
     /**
-     * 英文逗号上滑的标记 —— 一枚大写字母 A（功能标记，非字符）。
-     *
-     * 关闭态 = 零宽空格 + `A`；开启态 = 零宽空格 + **粗体 A**（U+1D400）。
-     * 两者是**同一个字形 A 的两种字重**，所以视觉上是"这一枚字变实/变立体了"，
-     * 而不是换成另一个不相干的图标 —— 这正是用户要的效果。
-     *
-     * 为什么前面要带一个零宽空格：上滑标记最终是**以文本形式提交**出去的，
-     * 而这个提交口无法区分"滑出来的 A"和"手打出来的 A"。加一个不可见、键盘上
-     * 永远不会产出的前缀，标记就变成整条链上唯一的字符串，拦截因此**零误伤**。
+     * 英文逗号上滑的内部动作标记。显示层不再伪造字母 A：百度定制版的真实键面是
+     * `assets/1080/res/more.png` 的第 2/3 贴图，动作链仍使用不可见哨兵文本。
      */
-    const val EN_SUGGEST_MARK_OFF: String = "\u200BA"
+    const val EN_SUGGEST_MARK_OFF: String = "\u200B"
 
-    /** 开启态：零宽空格 + 粗体大写 A（同一字形，加粗）。 */
-    const val EN_SUGGEST_MARK_ON: String = "\u200B\uD835\uDC00"
+    /** 开启态使用同一个不可见哨兵；图标状态由宿主设置回读决定。 */
+    const val EN_SUGGEST_MARK_ON: String = "\u200B"
 
     /**
      * 英文页 —— 逐字抄自**百度输入法自己的布局文件**。
@@ -117,15 +121,8 @@ internal object SoftKeySwipeMap {
      */
     const val CN_COMMA_ACTION: String = "toggle_english_suggestion"
 
-    /**
-     * 引擎真正读取的**存储键**。
-     *
-     * 注意区分：设置页那一行的 preference key 是 `key_english_suggestion`，
-     * 而引擎侧读的是 `key_en_suggestion` —— 宿主自己就是这样"界面 key → 存储 key"翻译的
-     * （`settings/English26KeyFragment.onPreferenceTreeClick` 里两个字符串同时出现，
-     *  随后调 `utils/storage/a.k(名字, "key_en_suggestion", 值)`）。
-     * 直接写存储键，才是真正改到引擎行为。
-     */
+    /** 中文资源及设置点击链验证：predict 为英文候选，suggestion 为英文联想。 */
+    const val KEY_EN_PREDICT: String = "key_en_predict"
     const val KEY_EN_SUGGESTION: String = "key_en_suggestion"
 
     /** 宿主设置用的 SharedPreferences 名（未被混淆的字符串常量）。 */
@@ -137,6 +134,19 @@ internal object SoftKeySwipeMap {
     /** 最近一次拿到的 Context（上下滑标记命中时用来切开关）。 */
     @Volatile
     private var contextRef: android.content.Context? = null
+
+    /** 百度定制版 `more.png` 精灵图：IMG2=英文联想关，IMG3=英文联想开。 */
+    @Volatile
+    private var baiduMoreBitmap: Bitmap? = null
+
+    @Volatile
+    private var baiduMoreLoadAttempted = false
+
+    private val baiduMorePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+    /** 百度资源表 more.til 中 IMG2 / IMG3 的源矩形。 */
+    private val BAIDU_MORE_OFF = Rect(139, 0, 163, 31)
+    private val BAIDU_MORE_ON = Rect(115, 0, 139, 31)
 
     /** 标记这个 SoftKey 已经被我们按当前语言刷过，避免每帧重复写。 */
     private const val TAG_LANG: String = "oplusime.swipe.lang"
@@ -159,8 +169,18 @@ internal object SoftKeySwipeMap {
         if (installed) return
         this.hostClassLoader = hostClassLoader
         bridgeRef = bridge
+        // 所有静态查询必须在 HookEntry 的 DexKitBridge.use 关闭之前完成。
+        // 运行时只能使用已经解析好的 Method，不能再次访问已释放的原生桥。
+        resolveFlagAccessors()
+        // 输入法换 input view（语音/手写全屏等）时把自绘图标收干净；
+        // 语音面板不会 detach 键盘视图，只靠可见性巡检会漏（真机已见）。
+        runCatching { SwipeIconLayer.install(hostClassLoader) }
+            .onFailure { log("swipe-map: swipe-icon install failed: ${it.message}") }
         installDrawHook(bridge, hostClassLoader)
+        installMarkTypography(bridge, hostClassLoader)
+        installReturnDrawing()
         installSwipeToggleHook(hostClassLoader)
+        bridgeRef = null
         installed = true
     }
 
@@ -274,16 +294,39 @@ internal object SoftKeySwipeMap {
 
     /** 命中标记：切开关 + 吞掉这次提交，并留一行证据。 */
     private fun onMarkerSeen(source: String): Boolean {
-        val ctx = contextRef
+        val oldContext = contextRef
+        val refreshView = lastKeyboardView?.get()
+        val ctx = refreshView?.context ?: oldContext
         if (ctx == null) {
-            log("swipe-map: marker seen from $source but no context yet")
+            log("swipe-map: marker seen from $source but host context unavailable")
             return true
         }
-        toggleEnglishSuggestion(ctx)
-        // 开关状态变了 → 键面那枚 A 的字重必须跟着变（关=普通 A，开=粗体 A）。
-        // 逐键判重的记录必须先作废，否则 applyLang 会认为"这一帧已经刷过"而跳过。
-        appliedLang.clear()
-        log("swipe-map: comma swipe toggled english suggestion (source=$source, submission suppressed)")
+        contextRef = ctx
+        val toggled = toggleEnglishSuggestion(ctx)
+        // 真正生效与否以**落盘快照**为准：宿主"写"与"读"不是同一份内存副本，
+        // 切换那一刻读回可能还是旧值（真机日志里就是 读取=false 而快照已经写入 false，
+        // 但更早那次是被这条判据误判成"切换失败"并弹了失败提示）。
+        val enabled = readFlag() == true
+        val message = if (toggled && enabled) "单词模式" else if (toggled) "字母模式" else "英文候选切换失败"
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        handler.post {
+            // 首选**画在输入法窗口里**。
+            //
+            // 真机日志里系统 Toast 那一行一直打印"已显示"，用户却看不到 —— 输入法窗口
+            // 层级上弹的 Toast 归属不对，系统会把它丢掉。自有覆盖层画在自己窗口里，
+            // 一定看得见。只有覆盖层挂不上时才退回系统 Toast。
+            val overlayShown = runCatching { SwipeIconLayer.toast(refreshView, message) }
+                .getOrDefault(false)
+            if (!overlayShown) {
+                runCatching { Toast.makeText(ctx, message, Toast.LENGTH_SHORT).show() }
+                    .onFailure { log("swipe-map: toast failed message=$message error=${it.message}") }
+            }
+            log("swipe-map: toast shown message=$message overlay=$overlayShown")
+        }
+        log(
+            "swipe-map: comma swipe candidates verified=$toggled state=$enabled" +
+                " (source=$source, submission suppressed)"
+        )
         return true
     }
 
@@ -357,7 +400,22 @@ internal object SoftKeySwipeMap {
                         // 只有实例方法（宿主 `f(Canvas, SoftKey)` / `g(Canvas, SoftKey)`）才动手。
                         val view = param.thisObject as? View ?: return
                         val key = param.args?.getOrNull(1) ?: return
+                        param.setObjectExtra("oplusime.draw.previous.key", drawingKey.get())
+                        param.setObjectExtra("oplusime.draw.previous.view", drawingView.get())
+                        drawingKey.set(key)
+                        drawingView.set(view)
+                        lastKeyboardView = java.lang.ref.WeakReference(view)
+                        rememberKeyboardView(view)
                         applyLang(view, key)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val view = param.thisObject as? View ?: return
+                        val canvas = param.args?.getOrNull(0) as? Canvas ?: return
+                        val key = param.args?.getOrNull(1) ?: return
+                        drawBaiduSuggestionIcon(view, canvas, key)
+                        drawingKey.set(param.getObjectExtra("oplusime.draw.previous.key"))
+                        drawingView.set(param.getObjectExtra("oplusime.draw.previous.view") as? View)
                     }
                 })
                 hooks++
@@ -382,6 +440,132 @@ internal object SoftKeySwipeMap {
         java.util.Collections.synchronizedMap(java.util.IdentityHashMap())
 
     /**
+     * 已经挂过"脱离窗口即清图标"监听的键盘视图。
+     *
+     * 只挂一次；用弱引用身份表，避免把已经销毁的键盘视图钉在内存里。
+     */
+    private val watchedKeyboardViews: MutableSet<View> =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+
+    /**
+     * 键盘视图被移出窗口时，立刻清掉我们画在输入法窗口上的那层图标。
+     *
+     * 这是 1.33.31 那个"图标一直浮在输入法上、切到哪个界面都在"的回归修复的一半：
+     * 另一半是覆盖层自己的心跳过期（见 [SwipeIconLayer] 注释）。这里覆盖的是
+     * "键盘整个视图被换掉/销毁"这种宿主行为，不必再等 350 毫秒心跳。
+     */
+    private fun rememberKeyboardView(view: View) {
+        if (!watchedKeyboardViews.add(view)) return
+        runCatching {
+            view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) = Unit
+
+                override fun onViewDetachedFromWindow(v: View) {
+                    SwipeIconLayer.clear("keyboard detached")
+                }
+            })
+        }.onFailure { log("swipe-map: attach-state listener failed: ${it.message}") }
+    }
+
+    /**
+     * 用百度定制版 APK 的真实 `more.png` 精灵图覆盖英文逗号上滑标记。
+     *
+     * 资源已经随模块打包进 `assets/baidu_more.png`；运行时不能依赖设备安装百度输入法，
+     * 因为百度 APK 只是取证来源，不是目标设备的运行时依赖。
+     */
+    private fun drawBaiduSuggestionIcon(view: View, canvas: Canvas, key: Any) {
+        runCatching {
+            if (resolveLang(view) != "en") {
+                // 非英文页没有这枚「英文候选」图标。必须在这里把它收掉：
+                // 1.33.31 的"图标像披在输入法上、切页都不消失"就是因为在中文页
+                // 也照同一个键位坐标画了一次。判页用宿主自己报的键盘类型，不靠心跳。
+                SwipeIconLayer.clear("non-english-page")
+                return
+            }
+            val text = readString(key, "s") ?: return
+            if (text != "," && text != "\uFF0C") return
+            val bitmap = loadBaiduMoreBitmap() ?: return
+            val enabled = readFlag() == true
+            val src = if (enabled) BAIDU_MORE_ON else BAIDU_MORE_OFF
+
+            // 复用宿主 SoftKey 自己的四个边界字段，不能按整个键盘 View 的比例猜坐标。
+            // 宿主 `s.g(Canvas, SoftKey)` 也正是用 b/d/c/e 设置键面边界。
+            val bounds = boundsOf(key) ?: return
+            val left = bounds.left
+            val top = bounds.top
+            val right = bounds.right
+            val bottom = bounds.bottom
+            val keyWidth = (right - left).coerceAtLeast(1)
+            val keyHeight = (bottom - top).coerceAtLeast(1)
+            val iconWidth = (keyWidth * 0.25f).toInt().coerceAtLeast(16)
+            val iconHeight = (iconWidth * 31f / 24f).toInt().coerceAtLeast(20)
+            val dstLeft = left + (keyWidth - iconWidth) / 2
+            val dstTop = top + (keyHeight * 0.08f).toInt()
+            val dst = Rect(dstLeft, dstTop, dstLeft + iconWidth, dstTop + iconHeight)
+            baiduMorePaint.colorFilter = PorterDuffColorFilter(
+                if (enabled) android.graphics.Color.rgb(10, 89, 247) else android.graphics.Color.BLACK,
+                PorterDuff.Mode.SRC_IN,
+            )
+            canvas.drawBitmap(bitmap, src, dst, baiduMorePaint)
+            // 同步到**自有覆盖层**：真机日志证明宿主收到 invalidate() 后并不会重画键面，
+            // 所以"上滑之后图标立刻变色"只能由我们这一层保证（详见 SwipeIconLayer 注释）。
+            val location = IntArray(2)
+            view.getLocationInWindow(location)
+            SwipeIconLayer.update(
+                view,
+                SwipeIconLayer.Spec(
+                    bitmap = bitmap,
+                    src = Rect(src),
+                    dst = Rect(
+                        dst.left + location[0],
+                        dst.top + location[1],
+                        dst.right + location[0],
+                        dst.bottom + location[1],
+                    ),
+                    keyboard = Rect(
+                        location[0],
+                        location[1],
+                        location[0] + view.width,
+                        location[1] + view.height,
+                    ),
+                ),
+                enabled,
+            )
+            log(
+                "swipe-map: baidu dictionary icon draw" +
+                    " state=${if (enabled) "ON_BLUE" else "OFF_BLACK"}" +
+                    " setting=${readFlagSnapshot()}" +
+                    " src=${src.left},${src.top},${src.right},${src.bottom}" +
+                    " dst=${dst.left},${dst.top},${dst.right},${dst.bottom}" +
+                    " keyBounds=$left,$top,$right,$bottom" +
+                    " keySize=${keyWidth}x${keyHeight}"
+            )
+        }.onFailure { log("swipe-map: baidu icon draw failed: ${it.message}") }
+    }
+
+    private fun loadBaiduMoreBitmap(): Bitmap? {
+        if (baiduMoreLoadAttempted) return baiduMoreBitmap
+        synchronized(this) {
+            if (baiduMoreLoadAttempted) return baiduMoreBitmap
+            baiduMoreLoadAttempted = true
+            baiduMoreBitmap = runCatching {
+                val moduleApk = HookEntry.modulePath
+                if (moduleApk.isBlank()) error("module APK path unavailable")
+                val assets = AssetManager::class.java.getDeclaredConstructor()
+                    .apply { isAccessible = true }
+                    .newInstance()
+                val cookie = assets.javaClass.getMethod("addAssetPath", String::class.java)
+                    .invoke(assets, moduleApk) as? Number
+                if (cookie?.toInt() == 0) error("module asset path rejected")
+                assets.open("baidu_more.png").use(BitmapFactory::decodeStream)
+            }.onFailure {
+                log("swipe-map: bundled baidu more.png unavailable: ${it.message}")
+            }.getOrNull()
+            return baiduMoreBitmap
+        }
+    }
+
+    /**
      * 按当前键盘语言重写一个 SoftKey 的上滑字符。
      *
      * 逐键判重：同一个键在同一语言下只写一次（键对象会被长期复用），
@@ -389,7 +573,10 @@ internal object SoftKeySwipeMap {
      */
     private fun applyLang(view: View?, key: Any) {
         val lang = resolveLang(view) ?: return
-        if (view != null && contextRef == null) contextRef = view.context
+        if (view != null && contextRef == null) {
+            contextRef = view.context
+            HookDiagnostics.flush(view.context)
+        }
         if (appliedLang[key] == lang) return
         runCatching {
             val text = readString(key, "s") ?: return
@@ -409,6 +596,17 @@ internal object SoftKeySwipeMap {
             if (lang == "en" && (ch == ',' || ch == '\uFF0C')) {
                 val on = readFlag() ?: false
                 mapped = if (on) EN_SUGGEST_MARK_ON else EN_SUGGEST_MARK_OFF
+                log(
+                    "swipe-map: apply comma lang=en keyText=$ch" +
+                        " rawMark=${readString(key, "t") ?: "<null>"}" +
+                        " mappedMarker=${mapped.codePoints().toArray().joinToString(",")}" +
+                        " englishSuggestion=$on"
+                )
+            } else if (lang != "en" && (mapped == "\uFF01" || mapped == "!")) {
+                log(
+                    "swipe-map: apply exclamation lang=$lang keyText=$ch" +
+                        " rawMark=${readString(key, "t") ?: "<null>"} mapped=$mapped"
+                )
             }
             val mark = readString(key, "t") ?: ""
             if (mark != mapped) {
@@ -435,9 +633,276 @@ internal object SoftKeySwipeMap {
             m?.invoke(view)?.toString()
         }.getOrNull() ?: return null
         if (name.isEmpty()) return null
+        // 把类型名交给键盘切换器：返回主键盘、以及"重切当前页让设置生效"都要用它。
+        (view as? View)?.let { HostKeyboardSwitch.rememberKeyboardType(it, name) }
         val lang = if (name.startsWith("QWERTY_EN")) "en" else "zh"
         if (lang != lastLang) lastLang = lang
         return lang
+    }
+
+    private val drawingKey = ThreadLocal<Any?>()
+    private val drawingView = ThreadLocal<View?>()
+    @Volatile private var lastKeyboardView: java.lang.ref.WeakReference<View>? = null
+    private var keyBounds: List<java.lang.reflect.Field> = emptyList()
+
+    private fun boundsOf(key: Any): Rect? = runCatching {
+        if (keyBounds.size != 4) return null
+        Rect(keyBounds[0].getInt(key), keyBounds[2].getInt(key),
+            keyBounds[1].getInt(key), keyBounds[3].getInt(key))
+    }.getOrNull()
+
+    /**
+     * 英文页半角 `!` 的参考画笔，按「键盘视图 + 键位对象」缓存。
+     *
+     * ## 为什么需要它（这是"感叹号偏大"的真正根因）
+     *
+     * 真机日志（`1.33.28-test`）里，中文页逗号上滑那一枚标记是：
+     *
+     * ```text
+     * mark draw main=， mark=！ text=! targetExclamation=true
+     * paintBefore=72.0/1.0/false paintAfter=72.0/1.0/false
+     * ```
+     *
+     * 而同一帧里其它所有上滑符号都是 `36.0`。也就是说宿主给中文页的感叹号
+     * **自己就用了 72（其它符号的两倍）**，而模块的修正分支没有真正改掉它 ——
+     * `paintAfter` 与 `paintBefore` 完全一样，等于白改。
+     *
+     * 用户给出的正确参照就在手边：「英文面板里字母 A 上面那个感叹号」。
+     * 那一枚宿主是用正常字号画的，所以这里改成**直接从英文页的同名键位取画笔**：
+     * 先记下它，等中文页要画感叹号时用这份参考画笔的字号/字重/字面宽画。
+     * 这样不写死任何数值，宿主改字号时两边一起变，大小天然一致。
+     */
+    private val englishMarkPaints = java.util.WeakHashMap<View, MutableMap<String, Paint>>()
+
+    private fun rememberEnglishMarkPaint(view: View, text: String, paint: Paint) {
+        val map = englishMarkPaints.getOrPut(view) { java.util.WeakHashMap() }
+        map[text] = Paint(paint)
+    }
+
+    private fun englishMarkPaint(view: View): Paint? {
+        val map = englishMarkPaints[view] ?: return null
+        return map["!"] ?: map["\uFF01"]
+    }
+
+    /**
+     * 普通字母键上滑标记的画笔，按键盘视图缓存 —— 也就是「周围那些符号」的基准量度。
+     *
+     * 真机日志里同一视图同一帧：字母键 / 标点键的标记全是 `36.000004`，
+     * 只有中文页逗号键那枚感叹号是 `72.0`。用户指定的参照「句号上面那个符号」
+     * 正是这一档。这里在绘制字母键标记时顺手记下来，中文页画感叹号时直接照抄。
+     */
+    private val normalMarkPaints = java.util.WeakHashMap<View, Paint>()
+
+    private fun rememberNormalMarkPaint(view: View, paint: Paint) {
+        normalMarkPaints[view] = Paint(paint)
+    }
+
+    private fun normalMarkPaint(view: View): Paint? = normalMarkPaints[view]
+
+    private fun matchingMarkPaint(view: View, key: Any, text: String, paint: Paint): Paint? {
+        val mark = readString(key, "t") ?: return null
+        val main = readString(key, "s") ?: return null
+        val chinesePage = resolveLang(view) != "en"
+        val isExclamation = text == "！" || text == "!"
+        val isComma = text == "," || text == "\uFF0C"
+        val isChineseExclamation = chinesePage && isExclamation
+        if (!isChineseExclamation && !(isComma && isExclamation)) return null
+        // 注意：**不能**要求 `text == mark`。
+        //
+        // 真机日志里中文页这一枚是 `mark=！ text=!`：宿主的文本布局分支已经把全角
+        // 换成了半角再交给绘制，两者本来就不同。上一版在这里写了 `if (text != mark) return null`，
+        // 于是每一次都返回空 → `paintAfter` 与 `paintBefore` 一模一样（日志里 72.0 对 72.0），
+        // 字号当然改不动。判据只按**键位那一栏是不是逗号位 + 当前是中文页**即可。
+        // 中文页的感叹号：照抄「同一帧里普通字母键上滑标记」的画笔量度。
+        //
+        // 参照系来自真机日志（1.33.29，同一键盘视图同一帧）：
+        //   main=q mark=1 textSize=36.000004
+        //   main=. mark=? textSize=36.000004   ← 用户指定的参照：句号上方那枚符号
+        //   main=， mark=！ textSize=72.0       ← 目标：宿主自己用了两倍
+        // 字母键与标点键的上滑标记一律 36，只有逗号键那一枚是 72。
+        // 因此以"字母键标记"的画笔为基准，天然与周围一致；宿主改字号时两边一起变，
+        // 不写死任何数值。
+        if (isChineseExclamation) {
+            val reference = englishMarkPaint(view) ?: normalMarkPaint(view)
+            if (reference == null) {
+                logThrottled("exclamation-noref", 3_000L) {
+                    "swipe-map: 感叹号暂无参照画笔（宿主原样绘制）main=$main mark=$mark text=$text"
+                }
+                // 参照还没采到的极少数帧序：把当前帧的重绘排上，
+                // 等同一帧的字母键画完后再画一次，避免用户看到 72 的那一帧。
+                runCatching { view.postInvalidateOnAnimation() }
+                return null
+            }
+            log(
+                "swipe-map: mark metrics main=$main text=$text" +
+                    " refTextSize=${reference.textSize} refScale=${reference.textScaleX}" +
+                    " refBold=${reference.isFakeBoldText} view=${view.javaClass.name}"
+            )
+            return Paint(reference).apply { color = paint.color }
+        }
+        // 英文页逗号键那一枚不是目标，保持宿主原样绘制。
+        return null
+    }
+
+    /** 同时调整宿主小字坐标计算与最终绘制，缓存限定在同一个键盘视图。 */
+    private fun installMarkTypography(bridge: DexKitBridge, loader: ClassLoader) {
+        val entity = softKeyClassName ?: return
+        val layouts = bridge.findMethod {
+            matcher { paramTypes(entity, "android.graphics.Paint", "java.lang.String", "boolean") }
+        }.map { it.getMethodInstance(loader) }.filter {
+            View::class.java.isAssignableFrom(it.declaringClass) &&
+                !java.lang.reflect.Modifier.isStatic(it.modifiers)
+        }
+        layouts.forEach { method ->
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val view = param.thisObject as? View ?: return
+                    val key = param.args[0] ?: return
+                    val paint = param.args[1] as? Paint ?: return
+                    val text = param.args[2] as? String ?: return
+                    matchingMarkPaint(view, key, text, paint)?.let { param.args[1] = it }
+                }
+            })
+        }
+        Canvas::class.java.declaredMethods.filter { method ->
+            method.name == "drawText" && method.parameterTypes.firstOrNull() == String::class.java &&
+                method.parameterTypes.lastOrNull() == Paint::class.java
+        }.forEach { method ->
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val view = drawingView.get() ?: return
+                    val key = drawingKey.get() ?: return
+                    val text = param.args.firstOrNull() as? String ?: return
+                    val paint = param.args.lastOrNull() as? Paint ?: return
+                    val main = readString(key, "s") ?: return
+                    val mark = readString(key, "t") ?: return
+                    val keyBox = boundsOf(key)
+                    val isUpperMark = text == mark
+                    val isTargetExclamation = resolveLang(view) != "en" &&
+                        (text == "\uFF01" || text == "!")
+                    if (!isUpperMark && !isTargetExclamation) return
+                    val displayText = if (isTargetExclamation) "!" else text
+                    val before = Paint(paint)
+                    val rendered = when {
+                        isTargetExclamation -> matchingMarkPaint(view, key, text, paint) ?: Paint(paint)
+                        else -> {
+                            // 英文页的上滑符号是中文页的**参照系**：把这一枚的量度记下来，
+                            // 中文页画感叹号时直接照抄，两边大小才会真正一致。
+                            if (resolveLang(view) == "en" && text == "!") {
+                                rememberEnglishMarkPaint(view, text, paint)
+                            }
+                            // 字母键的上滑标记就是「周围那些符号」的基准：中文页
+                            // 那一枚感叹号要跟它一样大。同一帧里字母键先画、逗号键后画
+                            // （真机日志顺序：q→p、a→l、z→m，然后才是逗号键），
+                            // 所以采到之后当帧就能用上。
+                            if (main.length == 1 && (main[0] in 'a'..'z' || main[0] in 'A'..'Z')) {
+                                rememberNormalMarkPaint(view, paint)
+                            }
+                            Paint(paint)
+                        }
+                    }
+                    param.args[param.args.lastIndex] = rendered
+                    param.args[0] = displayText
+                    // ---------------------------------------------------------------
+                    // 垂直对齐（用户反馈：字号对了，但比"句号上面那枚问号"低一截）。
+                    //
+                    // 真机日志（1.33.30，同一帧同一键盘视图）：
+                    //   main=.  mark=？  这一枚宿主自己用 36 画，位置正常
+                    //   main=， mark=！  paintBefore=72.0  paintAfter=36.000004
+                    //
+                    // 也就是说：宿主的**基线 y 是用它自己那把 72 的画笔算出来的**，
+                    // 我们只在 drawText 这一层把画笔换成 36，字号小了、基线却还留在
+                    // 大字号的位置上 —— 字形视觉中心因此整体往下掉，正是用户看到的
+                    // "低一点"。
+                    //
+                    // 修正量不需要任何写死数值：把"旧画笔"和"新画笔"的字体量度差值
+                    // 折算成半个高度差补回 y 上。旧新一致时 dy 自然是 0（不影响别的符号）。
+                    // 上半部分用 (ascent+descent)/2 表示字形视觉中心相对基线的偏移，
+                    // 差值即两把画笔之间需要补偿的基线位移。
+                    // ---------------------------------------------------------------
+                    val yIndex = param.args.lastIndex - 1
+                    val hostY = param.args.getOrNull(yIndex) as? Float
+                    var dy = 0f
+                    if (hostY != null) {
+                        // 用 `fontMetrics`（API 1 起就有）而不是 `ascent()/descent()`（API 29+），
+                        // 免得在低版本设备上直接抛 NoSuchMethodError。
+                        val oldMetrics = before.fontMetrics
+                        val newMetrics = rendered.fontMetrics
+                        dy = ((oldMetrics.ascent + oldMetrics.descent) -
+                            (newMetrics.ascent + newMetrics.descent)) / 2f
+                        if (kotlin.math.abs(dy) > 0.01f) param.args[yIndex] = hostY + dy
+                    }
+                    val beforeBounds = Rect()
+                    val afterBounds = Rect()
+                    before.getTextBounds(displayText, 0, displayText.length, beforeBounds)
+                    rendered.getTextBounds(displayText, 0, displayText.length, afterBounds)
+                    log(
+                        "swipe-map: mark draw main=$main mark=$mark text=$text" +
+                            " targetExclamation=$isTargetExclamation" +
+                            " paintBefore=${before.textSize}/${before.textScaleX}/${before.isFakeBoldText}" +
+                            " paintAfter=${rendered.textSize}/${rendered.textScaleX}/${rendered.isFakeBoldText}" +
+                            " boundsBefore=${beforeBounds.width()}x${beforeBounds.height()}" +
+                            " boundsAfter=${afterBounds.width()}x${afterBounds.height()}" +
+                            " measureBefore=${before.measureText(displayText)}" +
+                            " measureAfter=${rendered.measureText(displayText)}" +
+                            " yHost=$hostY yApplied=${hostY?.let { it + dy }} dy=$dy" +
+                            " keyBounds=${keyBox?.toShortString() ?: "<null>"}" +
+                            " view=${view.javaClass.name} key=${key.javaClass.name}"
+                    )
+                    if (isTargetExclamation) {
+                        HookDiagnostics.record(
+                            view.context,
+                            "上滑键位绘制",
+                            true,
+                            "${view.javaClass.name}; mark=$text; size=${rendered.textSize}; scale=${rendered.textScaleX}",
+                        )
+                    }
+                }
+            })
+        }
+        log("swipe-map: mark typography layout hooks=${layouts.size}")
+    }
+
+    /** 只替换回车键的绘制；文字标记仍保留给宿主按键行为判定。 */
+    private fun installReturnDrawing() {
+        Canvas::class.java.declaredMethods.filter { method ->
+            method.name == "drawText" && method.parameterTypes.firstOrNull() == String::class.java &&
+                method.parameterTypes.lastOrNull() == Paint::class.java
+        }.forEach { method ->
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (param.args.firstOrNull() != "\u21B5") return
+                    val key = drawingKey.get() ?: return
+                    val box = boundsOf(key) ?: return
+                    val hostPaint = param.args.lastOrNull() as? Paint ?: return
+                    val canvas = param.thisObject as? Canvas ?: return
+                    // 与功能键图标同量级，避免按小号文字的字号渲染回车。
+                    val w = minOf(box.width(), box.height()) * 0.46f
+                    val h = w * 0.64f
+                    val x = box.exactCenterX() - w / 2f
+                    val y = box.exactCenterY() - h / 2f
+                    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = hostPaint.color
+                        style = Paint.Style.STROKE
+                        strokeWidth = w * 0.075f
+                        strokeCap = Paint.Cap.ROUND
+                        strokeJoin = Paint.Join.ROUND
+                    }
+                    val line = Path().apply {
+                        moveTo(x + w, y)
+                        lineTo(x + w, y + h * 0.36f)
+                        quadTo(x + w, y + h * 0.55f, x + w * 0.82f, y + h * 0.55f)
+                        lineTo(x, y + h * 0.55f)
+                        moveTo(x + w * 0.24f, y + h * 0.08f)
+                        lineTo(x, y + h * 0.55f)
+                        lineTo(x + w * 0.24f, y + h)
+                    }
+                    canvas.drawPath(line, paint)
+                    param.result = null
+                    logThrottled("return-icon", 5000L) { "return-icon: vector drawn bounds=$box width=$w" }
+                }
+            })
+        }
     }
 
     /** 键实体类的类名（DexKit 反查，不写死混淆名）。 */
@@ -482,51 +947,64 @@ internal object SoftKeySwipeMap {
             // 两个字符串字段 + 直接继承 Object —— 就是键位实体（排除带父类的容器/包装类）。
             if (strings >= 2 && cls.superclass == Any::class.java) {
                 softKeyClassName = owner
-                log("swipe-map: softkey class resolved=$owner stringFields=$strings")
+                keyTextField = cls.declaredFields.single {
+                    it.type == String::class.java && !java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+                        !java.lang.reflect.Modifier.isFinal(it.modifiers)
+                }.apply { isAccessible = true }
+                keyMarkField = cls.declaredFields.single {
+                    it.type == String::class.java && !java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+                        java.lang.reflect.Modifier.isFinal(it.modifiers)
+                }.apply { isAccessible = true }
+                val boundaryMethods = bridge.findMethod {
+                    matcher { declaredClass(owner); paramCount(5); returnType("void") }
+                }.filter { it.paramTypeNames.take(4) == listOf("int", "int", "int", "int") }
+                val bounds = boundaryMethods.singleOrNull()?.usingFields
+                    ?.filter { it.usingType.toString().contains("WRITE", true) && it.field.typeName == "int" }
+                    ?.map { it.field }?.distinctBy { it.descriptor }?.take(4).orEmpty()
+                if (bounds.size == 4) {
+                    keyBounds = bounds.map { it.getFieldInstance(hostClassLoader).apply { isAccessible = true } }
+                }
+                log("swipe-map: softkey class resolved=$owner stringFields=$strings bounds=${keyBounds.size}")
                 return owner
             }
         }
         return null
     }
 
-    /**
-     * 逗号上滑 → 切换"英文候选"开关（实时生效）。
-     *
-     * ## 为什么必须走宿主自己的写入口
-     *
-     * 宿主设置层有一对结构化特征明确的静态方法（同一类里成对出现）：
-     *
-     * ```text
-     * (String 名字, String 键, boolean 默认值) -> boolean   读
-     * (String 名字, String 键, boolean 值)     -> void      写
-     * ```
-     *
-     * 写方法内部除了写盘，还会**逐个通知注册过的键监听**（宿主自己的 `i(值, 键)`），
-     * 输入法因此立刻按新值生效。如果我们自己 `getSharedPreferences(...).edit()`，
-     * 值虽然写进去了，但宿主那套监听不会被触发 —— 观感就是"改了但不实时生效"。
-     *
-     * 所以优先调用宿主写入口；只在它定位不到时才退回直接写偏好（至少值是对的）。
-     */
+    /** 上滑只切中文设置页的“英文候选”，不改变“英文联想”或键盘类型。 */
     fun toggleEnglishSuggestion(context: Context): Boolean {
-        val current = readFlag() ?: runCatching {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getBoolean(KEY_EN_SUGGESTION, false)
-        }.getOrDefault(false)
+        val current = readFlag() ?: return false
         val next = !current
-        val viaHost = writeFlag(next)
-        if (!viaHost) {
-            // 宿主入口没定位到时的兜底：至少把值写对，并记日志说明引擎本次不会同步。
+        val before = readFlagSnapshot()
+        val written = writeFlag(next, context)
+        val actual = readFlag()
+        val ok = written && actual == next
+        // 颜色始终服从实际读回结果，即使写入失败也不保留虚假的期望状态。
+        if (actual != null) {
+            flagOverride = actual
+            scheduleIconRefresh(actual)
+            SwipeIconLayer.setEnabled(actual)
+        }
+        log("swipe-map: candidates setting key=$KEY_EN_PREDICT before=$before requested=$next actual=$actual writeVerified=$ok after=${readFlagSnapshot()} keyboardSwitch=false")
+        return ok
+    }
+
+    private fun scheduleIconRefresh(enabled: Boolean) {
+        appliedLang.clear()
+        val view = lastKeyboardView?.get() ?: return
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val repaint = Runnable {
             runCatching {
-                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    .edit().putBoolean(KEY_EN_SUGGESTION, next).apply()
+                view.invalidate()
+                view.postInvalidateOnAnimation()
+                (view.rootView as? View)?.invalidate()
+                log("swipe-map: icon repaint enabled=$enabled")
             }
         }
-        val verify = readFlag()
-        log(
-            "swipe-map: english suggestion $current -> $next (viaHost=$viaHost" +
-                " notify=${flagNotifier?.name} readback=$verify)"
-        )
-        return true
+        repaint.run()
+        listOf(60L, 160L, 320L, 600L).forEach { delay ->
+            handler.postDelayed(repaint, delay)
+        }
     }
 
     /** 宿主设置读写入口（结构匹配结果，进程内缓存）。 */
@@ -536,18 +1014,14 @@ internal object SoftKeySwipeMap {
     @Volatile
     private var flagWriter: java.lang.reflect.Method? = null
 
-    /**
-     * 宿主设置变更的**通知**入口。
-     *
-     * 光写盘不会实时生效：宿主的设置层把"值变了"和"通知监听者"拆成两步 ——
-     * 写方法只落盘，另有一个静态 `(值, 键名) -> void` 负责遍历该键上的监听者并逐个回调。
-     * 不调它，引擎手里的还是旧值，表现就是"开关动了但输入行为没变"。
-     */
-    @Volatile
-    private var flagNotifier: java.lang.reflect.Method? = null
-
     @Volatile
     private var flagResolved = false
+
+    @Volatile
+    private var flagOverride: Boolean? = null
+
+    @Volatile
+    private var candidateSettingGetter: java.lang.reflect.Method? = null
 
     /**
      * 结构化定位宿主的设置读写入口。
@@ -563,83 +1037,74 @@ internal object SoftKeySwipeMap {
         val loader = hostClassLoader ?: return false
         val bridge = bridgeRef ?: return false
         runCatching {
-            val boolCls = Boolean::class.javaPrimitiveType ?: return false
-            val candidates: List<MethodData> = bridge.findMethod {
+            val settingRead = bridge.findMethod {
                 matcher {
+                    usingStrings(listOf(KEY_EN_PREDICT), StringMatchType.Equals, false)
+                    paramCount(0)
+                    returnType("boolean")
+                }
+            }.single()
+            candidateSettingGetter = settingRead.getMethodInstance(loader).apply { isAccessible = true }
+            val readerData = settingRead.invokes.single {
+                it.paramTypeNames == listOf("java.lang.String", "java.lang.String", "boolean") &&
+                    it.returnTypeName == "boolean"
+            }
+            val writerData = bridge.findMethod {
+                matcher {
+                    declaredClass(readerData.declaredClassName)
                     paramTypes("java.lang.String", "java.lang.String", "boolean")
                     returnType("void")
                 }
-            }.toList()
-            candidates.forEach { candidate ->
-                val owner = candidate.declaredClassName ?: return@forEach
-                // 只认宿主自己的类（排除框架/第三方）。
-                if (owner.startsWith("android.") || owner.startsWith("androidx.") ||
-                    owner.startsWith("kotlin.") || owner.startsWith("java.")
-                ) {
-                    return@forEach
-                }
-                val cls = runCatching { Class.forName(owner, false, loader) }.getOrNull()
-                    ?: return@forEach
-                val reader = cls.methods.firstOrNull {
-                    it.name != candidate.name && it.parameterTypes.contentEquals(
-                        arrayOf(String::class.java, String::class.java, boolCls),
-                    ) && it.returnType == boolCls
-                } ?: return@forEach
-                val writer = runCatching { candidate.getMethodInstance(loader) }.getOrNull()
-                    ?: return@forEach
-                flagReader = reader
-                flagWriter = writer
-                // 通知入口：同一个类里的静态 `(Object, String) -> void`
-                // 宿主自己的实现就是「按 key 取出监听者列表，逐个 invoke(value, key)」。
-                flagNotifier = cls.declaredMethods.firstOrNull {
-                    java.lang.reflect.Modifier.isStatic(it.modifiers) &&
-                        it.returnType == Void.TYPE &&
-                        it.parameterTypes.size == 2 &&
-                        it.parameterTypes[0] == Any::class.java &&
-                        it.parameterTypes[1] == String::class.java
-                }
-                log(
-                    "swipe-map: settings accessors resolved ${cls.name} read=${reader.name}" +
-                        " write=${writer.name} notify=${flagNotifier?.name}"
-                )
-            }
+            }.single()
+            flagReader = readerData.getMethodInstance(loader).apply { isAccessible = true }
+            flagWriter = writerData.getMethodInstance(loader).apply { isAccessible = true }
+            log("swipe-map: candidates accessors cached getter=$candidateSettingGetter writer=$flagWriter key=$KEY_EN_PREDICT")
+            HookDiagnostics.record(null, "英文候选读写", true,
+                "reader=${flagReader?.declaringClass?.name}#${flagReader?.name}; writer=${flagWriter?.declaringClass?.name}#${flagWriter?.name}")
         }.onFailure { log("swipe-map: resolve settings accessors failed: ${it.message}") }
         return flagReader != null && flagWriter != null
+    }
+
+    private fun readFlagSnapshot(): String {
+        if (!resolveFlagAccessors()) return "reader=UNRESOLVED"
+        fun read(key: String): String = runCatching {
+            (flagReader?.invoke(null, PREFS_NAME, key, true) as? Boolean)?.toString() ?: "null"
+        }.getOrElse { "error:${it.javaClass.simpleName}:${it.message}" }
+        return "$KEY_EN_PREDICT=${read(KEY_EN_PREDICT)},$KEY_EN_SUGGESTION=${read(KEY_EN_SUGGESTION)}"
     }
 
     private fun readFlag(): Boolean? {
         if (!resolveFlagAccessors()) return null
         return runCatching {
-            flagReader?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, false) as? Boolean
+            (candidateSettingGetter?.invoke(null) as? Boolean)
+        }.onFailure {
+            log("swipe-map: read setting failed key=$KEY_EN_SUGGESTION error=${it.message}")
         }.getOrNull()
     }
 
-    private fun writeFlag(value: Boolean): Boolean {
+    private fun writeFlag(value: Boolean, context: Context): Boolean {
         if (!resolveFlagAccessors()) return false
         return runCatching {
-            flagWriter?.invoke(null, PREFS_NAME, KEY_EN_SUGGESTION, value)
-            // 显式通知监听者：只写盘不通知，引擎拿的还是旧值（"改了不生效"就是这个）。
-            runCatching {
-                flagNotifier?.invoke(null, value, KEY_EN_SUGGESTION)
-            }.onFailure { log("swipe-map: notify failed: ${it.message}") }
-            true
-        }.getOrDefault(false)
+            val writer = flagWriter ?: return@runCatching false
+            writer.invoke(null, PREFS_NAME, KEY_EN_PREDICT, value)
+            // 宿主 writer 已自行通知监听，只调用一次；getter 在安装期缓存。
+            val actual = readFlag()
+            log("swipe-map: candidates write key=$KEY_EN_PREDICT expected=$value settingsReadback=$actual")
+            actual == value
+        }.onFailure { log("swipe-map: candidates write failed ${it.message}") }.getOrDefault(false)
     }
 
     // ------------------------------------------------------------------ 字段读写
 
+    private var keyTextField: java.lang.reflect.Field? = null
+    private var keyMarkField: java.lang.reflect.Field? = null
+
+    /** 运行时仅访问安装阶段按字符串字段角色解析的成员。 */
     private fun readString(target: Any, field: String): String? = runCatching {
-        target.javaClass.getField(field).get(target) as? String
+        (if (field == "s") keyTextField else keyMarkField)?.get(target) as? String
     }.getOrNull()
 
     private fun writeString(target: Any, field: String, value: String) {
-        runCatching {
-            // `t` 是 **final** 字段：`setAccessible(true)` 之后 `Field.set` 在 Android 上
-            // 对非静态 final 引用字段同样有效（只读语义由优化器在编译期固化时才拦得住），
-            // 宿主自己的代码就是这么读它的，所以不需要动 ArtMethod。
-            val f = target.javaClass.getField(field)
-            f.isAccessible = true
-            f.set(target, value)
-        }
+        (if (field == "s") keyTextField else keyMarkField)?.set(target, value)
     }
 }

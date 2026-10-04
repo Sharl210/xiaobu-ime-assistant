@@ -13,8 +13,12 @@ import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
+import org.luckypray.dexkit.query.FindClass
 import org.luckypray.dexkit.query.FindMethod
+import org.luckypray.dexkit.query.enums.StringMatchType
+import org.luckypray.dexkit.result.ClassData
 import org.luckypray.dexkit.result.MethodData
+import java.lang.reflect.Modifier
 
 /**
  * 剪贴板条目的「编辑」。
@@ -84,11 +88,18 @@ internal object ClipboardEdit {
     @Volatile
     private var roomDb: Any? = null
 
+    /** Room database runtime type names discovered from DexKit constructor signatures. */
+    @Volatile
+    private var roomDatabaseTypeNames: Set<String> = emptySet()
+
     @Volatile
     private var writeAdapter: Any? = null
 
     @Volatile
     private var writeEntry: java.lang.reflect.Method? = null
+
+    @Volatile
+    private var rowItemMethod: java.lang.reflect.Method? = null
 
     /** Room 的「带连接执行」工具：`androidx.room.util.a.j(db, readOnly, inTransaction, body)`。 */
     @Volatile
@@ -140,6 +151,7 @@ internal object ClipboardEdit {
         this.clearInputTarget = clearInputTarget
         this.restoreFocus = restoreFocus
         resolveEntity(bridge, hostClassLoader)
+        resolveWriteAdapter(bridge, hostClassLoader)
         captureWritePath(bridge, hostClassLoader)
         installed = true
         log(
@@ -158,8 +170,17 @@ internal object ClipboardEdit {
      * 且存在 `(long, String, Uri, ...)` 形态的构造器。这个组合在宿主里唯一。
      */
     private fun resolveEntity(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
-        // 反查入口：任何声明了「Uri 参数」构造器的宿主类（剪贴板实体必带 Uri）。
-        val owners = runCatching {
+        // 先用稳定的实体 toString 语义串收敛候选，再用字段形状核验；不写死宿主混淆类路径。
+        val semanticCandidates: List<ClassData> = runCatching {
+            bridge.findClass {
+                matcher {
+                    usingStrings(listOf("ClipboardData(id="), StringMatchType.Equals, false)
+                }
+            }.toList()
+        }.onFailure { log("clip-edit: entity semantic query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+
+        val fallbackOwners = runCatching {
             bridge.findMethod {
                 matcher {
                     paramTypes("android.net.Uri")
@@ -167,8 +188,13 @@ internal object ClipboardEdit {
                 }
             }.toList().mapNotNull { it.declaredClassName }
         }.getOrDefault(emptyList())
-        log("clip-edit: entity candidate owners=${owners.size}")
-        owners.forEach { name ->
+
+        val names = LinkedHashSet<String>()
+        semanticCandidates.mapNotNullTo(names) { it.name }
+        fallbackOwners.forEach { names.add(it) }
+        log("clip-edit: entity candidates semantic=${semanticCandidates.size} fallback=${fallbackOwners.size}")
+
+        names.forEach { name ->
             if (!name.startsWith(HOST_PACKAGE)) return@forEach
             val cls = runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
                 ?: return@forEach
@@ -200,33 +226,42 @@ internal object ClipboardEdit {
     /**
      * 记录写回路径：按结构定位「剪贴板 DAO 持有者」并挂它的构造函数，拿到数据库与写适配器。
      *
-     * **不写死类名**：宿主 `db/dao/` 下的 DAO 持有者有一个共同形状 ——
-     * 构造函数参数个数固定、且**声明了 `androidx.room.z`（RoomDatabase）类型的实例字段**。
-     * 我们只挂"字段类型里带 RoomDatabase"的那些类的构造器，构造完再从字段里取数据库。
+     * 宿主 Room 数据库类型由 DexKit 从构造函数签名中发现，写回路径只使用运行时解析结果。
      * 用构造钩子而不是反射构造：那个类的构造参数是数据库实例，我们没法凭空造一个，
      * 但宿主自己构造它的时候会把手里的实例交出来。
      */
     private fun captureWritePath(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
-        // Room 的连接工具：`androidx.room.util.a` 里的「带连接执行」——按返回类型与参数个数定位，
-        // 不写死方法名（R8 会把 `j` 改名）。它有一个 4 参数、返回 Object 的形态。
+        // Room 的连接执行器通过 DexKit 按静态方法形状与 Room 包内参数识别；不写死混淆工具类名。
         withConnection = runCatching {
-            Class.forName("androidx.room.util.a", false, hostClassLoader)
-                .methods
-                .firstOrNull {
-                    it.parameterTypes.size == 4 &&
-                        it.returnType == Any::class.java &&
-                        java.lang.reflect.Modifier.isStatic(it.modifiers)
+            bridge.findMethod {
+                matcher {
+                    paramCount(4)
+                    returnType("java.lang.Object")
+                    modifiers(Modifier.STATIC)
+                }
+            }.toList().asSequence()
+                .mapNotNull { data -> runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull() }
+                .firstOrNull { method ->
+                    val p = method.parameterTypes
+                    Modifier.isStatic(method.modifiers) && p.size == 4 &&
+                        p[0].name.startsWith("androidx.room.") &&
+                        p[1] == Boolean::class.javaPrimitiveType &&
+                        p[2] == Boolean::class.javaPrimitiveType &&
+                        p[3].name.startsWith("kotlin.jvm.functions.Function") &&
+                        method.declaringClass.name.startsWith("androidx.room.util.")
                 }
         }.getOrNull()
-        log("clip-edit: withConnection=${withConnection?.name}")
+        log("clip-edit: withConnection=${withConnection?.declaringClass?.name}#${withConnection?.name}")
 
-        // DAO 持有者：任何**声明了 RoomDatabase 类型实例字段**的宿主类。
-        // 反查入口用方法签名：DAO 持有者的构造函数一定接收 RoomDatabase。
-        val owners = runCatching {
-            bridge.findMethod {
-                matcher { paramTypes("androidx.room.z") }
-            }.toList().mapNotNull { it.declaredClassName }
+        // DAO 持有者构造函数：由 DexKit 发现所有单参数构造候选，再以 Room 包参数和宿主包过滤。
+        val dbConstructors = runCatching {
+            bridge.findMethod { matcher { paramCount(1) } }.toList()
+                .filter { it.name == "<init>" && it.paramTypeNames.singleOrNull()?.startsWith("androidx.room.") == true }
         }.getOrDefault(emptyList())
+        val owners = dbConstructors.mapNotNull { it.declaredClassName }.distinct()
+        roomDatabaseTypeNames = dbConstructors.mapNotNull { data ->
+            runCatching { data.getMethodInstance(hostClassLoader).parameterTypes.single().name }.getOrNull()
+        }.toSet()
 
         val seen = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
         var hooked = 0
@@ -236,9 +271,7 @@ internal object ClipboardEdit {
             val cls = runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
                 ?: return@forEach
             val holdsDb = runCatching {
-                cls.declaredFields.any {
-                    it.type.name == "androidx.room.z" || it.type.name.endsWith(".RoomDatabase")
-                }
+                cls.declaredFields.any { it.type.name in roomDatabaseTypeNames }
             }.getOrDefault(false)
             if (!holdsDb) return@forEach
             runCatching {
@@ -260,13 +293,51 @@ internal object ClipboardEdit {
      * 判据是结构性的：字段类型是 `androidx.room.A` 的子类，且它的 `b()` 返回的 SQL 里
      * 出现 `tab_clipboard_data` + `INSERT`。适配器基类里的 `e(connection, entity)` 就是执行入口。
      */
+    private var insertionBase: Class<*>? = null
+    private var sqlGetter: java.lang.reflect.Method? = null
+    private var daoFactory: java.lang.reflect.Constructor<*>? = null
+
+    private fun resolveWriteAdapter(bridge: DexKitBridge, loader: ClassLoader) {
+        runCatching {
+            val sql = "INSERT OR REPLACE INTO `tab_clipboard_data` (`clipboard_id`,`clipboard_type`,`clipboard_text`,`clipboard_uri`,`clipboard_time`,`clipboard_mime_types`) VALUES (nullif(?, 0),?,?,?,?,?)"
+            val data = bridge.findMethod {
+                matcher { usingStrings(listOf(sql), StringMatchType.Equals, false); paramCount(0); returnType("java.lang.String") }
+            }.single()
+            val adapterClass = data.getClassInstance(loader)
+            val base = adapterClass.superclass
+            sqlGetter = data.getMethodInstance(loader).apply { isAccessible = true }
+            insertionBase = base
+            writeEntry = bridge.findMethod {
+                matcher {
+                    declaredClass(base.name)
+                    usingStrings(listOf("SELECT last_insert_rowid()"), StringMatchType.Equals, false)
+                    paramCount(2)
+                    returnType("long")
+                }
+            }.single().getMethodInstance(loader).apply { isAccessible = true }
+            val owners = adapterClass.declaredConstructors.flatMap { it.parameterTypes.toList() }
+                .filter { !it.isPrimitive && it != String::class.java }.distinct()
+            daoFactory = owners.flatMap { it.declaredConstructors.toList() }
+                .single { it.parameterCount == 1 && it.parameterTypes[0].name.startsWith("androidx.room.") }
+                .apply { isAccessible = true }
+            log("clip-edit: SQL insertion contract resolved")
+        }.onFailure { log("clip-edit: SQL insertion contract failed: ${it.message}") }
+    }
+
+    /** 从已捕获的宿主数据库构造目标 DAO，不创建新数据库，不依赖错过的构造回调。 */
+    private fun ensureWriteReady() {
+        if (writeAdapter != null) return
+        val db = roomDb ?: error("host database not captured")
+        val factory = daoFactory ?: error("clipboard DAO constructor unresolved")
+        bindWritePath(factory.newInstance(db))
+        check(writeAdapter != null && writeEntry != null) { "clipboard insertion adapter unavailable" }
+    }
+
     private fun bindWritePath(owner: Any) {
         if (writeAdapter != null && roomDb != null) return
         runCatching {
-            // 数据库：字段类型是 androidx.room.z（RoomDatabase）。
-            owner.javaClass.declaredFields.firstOrNull {
-                it.type.name == "androidx.room.z" || it.type.name.endsWith(".RoomDatabase")
-            }?.let { f ->
+            // 数据库字段类型使用安装期 DexKit 构造签名得到的运行时类型集合。
+            owner.javaClass.declaredFields.firstOrNull { it.type.name in roomDatabaseTypeNames }?.let { f ->
                 f.isAccessible = true
                 (f.get(owner) as? Any)?.let { roomDb = it }
             }
@@ -274,12 +345,8 @@ internal object ClipboardEdit {
             // 适配器基类**不写死混淆名**：它的形状是「有一个返回 String 的 SQL 方法 +
             // 一个 (连接, 实体) 形态的执行方法」。这里按 Room 自己的包名去找基类，
             // 再按「SQL 里出现剪贴板表名」去歧义。
-            val base = runCatching {
-                Class.forName("androidx.room.A", false, owner.javaClass.classLoader)
-            }.getOrNull()
-            val entry = base?.methods?.firstOrNull {
-                it.parameterTypes.size == 2 && it.returnType == Void.TYPE
-            }
+            val base = insertionBase
+            val entry = writeEntry
             if (base == null || entry == null) {
                 log("clip-edit: room adapter base unresolved, write path disabled")
                 return@runCatching
@@ -290,12 +357,15 @@ internal object ClipboardEdit {
                     f.isAccessible = true
                     val adapter = f.get(owner) ?: return@forEach
                     val sql = runCatching {
-                        adapter.javaClass.getMethod("b").invoke(adapter) as? String
+                        if (sqlGetter?.declaringClass?.isInstance(adapter) == true)
+                            sqlGetter?.invoke(adapter) as? String else null
                     }.getOrNull().orEmpty()
-                    if (!sql.contains("tab_clipboard_data") || !sql.contains("INSERT")) return@forEach
+                    if (!sql.contains("tab_clipboard_data", ignoreCase = true) ||
+                        !sql.contains("INSERT", ignoreCase = true)
+                    ) return@forEach
                     writeAdapter = adapter
                     writeEntry = entry
-                    log("clip-edit: write adapter bound ${adapter.javaClass.name} field=${f.name}")
+                    log("clip-edit: write adapter bound ${adapter.javaClass.name} field=${f.name} sql=$sql")
                 }
         }.onFailure { log("clip-edit: bind write path failed: ${it.message}") }
     }
@@ -320,26 +390,36 @@ internal object ClipboardEdit {
             }.toList()
         }.onFailure { log("clip-edit: bind query failed: ${it.message}") }
             .getOrDefault(emptyList())
-        log("clip-edit: bind candidates=${candidates.size}")
-
-        var hooks = 0
+            var hooks = 0
         candidates.forEach { candidate ->
             val owner = candidate.declaredClassName ?: return@forEach
             if (!owner.startsWith(HOST_PACKAGE)) return@forEach
             val method = runCatching { candidate.getMethodInstance(hostClassLoader) }.getOrNull()
                 ?: return@forEach
+            val itemMethod = candidate.invokes
+                .filter {
+                    it.paramTypeNames == listOf("int") &&
+                        it.returnTypeName != "void" &&
+                        it.declaredClassName == owner
+                }
+                .mapNotNull { invoke ->
+                    runCatching { invoke.getMethodInstance(hostClassLoader).apply { isAccessible = true } }.getOrNull()
+                }
+                .firstOrNull()
+                ?: return@forEach
+            rowItemMethod = itemMethod
             runCatching {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
+                    override fun afterHookedMethod(param: XC_MethodHook.MethodHookParam) {
                         val holder = param.args?.getOrNull(0) ?: return
-                        val position = (param.args?.getOrNull(1) as? Int) ?: return
+                        val position = param.args?.getOrNull(1) as? Int ?: return
                         val itemView = itemViewOf(holder) ?: return
                         val item = itemAt(param.thisObject ?: return, position) ?: return
                         attachToRow(itemView, item)
                     }
                 })
                 hooks++
-                log("clip-edit: bind hooked $owner#onBindViewHolder")
+                log("clip-edit: bind hooked $owner#${method.name} item=${itemMethod.name}")
             }.onFailure { log("clip-edit: bind hook failed $owner: ${it.message}") }
         }
         log("clip-edit: bind hooks=$hooks")
@@ -352,9 +432,9 @@ internal object ClipboardEdit {
      * 那个已经消失的输入框（与搜索弹窗同一机制，见 ClipSearch.finishDialogSearch）。
      */
     private fun releaseInputTarget() {
-        val cleared = runCatching { clearInputTarget?.invoke() }.getOrNull()
-        val restored = runCatching { restoreFocus?.invoke() }.getOrNull()
-        log("clip-edit: focus released clear=$cleared restore=$restored")
+        val restored = runCatching { restoreFocus?.invoke() }.getOrNull() == true
+        val cleared = if (!restored) runCatching { clearInputTarget?.invoke() }.getOrNull() else false
+        log("clip-edit: focus released restore=$restored clearFallback=$cleared")
     }
 
     /**
@@ -367,48 +447,44 @@ internal object ClipboardEdit {
      * 现在按字段先取，找不到再退回方法（兼容确实定义了该方法的机型/版本）。
      */
     private fun itemViewOf(holder: Any): View? {
-        runCatching {
-            var current: Class<*>? = holder.javaClass
-            var depth = 0
-            while (depth < 8) {
-                val owner: Class<*> = current ?: break
-                val f = runCatching { owner.getDeclaredField("itemView") }.getOrNull()
-                if (f != null) {
-                    f.isAccessible = true
-                    return f.get(holder) as? View
-                }
-                current = owner.superclass
-                depth++
-            }
-        }
-        return runCatching { holder.javaClass.getMethod("getItemView").invoke(holder) as? View }
-            .getOrNull()
-    }
-
-    /**
-     * 取某一位置的数据对象。
-     *
-     * 分页适配器的取值口有两个形态：public 的 `peek(int)`，以及 protected 的 `getItem(int)`
-     * （后者只能用 `getDeclaredMethod` + `setAccessible` 才拿得到 —— 1.26.0 就是在这里翻的车）。
-     */
-    private fun itemAt(adapter: Any, position: Int): Any? {
-        runCatching {
-            adapter.javaClass.getMethod("peek", Int::class.java).invoke(adapter, position)
-        }.getOrNull()?.let { return it }
-        var current: Class<*>? = adapter.javaClass
+        var current: Class<*>? = holder.javaClass
         var depth = 0
-        while (depth < 12) {
-            val owner: Class<*> = current ?: break
-            val found = runCatching {
-                owner.getDeclaredMethod("getItem", Int::class.java).apply { isAccessible = true }
-            }.getOrNull()
-            if (found != null) {
-                return runCatching { found.invoke(adapter, position) }.getOrNull()
+        while (current != null && depth++ < 8) {
+            val field = current.declaredFields.firstOrNull {
+                !java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+                    View::class.java.isAssignableFrom(it.type)
             }
-            current = owner.superclass
-            depth++
+            if (field != null) {
+                return runCatching {
+                    field.isAccessible = true
+                    field.get(holder) as? View
+                }.getOrNull()
+            }
+            current = current.superclass
         }
         return null
+    }
+
+    /** 把列表包装项（ClipboardWithExtract）解包成真正可写回的 ClipboardData。 */
+    private fun unwrapEntity(item: Any?): Any? {
+        if (item == null) return null
+        val targetClass = entityClass
+        if (targetClass != null && targetClass.isInstance(item)) return item
+        val field = item.javaClass.declaredFields.firstOrNull { f ->
+            !java.lang.reflect.Modifier.isStatic(f.modifiers) &&
+                targetClass?.let { it.isAssignableFrom(f.type) } == true
+        } ?: return item
+        return runCatching {
+            field.isAccessible = true
+            field.get(item)
+        }.getOrNull() ?: item
+    }
+
+    /** 在一行绑定时取出实体本体，而不是外层 ClipboardWithExtract 包装对象。 */
+    private fun itemAt(adapter: Any, position: Int): Any? {
+        val method = rowItemMethod ?: return null
+        if (!method.declaringClass.isAssignableFrom(adapter.javaClass)) return null
+        return unwrapEntity(runCatching { method.invoke(adapter, position) }.getOrNull())
     }
 
     /** 在一行里插入「编辑」（幂等）。 */
@@ -523,82 +599,16 @@ internal object ClipboardEdit {
 
     /** 打开宿主同款编辑弹窗（`COUIAlertDialogBuilder`），确认后写回数据库。 */
     private fun openEditor(button: TextView) {
-        val entity = rowItems[button] ?: run {
-            log("clip-edit: item gone, edit aborted")
+        val entity = rowItems[button] ?: return
+        val current = readText(entity) ?: run {
+            log("clip-edit: native editor skipped: entity text unavailable")
             return
         }
-        val context = button.context
-        val density = context.resources.displayMetrics.density
-        runCatching {
-            val current = readText(entity).orEmpty()
-            val builderClass = Class.forName(
-                "com.coui.appcompat.dialog.COUIAlertDialogBuilder",
-                false,
-                context.classLoader,
-            )
-            val builder = builderClass.getConstructor(Context::class.java).newInstance(context)
-            val field = EditText(context)
-            field.setText(current)
-            field.setSelection(current.length)
-            field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            field.setPadding(
-                (12 * density).toInt(), (10 * density).toInt(),
-                (12 * density).toInt(), (10 * density).toInt(),
-            )
-            builderClass.getMethod("setTitle", CharSequence::class.java).invoke(builder, TITLE)
-            builderClass.getMethod("setView", View::class.java).invoke(builder, field)
-            builderClass.getMethod("setCancelable", Boolean::class.javaPrimitiveType).invoke(builder, true)
-            runCatching {
-                builderClass.getMethod("setBlurBackgroundDrawable", Boolean::class.javaPrimitiveType)
-                    .invoke(builder, true)
-            }
-            val listenerType = DialogInterface.OnClickListener::class.java
-            val confirm = java.lang.reflect.Proxy.newProxyInstance(
-                listenerType.classLoader,
-                arrayOf(listenerType),
-            ) { _, method, _ ->
-                if (method.name == "onClick") writeBack(entity, field.text?.toString().orEmpty())
-                null
-            } as DialogInterface.OnClickListener
-            builderClass.methods.firstOrNull {
-                it.name == "setNeutralButton" && it.parameterTypes.size == 2 &&
-                    CharSequence::class.java.isAssignableFrom(it.parameterTypes[0])
-            }?.let { runCatching { it.invoke(builder, CONFIRM, confirm) } }
-
-            val dialog = builderClass.getMethod("create").invoke(builder) as Dialog
-            // 弹窗关闭（无论确认、取消还是点外面）都要**成对还原输入目标**，
-            // 否则会留下"用过一次编辑弹窗之后键盘打不出字"。
-            dialog.setOnDismissListener { releaseInputTarget() }
-            val window = dialog.window
-            val token = button.windowToken
-            if (window != null && token != null) {
-                val attrs = window.attributes
-                attrs.token = token
-                // 与宿主「添加常用语」弹窗同款外层：type=0x3eb（输入法窗口自己的附加窗口层）。
-                runCatching { attrs.type = 0x3eb }
-                runCatching { window.attributes = attrs }
-                // 与宿主「添加常用语」的唯一差别：**不要 0x20000**。
-                // 0x20000 = FLAG_ALT_FOCUSABLE_IM —— 意思是"这个窗口不要让输入法弹出来"。
-                // 宿主那个弹窗里没有输入框，加上没问题；我们这个弹窗是要打字的，
-                // 带上它系统会把输入法窗口收下去 —— 表现就是"光标在里面但键盘打不出字"。
-                // 只保留 FLAG_DIM_BEHIND(0x2)，并显式清掉 0x20000。
-                window.clearFlags(0x20000)
-                window.addFlags(0x2)
-            }
-            dialog.show()
-            // show() 之后窗口标志才是最终值，这里再清一次并留证。
-            runCatching { dialog.window?.clearFlags(0x20000) }
-            // 与「添加常用语」逐字一致：show 之后调 `updateViewAfterShown()`，
-            // 这是宿主自己收尾用的那一步（圆角/背景/按钮排布都在里面）。
-            runCatching { builderClass.getMethod("updateViewAfterShown").invoke(builder) }
-            field.requestFocus()
-            field.setSelection(field.text?.length ?: 0)
-            // 注册成宿主的内部输入目标：键盘按键因此直接进到这个输入框。
-            // 这一步与窗口标志无关，是宿主「编辑常用语」能打字的原因（见 head/O;->o）。
-            val registered = registerInputTarget?.invoke(field) == true
-            log("clip-edit: dialog shown entity=${entityClass?.name} input-registered=$registered")
-        }.onFailure { log("clip-edit: dialog failed: ${it.message}") }
+        HostPhraseEditor.show(
+            button, TITLE, current, registerInputTarget,
+            onConfirm = { writeBack(entity, it) },
+            onClose = { releaseInputTarget() },
+        )
     }
 
     private fun readText(entity: Any): String? {
@@ -608,46 +618,35 @@ internal object ClipboardEdit {
 
     /** 改实体正文 → 用宿主的 SQL 适配器写回 → Room 失效跟踪会让列表刷新。 */
     private fun writeBack(entity: Any, next: String) {
-        val name = textFieldName ?: run {
-            log("clip-edit: text field unknown, write skipped")
-            return
-        }
-        runCatching { entity.javaClass.getField(name).set(entity, next) }
-            .onFailure {
-                log("clip-edit: set text failed: ${it.message}")
-                return
-            }
-        val adapter = writeAdapter
-        val entry = writeEntry
-        val db = roomDb
-        val runner = withConnection
-        if (adapter == null || entry == null || db == null || runner == null) {
-            log(
-                "clip-edit: write path not ready (adapter=${adapter != null}" +
-                    " entry=${entry != null} db=${db != null} runner=${runner != null})"
-            )
-            return
-        }
-        runCatching {
-            // 事务体是一个 kotlin Function1：参数就是连接。用 Proxy 实现即可。
-            val fnType = Class.forName("kotlin.jvm.functions.l", false, db.javaClass.classLoader)
+        ensureWriteReady()
+        val name = textFieldName ?: error("clipboard text field unresolved")
+        val field = entity.javaClass.getField(name).apply { isAccessible = true }
+        val before = field.get(entity)
+        val adapter = writeAdapter ?: error("clipboard adapter unavailable")
+        val entry = writeEntry ?: error("clipboard insertion method unavailable")
+        val db = roomDb ?: error("host database unavailable")
+        val runner = withConnection ?: error("host transaction runner unavailable")
+        var executed = false
+        try {
+            field.set(entity, next)
+            val fnType = runner.parameterTypes.last()
             val body = java.lang.reflect.Proxy.newProxyInstance(
-                fnType.classLoader,
-                arrayOf(fnType),
+                fnType.classLoader, arrayOf(fnType),
             ) { _, method, args ->
                 if (method.name == "invoke") {
-                    val connection = args?.getOrNull(0)
-                    if (connection != null) {
-                        runCatching { entry.invoke(adapter, connection, entity) }
-                            .onFailure { log("clip-edit: adapter execute failed: ${it.message}") }
-                    }
+                    val connection = args?.getOrNull(0) ?: error("host connection missing")
+                    entry.invoke(adapter, connection, entity)
+                    executed = true
                 }
                 null
             }
-            // j(db, readOnly=false, inTransaction=true, body)
             runner.invoke(null, db, false, true, body)
-            log("clip-edit: db write done len=${next.length}")
-        }.onFailure { log("clip-edit: db write failed: ${it.message}") }
+            check(executed) { "host transaction did not execute insertion" }
+            log("clip-edit: insertion executed len=${next.length}; persistence readback still required")
+        } catch (t: Throwable) {
+            field.set(entity, before)
+            throw t
+        }
     }
 
     private const val LABEL: String = "编辑"

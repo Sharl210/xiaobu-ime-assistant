@@ -11,9 +11,11 @@ android {
         applicationId 'com.oplusime.panel'
         minSdk 23
         targetSdk 34
-        // 版本：1.33.2（versionCode 41）
-        versionCode 41
-        versionName '1.33.2'
+        // 覆盖层不再心跳过期（修“蓝色闪一下”）+ 搜索按钮按面板实例判页 + 返回手势后切回打字主键盘
+        // + 英文候选设置真正生效 + 拼音光标真实绘制原点/1 秒闪烁/无记忆位置：待真机验证。
+        // 图标残影三层兜底（可见性巡检 / 容器子视图变化 / 换 input view 即清）+ 光标真实落点：待真机验证。
+        versionCode 89
+        versionName '1.33.50'
     }
 
     // 本模块自带的签名库（自建，与宿主无关）。如要换成自己的，替换下面四项即可。
@@ -38,18 +40,25 @@ android {
         jvmTarget = '11'
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
     buildTypes {
         debug {
             minifyEnabled false
             signingConfig signingConfigs.selfbuilt
+            buildConfigField 'boolean', 'DEFAULT_LOG_ENABLED', 'true'
         }
         release {
             // 模块大量使用反射与 DexKit 原生库，关闭 R8 以免误裁剪。
             minifyEnabled false
             shrinkResources false
             signingConfig signingConfigs.selfbuilt
+            buildConfigField 'boolean', 'DEFAULT_LOG_ENABLED', 'false'
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-        }    }
+        }
+    }
 
     packagingOptions {
         jniLibs {

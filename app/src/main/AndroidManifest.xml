@@ -17,6 +17,16 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name="com.oplusime.panel.HookDiagnosticsActivity"
+            android:exported="false" />
+
+        <provider
+            android:name="com.oplusime.panel.HookDiagnosticsProvider"
+            android:authorities="com.oplusime.panel.hookdiagnostics"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
