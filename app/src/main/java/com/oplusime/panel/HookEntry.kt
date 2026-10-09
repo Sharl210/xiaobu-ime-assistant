@@ -163,6 +163,9 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         runCatching { RoomDowngradeGuard.install(hostClassLoader) }
             .onFailure { logCritical("room-downgrade guard install failed: ${it.stackTraceToString()}") }
 
+        runCatching { ReturnKeyCompatibility.install(hostClassLoader) }
+            .onFailure { log("return-key compatibility install failed: ${it.message}") }
+
         // 与面板无关的独立功能：成对符号「自动补全」抑制。
         // 先于面板解析安装，因此即使面板定位失败，符号行为也照常生效。
             runCatching { QuotePairSuppressor.install(hostClassLoader) }
