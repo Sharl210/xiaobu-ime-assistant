@@ -20,7 +20,7 @@
 - Debug 默认日志：开启
 - Release 默认日志：关闭
 - Debug SHA-256：`5882f4482d8fe470c0d329c7f9f057f29a106b28d0f35bc8784786cf30f9c3ba`（3,228,154 bytes）
-- Release SHA-256：`745bee9278bcedd9ed83fe26b9a41cfd67b21467a2389fc3381cc8483ae70747`（2,561,150 bytes）
+- Release SHA-256：`0761a3059d95597b774ad371cc77a6805241adfb5803b7e1467ab351daec84e1`（2,561,153 bytes）
 - 设备端功能：待安装测试包、重启宿主并按验收动作逐项确认；构建和静态证据不替代真机验收。
 
 ## 产物
