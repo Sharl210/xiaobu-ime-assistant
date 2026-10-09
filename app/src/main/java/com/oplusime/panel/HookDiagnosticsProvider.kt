@@ -37,6 +37,8 @@ class HookDiagnosticsProvider : ContentProvider() {
             }
         }
         if (method != "record") return null
+        // 诊断结果只允许宿主通过显式广播提交；Provider 仅保留模块自身的 snapshot 兼容读取。
+        if (android.os.Binder.getCallingUid() != android.os.Process.myUid()) return null
         val name = extras?.getString("name") ?: return null
         val matched = extras.getBoolean("matched")
         val detail = extras.getString("detail").orEmpty()

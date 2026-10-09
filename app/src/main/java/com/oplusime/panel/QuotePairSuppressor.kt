@@ -1,7 +1,8 @@
 package com.oplusime.panel
 
-import android.os.Handler
-import android.os.Looper
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
 import android.view.inputmethod.InputConnection
 import android.content.DialogInterface
 import android.app.Dialog
@@ -10,66 +11,25 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import org.luckypray.dexkit.DexKitBridge
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicLong
 import java.lang.reflect.Modifier
 
 /**
- * 引号「成对补全」抑制。
+ * 成对符号自动补全抑制。
  *
- * ## 为什么放在这一层
+ * 宿主可能把自动补全拆成两次 `RemoteInputConnection.commitText`，也可能在宿主配对表源头
+ * 生成右符号。模块优先在配对表源头只执行左符号回调；输入连接层只保留一次性完整成对提交
+ * 的裁剪和观察，不按时间窗删除字符，因此用户手动输入 `()` 等内容不会被误删。
  *
- * 取证结论（com.oplus.keyboard 1.7.38.17-os）：
- *
- * - Java 侧**没有**任何"输入左引号 → 补右引号"的判定。全包内含 `“`/`”` 的类只有三处，
- *   全部是"符号清单/候选表"（`input/utils/l` 的符号集合、`input/view/O` 的符号键候选、
- *   `base/data/s` 的符号数据）；字符码 `0x201c` 在 `com/oplus/keyboard` 全包内只出现在
- *   markdown 的 HTML 解析器里；`SmartPunctuation` 相关类属于**语音输入**加标点
- *   （`VoiceInputPanelHelper`），与符号面板无关。
- * - 因此引号配对由**输入引擎（native：libjni_ime / libIQQILib / libokim_shared 等）**完成，
- *   Java 层没有可以直接关闭它的开关或函数。
- *
- * ## 因此采取的策略：在上屏结果上做修正
- *
- * 无论配对是谁做的、也无论它是"一次提交两个字符"还是"提交左引号后再补右引号并移动光标"，
- * 最终编辑框里必然出现同一个可检测的状态：
- *
- * ```text
- * 光标前面是左引号  且  光标后面是配对的右引号        →  “ | ”
- * ```
- *
- * 检测到这个状态就删掉光标后面的那个右引号，于是剩下：
- *
- * ```text
- * 光标前面是左引号，光标在它后面                      →  “ |
- * ```
- *
- * 这正是用户要的"把引号当普通符号输入，光标留在引号后面"。
- *
- * ## 挂点
- *
- * 输入法进程内承载"输入法 → 编辑框"全部调用的，是 framework 的 InputConnection 代理实现
- * （`com.android.internal.view.IInputConnectionWrapper` 及其同族）。native 引擎与 Java 代码
- * 最终都经过它，所以在它的 `commitText` / `setSelection` 之后各检查一次，即可覆盖两种形态：
- *
- * - 若配对是"一次提交两个字符" → `commitText` 之后就能看到 `“ | ”`；
- * - 若配对是"提交左引号后再补右引号并 setSelection 到中间" → `setSelection` 之后才成立。
- *
- * 两个检查都是幂等的：删掉之后状态不再成立，不会重复删除。
- *
- * ## 误伤控制
- *
- * 只在**本次动作确实与引号有关**时才检查（提交文本含引号，或涉及的选区间隔极小），
- * 因此用户平时"手动把光标放进一对引号中间"的正常编辑不会被干扰。
+ * 所有宿主定位仍使用 DexKit 语义/结构匹配；框架输入连接和运行时远程输入连接只作为
+ * Android 输入法进程的稳定系统接口，不写死宿主混淆类名。
  */
 internal object QuotePairSuppressor {
 
     /**
-     * 左符号 → 配对的右符号。
-     *
-     * 范围按用户要求放到**全量成对符号**：引号、圆括号、方括号、花括号、尖括号，
-     * 以及中文/全角与各语言变体。半角引号左右同形，因此映射到自身。
-     *
-     * 这张表只用于两件事：①识别「一次提交上来的正好是一对」；
-     * ②识别「光标正夹在一对中间」。都不涉及对用户输入的额外改写。
+     * 配对符号数据表只用于识别一次提交即为完整成对文本和记录符号相关输入。
+     * 不根据相邻字符推断自动补全，也不以此删除任何用户输入。
+     * 范围覆盖引号、圆括号、方括号、花括号、尖括号、书名号及中文/全角变体。
      */
     private val PAIRS: Map<Char, Char> = mapOf(
         // 引号
@@ -101,53 +61,40 @@ internal object QuotePairSuppressor {
         '\uFF1C' to '\uFF1E', // ＜ ＞
     )
 
-    /** 光标两侧都是引号时，两次删除之间的最小间隔，避免同一状态被连续处理。 */
-    private const val MIN_INTERVAL_MS = 60L
-
-    /**
-     * 「夹在中间」修正的**有效时间窗**。
-     *
-     * 这是本文件最重要的一道安全闸。原因：`setSelection` 挂在输入连接的每次光标移动上，
-     * 而用户手动把光标点到一段已有文字里的「（）」中间时，光标同样会呈现"被一对符号夹住"
-     * 的状态——若不加限制，就会**误删用户自己的右括号**。
-     *
-     * 因此只有在"刚刚确实有一次成对符号的提交"之后的极短时间内才允许修正：
-     * 那才是宿主自动补全产生的状态；其余时刻一律只观察、不动手。
-     */
-    private const val SANDWICH_WINDOW_MS = 1200L
-    private val CLEANUP_DELAYS_MS = longArrayOf(0L, 40L, 90L, 160L, 280L, 450L, 700L)
-
-    private val main = Handler(Looper.getMainLooper())
-
-    @Volatile
-    private var lastFixAt: Long = 0L
-
-    /** 最近一次"提交里含成对符号"的时刻；夹缝修正必须发生在这个时刻之后的时间窗内。 */
-    @Volatile
-    private var lastPairCommitAt: Long = 0L
-
+    /** 输入连接钩子安装后只保留计数诊断，不再用时间窗做破坏性删除。 */
+    /** 成对提交仅用于记录与一次性参数裁剪，不驱动后续删除。 */
     @Volatile
     private var installed = false
 
-    @Volatile
-    private var fixCount: Int = 0
-
-    /** 最近一次"单独提交了一个成对左符号"的记录：字符与时刻。 */
-    @Volatile
-    private var lastLeftChar: Char? = null
-
-    @Volatile
-    private var lastLeftAt: Long = 0L
-
-    /** 自动补全的右符号必须紧跟在左符号之后，时间窗放到很短，避免误伤用户自己点的右符号。 */
-    private const val AUTO_PAIR_WINDOW_MS = 130L
-
-    /** 引擎提交证据去重用的两个字段，避免连续按键刷屏。 */
     @Volatile
     private var lastObserveAt: Long = 0L
 
     @Volatile
     private var lastObservedText: String = ""
+
+    /** 宿主自动补全与用户手动输入都最终会走 RemoteInputConnection.commitText。 */
+    private data class PendingLeft(
+        val value: Char,
+        val at: Long,
+        val userInputGeneration: Long,
+    )
+
+    /** 当前输入法真正对外使用的 InputConnection 实例。按实例登记比按类名判断稳定，
+     * 因为新旧宿主都可能返回不同的框架代理类。 */
+    private val remoteConnections = Collections.synchronizedMap(
+        java.util.WeakHashMap<Any, Boolean>(),
+    )
+
+    /** 一个输入法窗口同时只有一个活动编辑目标，成对补全的两次提交也可能由两个代理实例完成。 */
+    @Volatile
+    private var pendingLeftGlobal: PendingLeft? = null
+
+    @Volatile
+    private var lastUserInputAt: Long = 0L
+    private val userInputGeneration = AtomicLong(0L)
+    private const val AUTO_CLOSE_MAX_DELAY_MS = 1200L
+    @Volatile
+    private var touchProbeInstalled = false
 
     /**
      * `InputConnection` 提交留证用的字段。
@@ -163,12 +110,52 @@ internal object QuotePairSuppressor {
     @Volatile
     private var lastCommitTraceText: String = ""
 
+    @Volatile
+    private var frameworkInputHookPoints = 0
+    @Volatile
+    private var hostInputHookPoints = 0
+    @Volatile
+    private var hostDispatcherHookPoints = 0
+    @Volatile
+    private var engineHookPoints = 0
+    @Volatile
+    private var pairSourceHooked = false
+    private val frameworkMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val hostInputMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val dispatcherMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val engineMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val pairSourceMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    fun diagnosticSignatures(): List<String> = buildList {
+        addAll(frameworkMatchSignatures)
+        addAll(hostInputMatchSignatures)
+        addAll(dispatcherMatchSignatures)
+        addAll(engineMatchSignatures)
+        addAll(pairSourceMatchSignatures)
+    }.distinct()
+
+    fun publishDiagnostics() {
+        HookDiagnostics.recordMatch("引号:输入连接", frameworkMatchSignatures,
+            "框架/远程 InputConnection 结构入口已解析")
+        HookDiagnostics.recordMatch("引号:框架输入连接", frameworkMatchSignatures,
+            "InputConnection 提交与组合文本方法")
+        HookDiagnostics.recordMatch("引号:宿主输入连接", hostInputMatchSignatures,
+            "宿主 onCreateInputConnection 返回实现的提交方法")
+        HookDiagnostics.recordMatch("引号:宿主提交分发", dispatcherMatchSignatures,
+            "宿主提交分发方法")
+        HookDiagnostics.recordMatch("引号:引擎提交汇聚点", engineMatchSignatures,
+            "引擎回调与最终提交汇聚方法")
+        HookDiagnostics.recordMatch("引号:成对符号源头", pairSourceMatchSignatures,
+            "配对表、选区查询与回调结构方法")
+    }
+
     /**
      * 在宿主进程内安装。输入法进程里承载编辑框调用的代理类可能不止一个名字，
      * 逐个尝试，命中即装；全部不可用时如实记日志（功能退化为原生行为，不会崩）。
      */
     fun install(hostClassLoader: ClassLoader, extraClasses: List<Class<*>> = emptyList()) {
         if (installed) return
+        installUserInputProbe()
         val candidates = listOf(
             // 框架侧的代理实现：native 引擎与 Java 代码最终都经过它。
             "com.android.internal.view.IInputConnectionWrapper",
@@ -184,6 +171,10 @@ internal object QuotePairSuppressor {
                 log("quote-pair: $name not present")
                 return@forEach
             }
+            frameworkMatchSignatures.addAll(
+                cls.methods.filter { it.name == "commitText" || it.name == "setComposingText" }
+                    .map { HookDiagnostics.methodSignature(it) }
+            )
             hooked += hookAll(cls)
         }
         // 宿主自己实现的 InputConnection（由入口用 DexKit 查出后传进来），
@@ -195,11 +186,14 @@ internal object QuotePairSuppressor {
                 log("quote-pair: host InputConnection hooked ${cls.name} points=$added")
             }
         }
+        frameworkInputHookPoints = hooked
         if (hooked == 0) {
             log("quote-pair: no InputConnection proxy hooked; quotes keep host behaviour")
+            HookDiagnostics.record(null, "引号:框架输入连接", false, "hook points=0")
         } else {
             installed = true
             log("quote-pair: installed, hook points=$hooked")
+            HookDiagnostics.record(null, "引号:框架输入连接", true, "hook points=$hooked")
         }
         // 输入法进程里真正把文本送进目标应用的，是框架侧那个"远程输入连接"
         // （`InputMethodService.getCurrentInputConnection()` 返回的对象）。它既不是
@@ -239,18 +233,30 @@ internal object QuotePairSuppressor {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val ic = param.result as? InputConnection ?: return
+                        remoteConnections[ic] = true
+                        log("quote-pair: remote IC observed class=${ic.javaClass.name} identity=${System.identityHashCode(ic)}")
                         hookIcClass(ic.javaClass)
                     }
                 },
             )
             log("quote-pair: remote IC provider hooked (${serviceClass.name}#getCurrentInputConnection)")
-        }.onFailure { log("quote-pair: remote IC provider hook failed: ${it.message}") }
+            frameworkMatchSignatures.addAll(
+                serviceClass.methods.filter { it.name == "getCurrentInputConnection" }
+                    .map { HookDiagnostics.methodSignature(it) }
+            )
+            HookDiagnostics.recordMatch("引号:框架输入连接", frameworkMatchSignatures,
+                "动态提供者方法已解析；返回实例后再挂载提交方法")
+        }.onFailure { log("quote-pair: remote IC provider hook failed: ${it.message}")
+            HookDiagnostics.record(null, "引号:框架输入连接", false, it.message.orEmpty())
+        }
     }
 
     private fun hookIcClass(cls: Class<*>) {
         if (!hookedIcClasses.add(cls.name)) return
         val added = hookAll(cls)
         log("quote-pair: remote IC hooked ${cls.name} points=$added")
+        HookDiagnostics.record(null, "引号:框架输入连接", added > 0,
+            "runtimeClass=${cls.name}; hookPoints=$added")
     }
 
     /**
@@ -273,6 +279,11 @@ internal object QuotePairSuppressor {
             .getOrDefault(emptyList())
 
         val names = methods.mapNotNull { it.returnTypeName }.distinct()
+        hostInputMatchSignatures.clear()
+        hostInputMatchSignatures.addAll(methods.mapNotNull { data ->
+            runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?.let { HookDiagnostics.methodSignature(it) }
+        })
         var hooked = 0
         names.forEach { name ->
             if (name.isEmpty() || name == "android.view.inputmethod.InputConnection") return@forEach
@@ -285,7 +296,10 @@ internal object QuotePairSuppressor {
                 log("quote-pair: host IC hooked ${cls.name} points=$added")
             }
         }
+        hostInputHookPoints = hooked
         log("quote-pair: host IC classes=${names.size} hooks=$hooked")
+        HookDiagnostics.recordMatch("引号:宿主输入连接", hostInputMatchSignatures,
+            "候选实现类=${names.size}；运行时 hook 点数=$hooked")
     }
 
     /**
@@ -375,7 +389,17 @@ internal object QuotePairSuppressor {
                 installed++
             }.onFailure { log("quote-pair: direct dispatcher hook failed: ${it.message}") }
         }
+        hostDispatcherHookPoints = installed
         log("quote-pair: host commit dispatchers candidates=${matchSymbol.size + direct.size} installed=$installed")
+        dispatcherMatchSignatures.clear()
+        dispatcherMatchSignatures.addAll(
+            (matchSymbol + finalCommit + direct).mapNotNull { data ->
+                runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                    ?.let { HookDiagnostics.methodSignature(it) }
+            }
+        )
+        HookDiagnostics.recordMatch("引号:宿主提交分发", dispatcherMatchSignatures,
+            "common=${matchSymbol.size}; final=${finalCommit.size}; direct=${direct.size}; hookPoints=$installed")
     }
 
     /**
@@ -398,6 +422,15 @@ internal object QuotePairSuppressor {
      */
     fun attachEngineCommit(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         var installed = 0
+        val matchedEngineMethods = mutableListOf<java.lang.reflect.Method>()
+        val matchedEngineSignatures = HashSet<String>()
+        val attemptedEngineHooks = HashSet<String>()
+        fun rememberEngineMatch(method: java.lang.reflect.Method): Boolean {
+            val signature = method.toGenericString()
+            if (matchedEngineSignatures.add(signature)) matchedEngineMethods.add(method)
+            // A duplicated semantic/structural query may return the same method; only install one callback.
+            return attemptedEngineHooks.add(signature)
+        }
 
         val callbackClasses = runCatching {
             bridge.findClass {
@@ -428,14 +461,14 @@ internal object QuotePairSuppressor {
                                 observeEngineCommit(text, cls.simpleName + "#" + method.name)
                                 val single = unwrapPair(text) ?: return
                                 param.args[0] = single.toString()
-                                lastPairCommitAt = System.currentTimeMillis()
-                                log(
+                                                    log(
                                     "quote-pair: engine commit pair trimmed to '" +
                                         describe(single[0]) + "'"
                                 )
                             }
                         })
                         installed++
+                        matchedEngineMethods.add(method)
                         log("quote-pair: engine callback hooked ${cls.name}#${method.name}")
                     }.onFailure { log("quote-pair: engine callback hook failed: ${it.message}") }
                 }
@@ -473,29 +506,243 @@ internal object QuotePairSuppressor {
                                 observeEngineCommit(text.toString(), cls.simpleName + "#" + method.name)
                                 val single = unwrapPair(text) ?: return
                                 param.args[0] = single
-                                lastPairCommitAt = System.currentTimeMillis()
-                                log(
+                                                    log(
                                     "quote-pair: dispatcher pair trimmed to '" +
                                         describe(single[0]) + "'"
                                 )
                             }
                         })
                         installed++
+                        matchedEngineMethods.add(method)
                         log("quote-pair: commit dispatcher hooked ${cls.name}#${method.name}")
                     }.onFailure { log("quote-pair: commit dispatcher hook failed: ${it.message}") }
                 }
         }
 
+        // 新旧宿主都保留一条稳定的最终提交形状：静态 (int, CharSequence) -> void，
+        // 方法体直接调用 InputConnection.commitText。新版不再保留旧的日志串，
+        // 因此这里用调用关系补回同一汇聚点，而不是按混淆类名或版本分支。
+        val structuralDirect = runCatching {
+            bridge.findMethod {
+                matcher {
+                    paramCount(2)
+                    paramTypes("int", "java.lang.CharSequence")
+                    returnType("void")
+                    addInvoke("Landroid/view/inputmethod/InputConnection;->commitText(Ljava/lang/CharSequence;I)Z")
+                }
+            }.toList()
+        }.onFailure { log("quote-pair: structural direct dispatcher query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+        structuralDirect.forEach { data ->
+            runCatching {
+                val method = data.getMethodInstance(hostClassLoader).apply { isAccessible = true }
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        trimPairArguments(param.args)
+                    }
+                })
+                installed++
+                matchedEngineMethods.add(method)
+                log("quote-pair: structural direct dispatcher hooked ${data.declaredClassName}#${data.name}")
+            }.onFailure { log("quote-pair: structural direct dispatcher hook failed: ${it.message}") }
+        }
+
+        // 部分旧宿主在引擎回调里保留了完整日志串，新宿主删掉/改写了日志文案。
+        // 退回到稳定结构：宿主引擎回调接口的实现类中，含 commitText 语义串的
+        // 实例方法 (String) -> boolean。这样混淆类名和方法名变化不会切断这一层。
+        fun hasEngineCallback(type: Class<*>): Boolean {
+            fun hasInterface(current: Class<*>): Boolean =
+                current.interfaces.any { iface ->
+                    iface.name.startsWith("com.oplus.keyboard.base.engine.") || hasInterface(iface)
+                } || (current.superclass?.let(::hasInterface) == true)
+            return hasInterface(type)
+        }
+        val callbackFallback = runCatching {
+            bridge.findMethod {
+                matcher {
+                    paramTypes("java.lang.String")
+                    returnType("boolean")
+                    usingStrings(
+                        listOf("commitText"),
+                        org.luckypray.dexkit.query.enums.StringMatchType.Contains,
+                        false,
+                    )
+                }
+            }.mapNotNull { data ->
+                runCatching { data.getMethodInstance(hostClassLoader).apply { isAccessible = true } }
+                    .getOrNull()
+            }.filter { method ->
+                method.declaringClass.name.startsWith("com.oplus.keyboard.") &&
+                    hasEngineCallback(method.declaringClass) &&
+                    !Modifier.isStatic(method.modifiers) &&
+                    method.returnType == Boolean::class.javaPrimitiveType &&
+                    method.parameterTypes.contentEquals(arrayOf(String::class.java))
+            }.distinctBy { it.toGenericString() }
+        }.onFailure { log("quote-pair: structural engine callback query failed: ${it.message}") }
+            .getOrDefault(emptyList())
+        callbackFallback.forEach { method ->
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val text = param.args?.firstOrNull() as? String ?: return
+                        observeEngineCommit(text, method.declaringClass.simpleName + "#" + method.name)
+                        unwrapPair(text)?.let { param.args[0] = it.toString() }
+                    }
+                })
+                installed++
+                matchedEngineMethods.add(method)
+                log("quote-pair: structural callback fallback hooked ${method.declaringClass.name}#${method.name}")
+            }.onFailure { log("quote-pair: structural callback fallback failed: ${it.message}") }
+        }
+
+        val dispatcherFallback = runCatching {
+            listOf(5, 7, 9).flatMap { count ->
+                bridge.findMethod {
+                    matcher { paramCount(count); returnType("boolean") }
+                }.mapNotNull { data -> runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull() }
+            }.filter { method ->
+                Modifier.isStatic(method.modifiers) &&
+                    method.parameterTypes.any { it == CharSequence::class.java } &&
+                    method.parameterTypes.any { InputConnection::class.java.isAssignableFrom(it) }
+            }
+        }.getOrDefault(emptyList())
+        dispatcherFallback.distinctBy { it.toGenericString() }.forEach { method ->
+            runCatching {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        trimPairArguments(param.args)
+                    }
+                })
+                installed++
+                matchedEngineMethods.add(method)
+                log("quote-pair: structural dispatcher fallback hooked ${method.declaringClass.name}#${method.name}")
+            }.onFailure { log("quote-pair: structural dispatcher fallback failed: ${it.message}") }
+        }
+
+        attachPairCompletionSource(bridge, hostClassLoader)
+
+        engineHookPoints = installed
         log("quote-pair: engine commit hooks installed=$installed")
+        engineMatchSignatures.clear()
+        engineMatchSignatures.addAll(
+            matchedEngineMethods.distinctBy { it.toGenericString() }
+                .map { HookDiagnostics.methodSignature(it) }
+        )
+        HookDiagnostics.recordMatch("引号:引擎提交汇聚点", engineMatchSignatures,
+            "callbackClasses=${callbackClasses.size}; dispatcherClasses=${dispatcherClasses.size}; hookPoints=$installed")
     }
 
     /**
-     * 只在"这次提交确实与成对符号有关"时记一行证据，避免每次按键都刷日志。
+     * 在宿主配对表源头只执行左符号回调，阻止宿主随后根据配对表再次生成右符号。
      *
-     * 这一行是下一轮真机取证的判据：如果日志里出现 `len=2`（一次上来就是一对），
-     * 说明配对发生在引擎之前（键位表）；如果只有 `len=1`，说明配对发生在提交之后，
-     * 由 [check] 的时间窗负责拆掉。
+     * DexKit 先按二参数/布尔返回宽召回，再用参数角色、HashMap 配对表引用、
+     * InputConnection 查询调用和 Function0.invoke() 形状联合收敛；不依赖 Kotlin/R8
+     * 对 Function0 的具体短类名。这样宿主升级后即使 `Function0` 的运行时名称变化，
+     * 仍然可以从结构重新定位。
      */
+    private fun attachPairCompletionSource(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        runCatching {
+            val recalled = bridge.findMethod {
+                matcher {
+                    paramCount(2)
+                    returnType("boolean")
+                }
+            }.toList()
+
+            val candidates = recalled.filter { data ->
+                val params = data.paramTypeNames
+                if (params.size != 2 || params[0] != "java.lang.String") return@filter false
+                // 不把 Kotlin/R8 对 Function0 的具体类型名当作硬条件。
+                // 新版宿主仍保留同一个结构：第二参数是回调，方法体引用配对表，
+                // 并查询 InputConnection 的选区文本；回调接口/生成类的名字可以变化。
+                val pairTable = data.usingFields.any { field ->
+                    field.field.typeName == "java.util.HashMap" ||
+                        field.field.typeName == "java.util.Map" ||
+                        field.field.typeName.endsWith("HashMap")
+                }
+                val queriesInputConnection = data.invokes.any { invoke ->
+                    invoke.paramTypeNames == listOf(
+                        "android.view.inputmethod.InputConnection",
+                        "int",
+                        "int",
+                    ) && invoke.returnTypeName == "java.lang.CharSequence"
+                }
+                pairTable && queriesInputConnection
+            }
+
+            val resolved = candidates.mapNotNull { data ->
+                runCatching {
+                    data.getMethodInstance(hostClassLoader).apply { isAccessible = true }
+                }.onFailure {
+                    log("quote-pair: pair source candidate resolve failed params=${data.paramTypeNames.joinToString()} error=${it.message}")
+                }.getOrNull()
+            }.filter { method ->
+                val params = method.parameterTypes
+                val callback = params.getOrNull(1)
+                val hasZeroArgInvoke = callback?.let { type ->
+                    var current: Class<*>? = type
+                    var found = false
+                    while (current != null && !found) {
+                        found = current.declaredMethods.any { invoke ->
+                            invoke.name == "invoke" && invoke.parameterTypes.isEmpty()
+                        } || current.methods.any { invoke ->
+                            invoke.name == "invoke" && invoke.parameterTypes.isEmpty()
+                        }
+                        current = current.superclass
+                    }
+                    found
+                } == true
+                params.size == 2 &&
+                    params[0] == String::class.java &&
+                    callback != null &&
+                    !callback.isPrimitive &&
+                    hasZeroArgInvoke
+            }.distinctBy { it.toGenericString() }
+
+            // 该源头在不同 Kotlin/R8 输出中可能是实例方法，也可能是静态桥接方法；
+            // 方法是否 static 不属于语义判据，不能因此丢掉唯一候选。
+            if (resolved.size > 1) {
+                log("quote-pair: pair source candidates after callback-shape=${resolved.map { it.toGenericString() }.take(8)}")
+            }
+
+            val method = resolved.singleOrNull()
+                ?: error(
+                    "pair completion source unresolved candidates=${candidates.size}" +
+                        " resolved=${resolved.size} recalled=${recalled.size}"
+                )
+
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val text = param.args?.getOrNull(0) as? String ?: return
+                    if (text.length != 1 || !PAIRS.containsKey(text[0])) return
+                    val callback = param.args?.getOrNull(1) ?: return
+                    val invoke = callback.javaClass.methods.firstOrNull {
+                        it.name == "invoke" && it.parameterTypes.isEmpty()
+                    } ?: return
+                    val callbackResult = invoke.invoke(callback)
+                    param.result = callbackResult as? Boolean ?: true
+                    log(
+                        "quote-pair: host pair source short-circuited left=" +
+                            describe(text[0]) + " right=${describe(PAIRS[text[0]]!!)}" +
+                            " callbackResult=${param.result} method=${method.declaringClass.name}#${method.name}"
+                    )
+                }
+            })
+            pairSourceHooked = true
+            pairSourceMatchSignatures.clear()
+            pairSourceMatchSignatures.add(method.toGenericString())
+            HookDiagnostics.recordMatch(
+                "引号:成对符号源头",
+                pairSourceMatchSignatures,
+                "recalled=${recalled.size}; structuralCandidates=${candidates.size}; resolved=${resolved.size}",
+            )
+            log("quote-pair: pair completion source hooked method=$method")
+        }.onFailure {
+            HookDiagnostics.record(null, "引号:成对符号源头", false, it.message.orEmpty())
+            log("quote-pair: pair completion source unresolved: ${it.message}")
+        }
+    }
+
     private fun observeEngineCommit(text: String, source: String) {
         // 诊断口径：短文本（符号、单字）一律留证；长文本只在确实含成对符号时记录。
         // 这是为了在不刷屏的前提下，把"引号究竟从哪条链提交"这件事钉死。
@@ -512,10 +759,6 @@ internal object QuotePairSuppressor {
                 )
             }
         }
-        if (text.length == 1 && PAIRS.containsKey(text[0])) {
-            // 单个左符号提交同样是"刚发生一次成对符号动作"，要打开修正时间窗。
-            lastPairCommitAt = System.currentTimeMillis()
-        }
     }
 
     private fun trimPairArguments(args: Array<Any?>?) {
@@ -527,11 +770,108 @@ internal object QuotePairSuppressor {
             val value = candidate as? CharSequence ?: return@forEach
             val single = unwrapPair(value) ?: return@forEach
             args[index] = single
-            lastPairCommitAt = System.currentTimeMillis()
             log("quote-pair: host dispatcher pair trimmed to single ${describe(single[0])}")
         }
         scheduleInspect(inputConnection, "dispatcher-trim")
     }
+    /** 记录真实用户输入事件，避免把用户稍后手动按下的后符号误判成宿主自动补全。 */
+    private fun installUserInputProbe() {
+        if (touchProbeInstalled) return
+        touchProbeInstalled = true
+        runCatching {
+            XposedBridge.hookAllMethods(View::class.java, "dispatchTouchEvent", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val event = param.args?.firstOrNull() as? MotionEvent ?: return
+                    if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                        lastUserInputAt = SystemClock.uptimeMillis()
+                        userInputGeneration.incrementAndGet()
+                    }
+                }
+            })
+            XposedBridge.hookAllMethods(View::class.java, "dispatchKeyEvent", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    lastUserInputAt = SystemClock.uptimeMillis()
+                    userInputGeneration.incrementAndGet()
+                }
+            })
+            log("quote-pair: user input probe installed")
+        }.onFailure {
+            touchProbeInstalled = false
+            log("quote-pair: user input probe failed: ${it.message}")
+        }
+    }
+
+    private fun isRemoteInputConnection(target: Any?): Boolean {
+        if (target == null) return false
+        val observed = synchronized(remoteConnections) { remoteConnections.containsKey(target) }
+        // 兼容尚未完成第一次 provider 回调的早期提交；后续仍以实例登记为主。
+        return observed || target.javaClass.name.contains("RemoteInputConnection")
+    }
+
+    private fun leftForClosing(value: Char): Char? =
+        PAIRS.entries.firstOrNull { it.value == value }?.key
+
+    /**
+     * 只在真正对外的输入连接上处理宿主拆成两次提交的自动补全。
+     * 待匹配状态按当前活动编辑目标全局保存，避免宿主在两次提交之间更换代理对象。
+     */
+    /**
+     * 远程输入连接上的拆分提交处理：
+     * - 左符号提交后记录一个待闭合状态；
+     * - 后续没有新的用户触摸/按键、且在自动补全时间窗内到达的右符号，视为宿主自动补全并吞掉；
+     * - 用户产生了新的触摸/按键世代，则明确放行右符号；
+     * - 超时状态丢弃，不影响后续正常输入。
+     *
+     * 这里只在提交前返回 true，不调用 deleteSurroundingText，也不删除已经上屏的用户文本。
+     */
+    private fun suppressDelayedAutoClosing(target: Any, text: CharSequence): Boolean {
+        if (!isRemoteInputConnection(target) || text.length != 1) return false
+        val now = SystemClock.uptimeMillis()
+        val value = text[0]
+        val pending = pendingLeftGlobal
+        val left = leftForClosing(value)
+        if (pending != null && left == pending.value) {
+            val delay = now - pending.at
+            val currentGeneration = userInputGeneration.get()
+            val userChanged = currentGeneration != pending.userInputGeneration
+            pendingLeftGlobal = null
+            if (userChanged) {
+                log(
+                    "quote-pair: manual closing preserved left=${describe(left)}" +
+                        " right=${describe(value)} delayMs=$delay" +
+                        " userGeneration=${pending.userInputGeneration}->${currentGeneration}" +
+                        " connection=${target.javaClass.name}"
+                )
+                return false
+            }
+            if (delay in 0L..AUTO_CLOSE_MAX_DELAY_MS) {
+                log(
+                    "quote-pair: automatic closing suppressed left=${describe(left)}" +
+                        " right=${describe(value)} delayMs=$delay" +
+                        " userGeneration=${currentGeneration} connection=${target.javaClass.name}"
+                )
+                return true
+            }
+            log(
+                "quote-pair: closing outside auto window preserved left=${describe(left)}" +
+                    " right=${describe(value)} delayMs=$delay connection=${target.javaClass.name}"
+            )
+            return false
+        }
+        if (PAIRS.containsKey(value)) {
+            pendingLeftGlobal = PendingLeft(
+                value = value,
+                at = now,
+                userInputGeneration = userInputGeneration.get(),
+            )
+            log(
+                "quote-pair: pending left observed ${describe(value)}" +
+                    " userGeneration=${userInputGeneration.get()} connection=${target.javaClass.name}"
+            )
+        }
+        return false
+    }
+
     private fun hookAll(cls: Class<*>): Int {
         var count = 0
         count += runCatching {
@@ -548,28 +888,20 @@ internal object QuotePairSuppressor {
                     // 一眼就能看出是哪一方的输入连接在收字。
                     val owner = param.thisObject?.javaClass?.simpleName ?: cls.simpleName
                     traceCommit(text, "$owner.commitText")
-                    // 形态零（本版新增，也是 1.19.0 真机失败的直接原因）：
-                    // 上一拍刚落下一个左符号，紧接着又送来"正好配对"的右符号 —— 这就是宿主/引擎
-                    // 的自动补全**第二步**。1.19.0 只做事后删除，而删除发生在它之后又被它补回，
-                    // 于是用户看到的一直是成对。这里直接在提交入口把它拦成一次空提交。
-                    if (dropAutoClosing(text, param.thisObject as? InputConnection)) {
-                        param.setResult(true)
-                        log("quote-pair: dropped auto closing '" + describe(text[0]) + "'")
+                    if (suppressDelayedAutoClosing(param.thisObject ?: return, text)) {
+                        param.result = true
                         return
                     }
-                    rememberLeftSymbol(text)
+                    // 一次性提交成对字符时保留前半部分；拆分提交时按用户输入时间戳区分延迟自动补全。
                     val single = unwrapPair(text) ?: return
                     param.args[0] = single
-                    lastPairCommitAt = System.currentTimeMillis()
-                    log("quote-pair: pair commit trimmed to single '" + describe(single[0]) + "'")
+                    log("quote-pair: pair commit trimmed to single '${describe(single[0])}'")
                 }
 
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
-                    rememberLeftSymbol(text)
                     if (!mentionsPair(text)) return
-                    lastPairCommitAt = System.currentTimeMillis()
-                    inspect(param.thisObject, "commitText")
+                            inspect(param.thisObject, "commitText")
                 }
             }).size
         }.onFailure { log("quote-pair: commitText hook failed on ${cls.name}: ${it.message}") }
@@ -585,16 +917,18 @@ internal object QuotePairSuppressor {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
                     val owner = param.thisObject?.javaClass?.simpleName ?: cls.simpleName
                     traceCommit(text, "$owner.setComposingText")
+                    if (suppressDelayedAutoClosing(param.thisObject ?: return, text)) {
+                        param.result = true
+                        return
+                    }
                     val single = unwrapPair(text) ?: return
                     param.args[0] = single
-                    lastPairCommitAt = System.currentTimeMillis()
-                    log("quote-pair: composing pair trimmed to single '" + describe(single[0]) + "'")
+                    log("quote-pair: composing pair trimmed to single '${describe(single[0])}'")
                 }
 
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val text = param.args?.getOrNull(0) as? CharSequence ?: return
                     if (!mentionsPair(text)) return
-                    lastPairCommitAt = System.currentTimeMillis()
                 }
             }).size
         }.onFailure { log("quote-pair: setComposingText hook failed on ${cls.name}: ${it.message}") }
@@ -649,36 +983,7 @@ internal object QuotePairSuppressor {
         )
     }
 
-    /** 记录"刚刚单独提交了一个成对左符号"，为下一步的自动补全判定留下依据。 */
-    private fun rememberLeftSymbol(text: CharSequence) {
-        if (text.length != 1) return
-        val c = text[0]
-        if (!PAIRS.containsKey(c)) return
-        lastLeftChar = c
-        lastLeftAt = System.currentTimeMillis()
-    }
-
-    /**
-     * 这次提交是不是"自动补出的右符号"。
-     *
-     * 判据三条同时成立才认，缺一不可：
-     * 1. 提交内容是单个字符，且正好是上一个左符号的配对右符号；
-     * 2. 距那个左符号提交不超过 [AUTO_PAIR_WINDOW_MS]（自动补全跟在同一次按键里，
-     *    用户自己再点一次右符号通常不会这么快）；
-     * 3. 光标此刻就贴在刚提交的左符号后面（说明编辑器里是 `"…左符号` 末尾，
-     *    这一笔就是宿主补出来的那一半）。
-     */
-    private fun dropAutoClosing(text: CharSequence, ic: InputConnection?): Boolean {
-        if (text.length != 1) return false
-        val left = lastLeftChar ?: return false
-        val now = System.currentTimeMillis()
-        if (now - lastLeftAt > AUTO_PAIR_WINDOW_MS) return false
-        if (text[0] != PAIRS[left]) return false
-        val before = ic?.let { runCatching { it.getTextBeforeCursor(1, 0) }.getOrNull() } ?: return false
-        return before.length == 1 && before[0] == left
-    }
-
-    /** 本次提交的文本是否涉及成对符号（含"一次提交成对"与"提交单个左符号"两种形态）。 */
+    /** 本次提交的文本是否涉及成对符号（含一次提交成对与提交单个前/后符号）。 */
     private fun mentionsPair(text: CharSequence): Boolean {
         if (text.isEmpty()) return false
         if (text.length > 4) return false
@@ -689,87 +994,39 @@ internal object QuotePairSuppressor {
         return false
     }
 
+    /**
+     * 只处理明确可识别的“一次提交即为完整成对符号”形态。
+     *
+     * 如果宿主把自动补全拆成“先提交前符号、再提交后符号”，Java/Xposed 侧无法可靠区分
+     * 它和用户随后手动输入后符号的调用；两者的 InputConnection 参数和时序完全相同。
+     * 因此这里不再根据相邻字符、时间窗或光标夹缝删除任何后符号，避免破坏用户输入的 `()`、`[]`
+     * 等相邻成对内容。自动补全若以一次性成对文本提交，则由 [unwrapPair] 在参数入口裁掉后半部分。
+     */
     private fun inspect(target: Any?, source: String) {
-        scheduleInspect(target as? InputConnection, source)
+        // 保留调用点和参数，方便后续日志取证；不执行任何破坏性删除。
+        if (target != null) logThrottled("quote-pair-observe", 1_000L) {
+            "quote-pair: observe source=$source; sequential closing is preserved"
+        }
     }
 
     /**
-     * 宿主可能先提交左符号、稍后再补右符号；一次 post 不够。
-     * 在一次输入动作后的多个时间点重读同一个编辑器状态，直到右符号出现并删除，
-     * 或时间窗结束。这样不依赖某个单一的 native/Java 时序。
+     * 兼容旧调用链的观察入口。当前只观察，不再排队删除光标后的符号。
      */
     private fun scheduleInspect(ic: InputConnection?, source: String) {
-        if (ic == null) return
-        CLEANUP_DELAYS_MS.forEach { delay ->
-            main.postDelayed({
-                runCatching { check(ic, source) }
-                    .onFailure { log("quote-pair: inspect failed: ${it.message}") }
-            }, delay)
-        }
+        inspect(ic, source)
     }
 
     /**
-     * 检测"光标夹在一对符号中间"并拆掉右边那个。
-     *
-     * 成功条件必须**同时**满足，缺一不可：
-     * 1. 上一次成对符号提交发生在 [SANDWICH_WINDOW_MS] 之内（这是唯一允许修正的时机，
-     *    否则用户手动把光标点进已有的「（）」中间也会被误删）；
-     * 2. 光标前恰好一个字符，且它是某个左符号；
-     * 3. 光标后恰好一个字符，且它是该左符号的配对右符号；
-     * 4. 距离上次修正超过 [MIN_INTERVAL_MS]。
-     *
-     * 任一条不满足即不做任何事——因此不会触碰任何非"刚被补全"的文本。
+     * 保留为统一调用接口，但禁止通过“光标夹在一对符号中间”删除字符。
+     * 用户手动输入 `()`、`[]`、`{}` 等相邻成对符号时必须完整保留。
      */
     private fun check(ic: InputConnection?, source: String = "setSelection") {
-        if (ic == null) return
-        val now = System.currentTimeMillis()
-        if (now - lastPairCommitAt > SANDWICH_WINDOW_MS) return
-        val before = runCatching { ic.getTextBeforeCursor(1, 0) }.getOrNull() ?: return
-        if (before.length != 1) return
-        val expected = PAIRS[before[0]]
-        val after = runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull() ?: return
-        if (now - lastFixAt < MIN_INTERVAL_MS) return
-
-        val branch: String
-        val target: Char
-        val removed: Boolean
-        if (expected != null && after.length == 1 && after[0] == expected) {
-            // 光标位于左右符号之间，例如 “|”；删除右侧自动补出的符号。
-            branch = "sandwich(" + describe(before[0]) + "|" + describe(after[0]) + ")"
-            target = expected
-            removed = deleteSurrounding(ic, 0, 1)
-        } else {
-            // 另一种宿主时序：成对文本已提交，光标位于末尾，例如 “”|。
-            val beforeTwo = runCatching { ic.getTextBeforeCursor(2, 0) }.getOrNull()
-            if (beforeTwo == null || beforeTwo.length != 2) return
-            val pairRight = PAIRS[beforeTwo[0]]
-            if (pairRight == null || beforeTwo[1] != pairRight) return
-            branch = "tail(..." + describe(beforeTwo[0]) + describe(beforeTwo[1]) + ")"
-            target = beforeTwo[1]
-            removed = deleteSurrounding(ic, 1, 0)
+        if (ic != null) {
+            logThrottled("quote-pair-check", 1_000L) {
+                "quote-pair: non-destructive check source=$source; manual closing preserved"
+            }
         }
-        if (!removed) {
-            log("quote-pair: editor rejected deleteSurroundingText (source=$source branch=$branch)")
-            return
-        }
-        lastFixAt = System.currentTimeMillis()
-        fixCount++
-        // 复读验证：`deleteSurroundingText` 返回 true 只代表"命令发出去了"，不代表真的删掉了
-        // （组合态、只读编辑器、编辑连接指向别处都会静默失败）。1.19.0 就是在这里只看了返回值就
-        // 关掉时间窗，于是删除没生效、后续时间点也不再重试，用户看到的仍然是成对符号。
-        // 现在只有复读确认目标字符消失才算成功；没删掉就保留时间窗继续试。
-        val stillAfter = runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull()
-        val gone = stillAfter == null || stillAfter.isEmpty() || stillAfter[0] != target
-        log(
-            "quote-pair: removed auto-inserted closing symbol '" + describe(target) +
-                "' (source=" + source + ", branch=" + branch +
-                ", total=" + fixCount + ", verifiedGone=" + gone + ")"
-        )
-        if (gone) lastPairCommitAt = 0L
     }
-
-    private fun deleteSurrounding(ic: InputConnection, before: Int, after: Int): Boolean =
-        runCatching { ic.deleteSurroundingText(before, after) }.getOrDefault(false)
 
     /** 只输出可读字符；引号本身用码位标注，避免日志里出现成对引号引起歧义。 */
     private fun describe(c: Char): String = String(charArrayOf(c)) + " (U+" + String.format("%04X", c.code) + ")"

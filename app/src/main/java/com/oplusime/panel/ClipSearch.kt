@@ -28,6 +28,14 @@ import org.luckypray.dexkit.result.MethodData
 import java.util.Collections
 import java.util.WeakHashMap
 
+/** 剪贴板编辑返回时用于恢复原条目位置的稳定锚点。 */
+internal data class ClipboardRestoreAnchor(
+    val stableKey: String?,
+    val text: String?,
+    val position: Int,
+    val offset: Int,
+)
+
 /**
  * 剪贴板面板的「搜索」按钮与条目过滤。
  *
@@ -234,7 +242,181 @@ internal class ClipSearch(
     private val buttons: MutableMap<ViewGroup, View> =
         Collections.synchronizedMap(WeakHashMap())
 
-    /** 当前活动输入框只由宿主 Dialog 自身持有，不在输入法面板内叠加卡片。 */
+    /** 最近一次成功找到的剪贴板列表；面板关闭后按钮映射可能暂时被清掉，弱引用用于恢复路径。 */
+    @Volatile
+    private var clipboardListRef: java.lang.ref.WeakReference<View>? = null
+
+    /** 剪贴板页最近一次真实滚动位置；弹窗关闭后要恢复到编辑条目附近。 */
+    @Volatile
+    private var clipboardRestoreAnchor: ClipboardRestoreAnchor? = null
+
+    /** ClipboardEdit 在宿主编辑模板弹出前调用，保存条目与当前滚动锚点。 */
+    fun rememberEditingItem(item: Any?) = captureClipboardRestoreAnchor(item)
+
+    /** 由 ClipboardEdit 在打开编辑器前保存原条目锚点。 */
+    fun captureClipboardRestoreAnchor(item: Any?) {
+        val list = findLiveList(listId) ?: run {
+            log("clip-search: restore anchor capture skipped; live clipboard list unavailable")
+            return
+        }
+        clipboardListRef = java.lang.ref.WeakReference(list)
+        val position = findAdapterPosition(list, item).let { resolved ->
+            if (resolved >= 0) resolved else firstVisibleAdapterPosition(list)
+        }
+        val offset = targetVisibleOffset(list, position) ?: firstChildOffset(list)
+        val key = stableItemKey(item)
+        val text = itemText(item)
+        clipboardRestoreAnchor = ClipboardRestoreAnchor(key, text, position, offset)
+        log("clip-search: restore anchor captured key=${key ?: "<none>"} text=${text?.take(32) ?: "<none>"} position=$position offset=$offset")
+    }
+
+    /** 面板重开并填充后恢复原条目位置；优先稳定键/正文匹配，位置只作兜底。 */
+    private fun restoreClipboardRestoreAnchor() {
+        val anchor = clipboardRestoreAnchor ?: return
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val attempt = object : Runnable {
+            var count = 0
+            override fun run() {
+                count++
+                val list = findLiveList(listId)
+                val adapter = list?.let { adapterOf(it) }
+                if (list == null || adapter == null || adapterCount(adapter) == 0) {
+                    if (count < 20) handler.postDelayed(this, 150L) else {
+                        log("clip-search: restore anchor failed; list not ready after attempts=$count")
+                        clipboardRestoreAnchor = null
+                    }
+                    return
+                }
+                val resolved = findPositionByAnchor(adapter, anchor)
+                val position = resolved.takeIf { it >= 0 } ?: anchor.position.takeIf { it >= 0 }
+                if (position == null) {
+                    if (count < 20) handler.postDelayed(this, 150L) else {
+                        log("clip-search: restore anchor failed; no position key=${anchor.stableKey} text=${anchor.text?.take(32)}")
+                        clipboardRestoreAnchor = null
+                    }
+                    return
+                }
+                val applied = scrollListToPosition(list, position, anchor.offset)
+                log("clip-search: restore anchor attempt=$count position=$position matched=${resolved >= 0} offset=${anchor.offset} applied=$applied")
+                if (!applied && count < 20) {
+                    handler.postDelayed(this, 150L)
+                    return
+                }
+                clipboardRestoreAnchor = null
+            }
+        }
+        handler.post(attempt)
+    }
+
+    private fun adapterOf(list: View): Any? = runCatching {
+        list.javaClass.methods.firstOrNull {
+            it.name == "getAdapter" && it.parameterTypes.isEmpty()
+        }?.apply { isAccessible = true }?.invoke(list)
+            ?: Reflect.readObject(list, "mAdapter")
+    }.getOrNull()
+
+    private fun adapterCount(adapter: Any): Int = runCatching {
+        adapter.javaClass.methods.firstOrNull {
+            it.name == "getItemCount" && it.parameterTypes.isEmpty()
+        }?.apply { isAccessible = true }?.invoke(adapter) as? Int ?: 0
+    }.getOrDefault(0)
+
+    private fun childViews(list: View): List<View> = runCatching {
+        val count = list.javaClass.methods.firstOrNull {
+            it.name == "getChildCount" && it.parameterTypes.isEmpty()
+        }?.apply { isAccessible = true }?.invoke(list) as? Int ?: 0
+        val getter = list.javaClass.methods.firstOrNull {
+            it.name == "getChildAt" && it.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
+        }?.apply { isAccessible = true } ?: return@runCatching emptyList()
+        (0 until count).mapNotNull { index -> getter.invoke(list, index) as? View }
+    }.getOrDefault(emptyList())
+
+    private fun childAdapterPosition(list: View, child: View): Int = runCatching {
+        list.javaClass.methods.firstOrNull {
+            it.name == "getChildAdapterPosition" && it.parameterTypes.size == 1
+        }?.apply { isAccessible = true }?.invoke(list, child) as? Int ?: -1
+    }.getOrDefault(-1)
+
+    private fun firstVisibleAdapterPosition(list: View): Int =
+        childViews(list).firstNotNullOfOrNull { childAdapterPosition(list, it).takeIf { p -> p >= 0 } } ?: -1
+
+    private fun targetVisibleOffset(list: View, position: Int): Int? =
+        childViews(list).firstOrNull { childAdapterPosition(list, it) == position }?.top
+
+    private fun scrollListToPosition(list: View, position: Int, offset: Int): Boolean {
+        return runCatching {
+            val manager = list.javaClass.methods.firstOrNull {
+                it.name == "getLayoutManager" && it.parameterTypes.isEmpty()
+            }?.apply { isAccessible = true }?.invoke(list) ?: return@runCatching false
+            val withOffset = manager.javaClass.methods.firstOrNull {
+                it.name == "scrollToPositionWithOffset" && it.parameterTypes.size == 2
+            }?.apply { isAccessible = true }
+            if (withOffset != null) {
+                withOffset.invoke(manager, position, offset)
+                true
+            } else {
+                val plain = manager.javaClass.methods.firstOrNull {
+                    it.name == "scrollToPosition" && it.parameterTypes.size == 1
+                }?.apply { isAccessible = true } ?: return@runCatching false
+                plain.invoke(manager, position)
+                true
+            }
+        }.onFailure { log("clip-search: restore scroll failed: ${it.message}") }.getOrDefault(false)
+    }
+
+    private fun findAdapterPosition(list: View, item: Any?): Int {
+        val adapter = adapterOf(list) ?: return -1
+        if (item == null) return firstVisibleAdapterPosition(list)
+        val count = adapterCount(adapter)
+        val key = stableItemKey(item)
+        for (index in 0 until count) {
+            val candidate = runCatching { readItem(adapter, index) }.getOrNull()
+            if (candidate === item || (key != null && key == stableItemKey(candidate))) return index
+            if (itemText(item) != null && itemText(item) == itemText(candidate)) return index
+        }
+        return -1
+    }
+
+    private fun findPositionByAnchor(adapter: Any, anchor: ClipboardRestoreAnchor): Int {
+        val count = adapterCount(adapter)
+        for (index in 0 until count) {
+            val candidate = runCatching { readItem(adapter, index) }.getOrNull()
+            if (anchor.stableKey != null && anchor.stableKey == stableItemKey(candidate)) return index
+            if (anchor.text != null && anchor.text == itemText(candidate)) return index
+        }
+        return -1
+    }
+
+    private fun firstChildOffset(list: View): Int = childViews(list).firstOrNull()?.top ?: 0
+
+    private fun stableItemKey(item: Any?): String? {
+        if (item == null) return null
+        val entity = unwrapEntityForAnchor(item) ?: return null
+        val fields = entity.javaClass.declaredFields
+        val id = fields.firstOrNull { !java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+            (it.type == Long::class.javaPrimitiveType || it.type == Int::class.javaPrimitiveType || it.type == String::class.java) &&
+            it.name.contains("id", ignoreCase = true)
+        } ?: return null
+        return runCatching { id.isAccessible = true; "${entity.javaClass.name}:${id.get(entity)}" }.getOrNull()
+    }
+
+    private fun itemText(item: Any?): String? {
+        val entity = unwrapEntityForAnchor(item) ?: return null
+        return entity.javaClass.declaredFields.firstOrNull {
+            !java.lang.reflect.Modifier.isStatic(it.modifiers) && it.type == String::class.java &&
+                (it.name.contains("text", true) || it.name.contains("content", true) || it.name == "c")
+        }?.let { runCatching { it.isAccessible = true; it.get(entity) as? String }.getOrNull() }
+    }
+
+    private fun unwrapEntityForAnchor(item: Any?): Any? {
+        if (item == null) return null
+        val entityName = item.javaClass.declaredFields.firstOrNull { field ->
+            !java.lang.reflect.Modifier.isStatic(field.modifiers) &&
+                field.type.declaredFields.any { it.type == String::class.java }
+        } ?: return item
+        return runCatching { entityName.isAccessible = true; entityName.get(item) }.getOrNull() ?: item
+    }
+
 
     // ------------------------------------------------------------------ UI
 
@@ -322,11 +504,32 @@ internal class ClipSearch(
     private var pageZeroIsClipboard: Boolean? = null
 
     /** 宿主页状态变化（分段按钮被点）时立刻按新状态重算所有面板。 */
+    /**
+     * 编辑/搜索模板关闭后，强制回到剪贴板页。
+     *
+     * 宿主常用语编辑器的关闭链会重置自己的分段状态；剪贴板编辑虽然复用了同一个
+     * 模板，但来源页仍然是剪贴板，因此不能只释放输入焦点，必须重新打开宿主的
+     * BOX_CLIP 页面。延迟一拍是为了让宿主 close chain 先完成，避免它随后把我们的
+     * 选择再次覆盖成常用语页。
+     */
+    fun returnToClipboard() {
+        currentPage = Page.CLIPBOARD
+        val opened = runCatching { openPanel?.invoke(BOX_CLIP) == true }.getOrDefault(false)
+        log("clip-search: returnToClipboard requested opened=$opened")
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            currentPage = Page.CLIPBOARD
+            onHostPageChanged()
+            log("clip-search: returnToClipboard reconciled currentPage=$currentPage")
+            restoreClipboardRestoreAnchor()
+        }, 180L)
+    }
+
     fun onHostPageChanged() {
         knownPanels.toList().forEach { panel ->
             runCatching { syncButtonVisibility(panel) }
         }
     }
+
 
     private fun isOnClipboardPage(panel: ViewGroup): Boolean {
         val hint = pageHints[panel]
@@ -1141,7 +1344,11 @@ internal class ClipSearch(
         (anchor.rootView as? ViewGroup)?.let { lastRoot = java.lang.ref.WeakReference(it) }
         val shown = HostPhraseEditor.show(
             anchor, "搜索", currentKeyword().orEmpty(), registerInputTarget,
-            onConfirm = { applyKeyword(it, page) },
+            onConfirm = { value, complete ->
+                runCatching { applyKeyword(value, page) }
+                    .onSuccess { complete(null) }
+                    .onFailure { complete(it) }
+            },
             onClose = { finishDialogSearch(page, "native-close") },
         )
         if (!shown) log("clip-search: native editor unavailable; no custom dialog fallback")
@@ -1342,9 +1549,15 @@ internal class ClipSearch(
      */
     private fun findLiveList(targetId: Int): View? {
         val candidates = ArrayList<View?>()
+        candidates.add(clipboardListRef?.get())
         candidates.add(runCatching { lastRoot?.get()?.findViewById<View>(targetId) }.getOrNull())
         synchronized(buttons) {
             buttons.keys.forEach { panel ->
+                candidates.add(runCatching { panel.findViewById<View>(targetId) }.getOrNull())
+            }
+        }
+        synchronized(knownPanels) {
+            knownPanels.forEach { panel ->
                 candidates.add(runCatching { panel.findViewById<View>(targetId) }.getOrNull())
             }
         }
@@ -1352,6 +1565,7 @@ internal class ClipSearch(
         candidates.forEach { view ->
             if (view == null) return@forEach
             if (!view.isAttachedToWindow) return@forEach
+            if (targetId == listId) clipboardListRef = java.lang.ref.WeakReference(view)
             if (view.isShown) return view
             if (fallback == null) fallback = view
         }

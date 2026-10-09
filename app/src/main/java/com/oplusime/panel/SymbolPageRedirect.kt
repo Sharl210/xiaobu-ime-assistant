@@ -27,6 +27,33 @@ internal object SymbolPageRedirect {
     private var symbolSwitchMethod: Method? = null
     private val opening = ThreadLocal<Boolean>()
     private var apiHookCount = 0
+    @Volatile private var variantHookCount = 0
+    @Volatile private var publicApiHookCount = 0
+    @Volatile private var publicApiMethodCount = 0
+    private val variantMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val publicApiMatchSignatures = java.util.concurrent.ConcurrentHashMap<String, MutableList<String>>()
+
+    fun publishDiagnostics() {
+        HookDiagnostics.recordMatch(
+            "符号完整页:键盘分支",
+            variantMatchSignatures,
+            "候选数量=${variantMatchSignatures.size}；运行时 hook 数量=$variantHookCount",
+        )
+        val apiNames = listOf("showSymbolsView", "showSymbolsViewWithLockSelect")
+        apiNames.forEach { apiName ->
+            HookDiagnostics.recordMatch(
+                "符号完整页:公开API:$apiName",
+                publicApiMatchSignatures[apiName].orEmpty(),
+                "公开 API 只按实现方法是否被 DexKit 找到判定",
+            )
+        }
+        val allApi = apiNames.flatMap { publicApiMatchSignatures[it].orEmpty() }
+        HookDiagnostics.recordMatch(
+            "符号完整页:公开API",
+            allApi,
+            "实现方法总数=${allApi.size}；运行时 hook 数量=$publicApiHookCount",
+        )
+    }
 
     fun install(bridge: DexKitBridge, loader: ClassLoader) {
         runCatching {
@@ -184,6 +211,9 @@ internal object SymbolPageRedirect {
                     p[1] == Boolean::class.javaPrimitiveType &&
                     method.returnType == Boolean::class.javaPrimitiveType
             }
+            variantHookCount = variantMethods.size
+            variantMatchSignatures.clear()
+            variantMatchSignatures.addAll(variantMethods.map { it.toGenericString() })
             variantMethods.distinctBy { it.toGenericString() }.forEach { variant ->
                 variant.isAccessible = true
                 XposedBridge.hookMethod(variant, object : XC_MethodHook(100) {
@@ -211,6 +241,11 @@ internal object SymbolPageRedirect {
             }
             log("symbol-page: variant hooks=${variantMethods.size}; candidates=" +
                 holder.declaredMethods.filter { it.parameterTypes.size == 2 }.joinToString { it.toGenericString() })
+            HookDiagnostics.recordMatch(
+                "符号完整页:键盘分支",
+                variantMatchSignatures,
+                "按枚举参数+boolean+boolean 返回形状匹配；候选数量=${variantMethods.size}",
+            )
             // 宿主公开 API 本身已经调用完整入口；这里只记录实际命中，方便诊断页显示调用覆盖。
             //
             // 注意：`IInputApi` 里的这两个方法是**接口抽象方法**，直接 hook 会报
@@ -239,12 +274,33 @@ internal object SymbolPageRedirect {
                         hooked++
                     }.onFailure { log("symbol-page: public API hook failed name=$apiName error=${it.message}") }
                 }
-                log("symbol-page: public API $apiName hooks=$hooked")
+                val apiSignatures = methods.map { it.toGenericString() }.distinct()
+                publicApiMatchSignatures[apiName] = apiSignatures.toMutableList()
+                publicApiMethodCount += methods.size
+                publicApiHookCount += hooked
+                log("symbol-page: public API $apiName hooks=$hooked matches=${apiSignatures.size}")
+                HookDiagnostics.recordMatch(
+                    "符号完整页:公开API:$apiName",
+                    apiSignatures,
+                    if (apiSignatures.isEmpty()) "宿主版本没有可挂载的该公开 API 实现" else "实现方法已解析；运行时 hook 数量=$hooked",
+                )
             }
+            HookDiagnostics.recordMatch(
+                "符号完整页:公开API",
+                publicApiMatchSignatures.values.flatten(),
+                if (publicApiMethodCount == 0) "宿主版本没有可挂载的公开符号 API；完整入口仍已解析"
+                else "实现方法总数=$publicApiMethodCount；运行时 hook 数量=$publicApiHookCount",
+            )
 
             HookDiagnostics.record(null, "符号完整页入口", true,
                 "full=${full.declaringClass.name}#${full.name}; apiHooks=$apiHookCount")
         }.onFailure {
+            listOf(
+                "符号完整页:键盘分支",
+                "符号完整页:公开API",
+                "符号完整页:公开API:showSymbolsView",
+                "符号完整页:公开API:showSymbolsViewWithLockSelect",
+            ).forEach { name -> HookDiagnostics.record(null, name, false, "install failed: ${it.message}") }
             HookDiagnostics.record(null, "符号完整页入口", false, it.message.orEmpty())
             log("symbol-page: unified entry resolution failed: ${it.cause ?: it}")
         }

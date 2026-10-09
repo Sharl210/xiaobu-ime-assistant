@@ -61,6 +61,11 @@ internal class HostTweaks(
     @Volatile
     private var closeReported = false
 
+    /** HostTweaks 自身没有 DexKit 专属匹配点，保留结构用于后续诊断扩展。 */
+    private val diagnosticMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    fun diagnosticSignatures(): List<String> = diagnosticMatchSignatures.distinct()
+
     fun install() {
         hookCounterFormatting()
         hookEnterTitle()

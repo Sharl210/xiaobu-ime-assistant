@@ -9,8 +9,6 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Path
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffColorFilter
 import android.view.View
 import android.widget.Toast
 import de.robv.android.xposed.XC_MethodHook
@@ -135,27 +133,53 @@ internal object SoftKeySwipeMap {
     @Volatile
     private var contextRef: android.content.Context? = null
 
-    /** 百度定制版 `more.png` 精灵图：IMG2=英文联想关，IMG3=英文联想开。 */
+    /** 英文候选键的原始黑色符号图，仅绘制黑色，不读取或维护颜色状态。 */
     @Volatile
-    private var baiduMoreBitmap: Bitmap? = null
-
+    private var candidateIcon: Bitmap? = null
     @Volatile
-    private var baiduMoreLoadAttempted = false
-
-    private val baiduMorePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-
-    /** 百度资源表 more.til 中 IMG2 / IMG3 的源矩形。 */
-    private val BAIDU_MORE_OFF = Rect(139, 0, 163, 31)
-    private val BAIDU_MORE_ON = Rect(115, 0, 139, 31)
+    private var candidateIconLoadAttempted = false
+    private val candidateIconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val candidateIconSource = Rect(139, 0, 163, 31)
 
     /** 标记这个 SoftKey 已经被我们按当前语言刷过，避免每帧重复写。 */
     private const val TAG_LANG: String = "oplusime.swipe.lang"
+
+    @Volatile
+    private var drawHookCount: Int = 0
+    @Volatile
+    private var remoteProviderHooked = false
+    @Volatile
+    private var hostInputConnectionHookCount = 0
+    @Volatile
+    private var internalCommitHookCount = 0
+    @Volatile
+    private var remoteProviderSignature: String? = null
+    private val drawMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val hostInputMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val internalCommitMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
 
     @Volatile
     private var installed = false
 
     @Volatile
     private var hostClassLoader: ClassLoader? = null
+
+    /** 安装阶段结束后补交各个独立子挂点的真实数量，避免只记录总入口。 */
+    fun publishDiagnostics() {
+        HookDiagnostics.recordMatch("上滑键位绘制:绘制入口", drawMatchSignatures,
+            "SoftKey 绘制规则匹配；运行时 hook 数量=$drawHookCount")
+        HookDiagnostics.recordMatch("上滑动作:远程输入连接",
+            listOfNotNull(remoteProviderSignature),
+            "InputMethodService#getCurrentInputConnection 运行时提供者入口")
+        HookDiagnostics.recordMatch("上滑动作:宿主输入连接", hostInputMatchSignatures,
+            "InputConnection 实现类的方法规则匹配；运行时类 hook 数量=$hostInputConnectionHookCount")
+        HookDiagnostics.recordMatch("上滑动作:内部提交出口", internalCommitMatchSignatures,
+            "(int, CharSequence) 提交出口规则匹配；运行时 hook 数量=$internalCommitHookCount")
+        HookDiagnostics.recordMatch("英文候选:读取器", listOfNotNull(flagReader?.toGenericString()),
+            "key_en_predict 读取方法已解析")
+        HookDiagnostics.recordMatch("英文候选:写入器", listOfNotNull(flagWriter?.toGenericString()),
+            "key_en_predict 写入方法已解析")
+    }
 
     /** 安装时拿到的 DexKit 桥（定位设置读写入口时复用）。 */
     @Volatile
@@ -174,8 +198,6 @@ internal object SoftKeySwipeMap {
         resolveFlagAccessors()
         // 输入法换 input view（语音/手写全屏等）时把自绘图标收干净；
         // 语音面板不会 detach 键盘视图，只靠可见性巡检会漏（真机已见）。
-        runCatching { SwipeIconLayer.install(hostClassLoader) }
-            .onFailure { log("swipe-map: swipe-icon install failed: ${it.message}") }
         installDrawHook(bridge, hostClassLoader)
         installMarkTypography(bridge, hostClassLoader)
         installReturnDrawing()
@@ -231,7 +253,14 @@ internal object SoftKeySwipeMap {
                 },
             )
             log("swipe-map: remote IC provider hooked")
-        }.onFailure { log("swipe-map: remote IC provider hook failed: ${it.message}") }
+            remoteProviderHooked = true
+            remoteProviderSignature = "${serviceClass.name}#getCurrentInputConnection():android.view.inputmethod.InputConnection"
+        HookDiagnostics.recordMatch("上滑动作:远程输入连接", listOf(remoteProviderSignature!!),
+            "提供者入口已由反射解析；实例方法在运行时首次返回时再挂载")
+        }.onFailure {
+            HookDiagnostics.record(null, "上滑动作:远程输入连接", false, "provider hook failed: ${it.message}")
+            log("swipe-map: remote IC provider hook failed: ${it.message}")
+        }
 
         // ② 宿主自己的 InputConnection 实现（不经框架代理的那条）。
         runCatching {
@@ -242,6 +271,7 @@ internal object SoftKeySwipeMap {
                     returnType("boolean")
                 }
             }?.toList().orEmpty()
+            hostInputMatchSignatures.clear()
             var count = 0
             candidates.forEach { data ->
                 val owner = data.declaredClassName ?: return@forEach
@@ -249,22 +279,51 @@ internal object SoftKeySwipeMap {
                 val cls = runCatching { Class.forName(owner, false, hostClassLoader) }.getOrNull()
                     ?: return@forEach
                 if (!icClass.isAssignableFrom(cls)) return@forEach
+                runCatching { data.getMethodInstance(hostClassLoader) }
+                    .getOrNull()
+                    ?.let { hostInputMatchSignatures.add(HookDiagnostics.methodSignature(it)) }
                 if (!hookedIcClasses.add(cls.name)) return@forEach
                 hookIc(cls, null)
                 count++
             }
             log("swipe-map: host IC impl classes hooked=$count")
-        }.onFailure { log("swipe-map: host IC impl scan failed: ${it.message}") }
+            hostInputConnectionHookCount = count
+        HookDiagnostics.recordMatch("上滑动作:宿主输入连接", hostInputMatchSignatures,
+            "规则候选数量=${hostInputMatchSignatures.size}；运行时类 hook 数量=$count")
+
+        }.onFailure {
+            HookDiagnostics.record(null, "上滑动作:宿主输入连接", false, "scan failed: ${it.message}")
+            log("swipe-map: host IC impl scan failed: ${it.message}")
+        }
 
         // ③ 宿主内部的"提交文本"汇聚点：静态 `(int, CharSequence) -> boolean`
         //    宿主自己的日志串就是 "commitInternalText text="，说明这是内部提交入口。
         runCatching {
-            val candidates: List<MethodData> = bridgeRef?.findMethod {
-                matcher {
-                    paramTypes("int", "java.lang.CharSequence")
-                    returnType("boolean")
-                }
-            }?.toList().orEmpty()
+            val booleanCandidates = runCatching {
+                bridgeRef?.findMethod {
+                    matcher {
+                        paramTypes("int", "java.lang.CharSequence")
+                        returnType("boolean")
+                    }
+                }?.toList().orEmpty()
+            }.getOrDefault(emptyList())
+            val voidCandidates = runCatching {
+                bridgeRef?.findMethod {
+                    matcher {
+                        paramTypes("int", "java.lang.CharSequence")
+                        returnType("void")
+                        addInvoke("Landroid/view/inputmethod/InputConnection;->commitText(Ljava/lang/CharSequence;I)Z")
+                    }
+                }?.toList().orEmpty()
+            }.getOrDefault(emptyList())
+            val candidates = (booleanCandidates + voidCandidates).distinctBy {
+                "${it.declaredClassName}#${it.name}#${it.paramTypeNames.joinToString(",")}"
+            }
+            val matchedMethods = candidates.mapNotNull { data ->
+                runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+            }
+            internalCommitMatchSignatures.clear()
+            internalCommitMatchSignatures.addAll(matchedMethods.map { HookDiagnostics.methodSignature(it) })
             var count = 0
             candidates.forEach { data ->
                 val method = runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
@@ -283,7 +342,13 @@ internal object SoftKeySwipeMap {
                 }
             }
             log("swipe-map: internal commit hooks=$count")
-        }.onFailure { log("swipe-map: internal commit hook failed: ${it.message}") }
+            internalCommitHookCount = count
+            HookDiagnostics.recordMatch("上滑动作:内部提交出口", internalCommitMatchSignatures,
+                "规则候选数量=${internalCommitMatchSignatures.size}；运行时 hook 数量=$count")
+        }.onFailure {
+            HookDiagnostics.record(null, "上滑动作:内部提交出口", false, "scan failed: ${it.message}")
+            log("swipe-map: internal commit hook failed: ${it.message}")
+        }
     }
 
     /** 文本是不是英文逗号上滑那枚标记（容忍首尾空白）。 */
@@ -374,6 +439,8 @@ internal object SoftKeySwipeMap {
      */
     private fun installDrawHook(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         val entityName = resolveSoftKeyClass(bridge, hostClassLoader) ?: run {
+            HookDiagnostics.record(null, "上滑键位绘制:绘制入口", false, "SoftKey class unresolved")
+            HookDiagnostics.record(null, "上滑键位绘制", false, "SoftKey class unresolved")
             log("swipe-map: SoftKey class unresolved; swipe map keeps host behaviour")
             return
         }
@@ -387,6 +454,11 @@ internal object SoftKeySwipeMap {
         }.onFailure { log("swipe-map: query failed: ${it.message}") }
             .getOrDefault(emptyList())
         log("swipe-map: draw candidates=${candidates.size} entity=$entityName")
+        drawMatchSignatures.clear()
+        drawMatchSignatures.addAll(candidates.mapNotNull { data ->
+            runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?.let { HookDiagnostics.methodSignature(it) }
+        })
 
         var hooks = 0
         candidates.forEach { candidate ->
@@ -400,6 +472,11 @@ internal object SoftKeySwipeMap {
                         // 只有实例方法（宿主 `f(Canvas, SoftKey)` / `g(Canvas, SoftKey)`）才动手。
                         val view = param.thisObject as? View ?: return
                         val key = param.args?.getOrNull(1) ?: return
+                        val previousView = lastKeyboardView?.get()
+                        if (previousView != null && previousView !== view) {
+                            appliedLang.clear()
+                            lastLang = null
+                        }
                         param.setObjectExtra("oplusime.draw.previous.key", drawingKey.get())
                         param.setObjectExtra("oplusime.draw.previous.view", drawingView.get())
                         drawingKey.set(key)
@@ -409,12 +486,13 @@ internal object SoftKeySwipeMap {
                         applyLang(view, key)
                     }
 
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val view = param.thisObject as? View ?: return
-                        val canvas = param.args?.getOrNull(0) as? Canvas ?: return
-                        val key = param.args?.getOrNull(1) ?: return
-                        drawBaiduSuggestionIcon(view, canvas, key)
-                        drawingKey.set(param.getObjectExtra("oplusime.draw.previous.key"))
+                    override fun afterHookedMethod(param: XC_MethodHook.MethodHookParam) {
+                        val view = param.thisObject as? View
+                        val canvas = param.args?.getOrNull(0) as? Canvas
+                        val key = param.args?.getOrNull(1)
+                        if (view != null && canvas != null && key != null) {
+                            drawEnglishCandidateSymbol(view, canvas, key)
+                        }
                         drawingView.set(param.getObjectExtra("oplusime.draw.previous.view") as? View)
                     }
                 })
@@ -426,7 +504,18 @@ internal object SoftKeySwipeMap {
             }.onFailure { log("swipe-map: draw hook failed: ${it.message}") }
         }
         installed = true
+        drawHookCount = hooks
         log("swipe-map: installed hooks=$hooks")
+        HookDiagnostics.recordMatch(
+            "上滑键位绘制:绘制入口",
+            drawMatchSignatures,
+            "SoftKey 绘制规则匹配；运行时 hook 数量=$hooks；entity=$entityName",
+        )
+        HookDiagnostics.recordMatch(
+            "上滑键位绘制",
+            drawMatchSignatures,
+            "绘制入口结构匹配；语言映射与英文候选黑色符号绘制在该入口执行",
+        )
     }
 
     /**
@@ -461,7 +550,7 @@ internal object SoftKeySwipeMap {
                 override fun onViewAttachedToWindow(v: View) = Unit
 
                 override fun onViewDetachedFromWindow(v: View) {
-                    SwipeIconLayer.clear("keyboard detached")
+                    // 不再维护英文候选图标覆盖层或颜色状态。
                 }
             })
         }.onFailure { log("swipe-map: attach-state listener failed: ${it.message}") }
@@ -473,95 +562,51 @@ internal object SoftKeySwipeMap {
      * 资源已经随模块打包进 `assets/baidu_more.png`；运行时不能依赖设备安装百度输入法，
      * 因为百度 APK 只是取证来源，不是目标设备的运行时依赖。
      */
-    private fun drawBaiduSuggestionIcon(view: View, canvas: Canvas, key: Any) {
-        runCatching {
-            if (resolveLang(view) != "en") {
-                // 非英文页没有这枚「英文候选」图标。必须在这里把它收掉：
-                // 1.33.31 的"图标像披在输入法上、切页都不消失"就是因为在中文页
-                // 也照同一个键位坐标画了一次。判页用宿主自己报的键盘类型，不靠心跳。
-                SwipeIconLayer.clear("non-english-page")
-                return
-            }
-            val text = readString(key, "s") ?: return
-            if (text != "," && text != "\uFF0C") return
-            val bitmap = loadBaiduMoreBitmap() ?: return
-            val enabled = readFlag() == true
-            val src = if (enabled) BAIDU_MORE_ON else BAIDU_MORE_OFF
+    // 英文候选图标不再由模块绘制。宿主原始图标保持原样，模块只负责开关功能和提示。
 
-            // 复用宿主 SoftKey 自己的四个边界字段，不能按整个键盘 View 的比例猜坐标。
-            // 宿主 `s.g(Canvas, SoftKey)` 也正是用 b/d/c/e 设置键面边界。
-            val bounds = boundsOf(key) ?: return
-            val left = bounds.left
-            val top = bounds.top
-            val right = bounds.right
-            val bottom = bounds.bottom
-            val keyWidth = (right - left).coerceAtLeast(1)
-            val keyHeight = (bottom - top).coerceAtLeast(1)
-            val iconWidth = (keyWidth * 0.25f).toInt().coerceAtLeast(16)
-            val iconHeight = (iconWidth * 31f / 24f).toInt().coerceAtLeast(20)
-            val dstLeft = left + (keyWidth - iconWidth) / 2
-            val dstTop = top + (keyHeight * 0.08f).toInt()
-            val dst = Rect(dstLeft, dstTop, dstLeft + iconWidth, dstTop + iconHeight)
-            baiduMorePaint.colorFilter = PorterDuffColorFilter(
-                if (enabled) android.graphics.Color.rgb(10, 89, 247) else android.graphics.Color.BLACK,
-                PorterDuff.Mode.SRC_IN,
-            )
-            canvas.drawBitmap(bitmap, src, dst, baiduMorePaint)
-            // 同步到**自有覆盖层**：真机日志证明宿主收到 invalidate() 后并不会重画键面，
-            // 所以"上滑之后图标立刻变色"只能由我们这一层保证（详见 SwipeIconLayer 注释）。
-            val location = IntArray(2)
-            view.getLocationInWindow(location)
-            SwipeIconLayer.update(
-                view,
-                SwipeIconLayer.Spec(
-                    bitmap = bitmap,
-                    src = Rect(src),
-                    dst = Rect(
-                        dst.left + location[0],
-                        dst.top + location[1],
-                        dst.right + location[0],
-                        dst.bottom + location[1],
-                    ),
-                    keyboard = Rect(
-                        location[0],
-                        location[1],
-                        location[0] + view.width,
-                        location[1] + view.height,
-                    ),
-                ),
-                enabled,
-            )
-            log(
-                "swipe-map: baidu dictionary icon draw" +
-                    " state=${if (enabled) "ON_BLUE" else "OFF_BLACK"}" +
-                    " setting=${readFlagSnapshot()}" +
-                    " src=${src.left},${src.top},${src.right},${src.bottom}" +
-                    " dst=${dst.left},${dst.top},${dst.right},${dst.bottom}" +
-                    " keyBounds=$left,$top,$right,$bottom" +
-                    " keySize=${keyWidth}x${keyHeight}"
-            )
-        }.onFailure { log("swipe-map: baidu icon draw failed: ${it.message}") }
+    /** 绘制英文页逗号键的原始黑色候选符号；不依赖开关，也不改变 keyMark。 */
+    private fun drawEnglishCandidateSymbol(view: View, canvas: Canvas, key: Any) {
+        if (resolveLang(view) != "en") return
+        val text = readString(key, "s") ?: return
+        if (text != "," && text != "\uFF0C") return
+        val bitmap = loadCandidateIcon() ?: return
+        val bounds = boundsOf(key) ?: return
+        val width = (bounds.width() * 0.25f).toInt().coerceAtLeast(16)
+        val height = (width * candidateIconSource.height() / candidateIconSource.width())
+            .coerceAtLeast(20)
+        val dst = Rect(
+            bounds.left + (bounds.width() - width) / 2,
+            bounds.top + (bounds.height() * 0.08f).toInt(),
+            bounds.left + (bounds.width() - width) / 2 + width,
+            bounds.top + (bounds.height() * 0.08f).toInt() + height,
+        )
+        candidateIconPaint.colorFilter = null
+        candidateIconPaint.alpha = 255
+        canvas.drawBitmap(bitmap, candidateIconSource, dst, candidateIconPaint)
+        logThrottled("candidate-symbol", 3000L) {
+            "swipe-map: english candidate symbol drawn black dst=${dst.left},${dst.top},${dst.right},${dst.bottom}"
+        }
     }
 
-    private fun loadBaiduMoreBitmap(): Bitmap? {
-        if (baiduMoreLoadAttempted) return baiduMoreBitmap
+    private fun loadCandidateIcon(): Bitmap? {
+        candidateIcon?.let { return it }
+        if (candidateIconLoadAttempted) return null
         synchronized(this) {
-            if (baiduMoreLoadAttempted) return baiduMoreBitmap
-            baiduMoreLoadAttempted = true
-            baiduMoreBitmap = runCatching {
-                val moduleApk = HookEntry.modulePath
-                if (moduleApk.isBlank()) error("module APK path unavailable")
+            candidateIcon?.let { return it }
+            if (candidateIconLoadAttempted) return null
+            candidateIconLoadAttempted = true
+            candidateIcon = runCatching {
+                val path = HookEntry.modulePath
+                check(path.isNotBlank()) { "module APK path unavailable" }
                 val assets = AssetManager::class.java.getDeclaredConstructor()
-                    .apply { isAccessible = true }
-                    .newInstance()
+                    .apply { isAccessible = true }.newInstance()
                 val cookie = assets.javaClass.getMethod("addAssetPath", String::class.java)
-                    .invoke(assets, moduleApk) as? Number
-                if (cookie?.toInt() == 0) error("module asset path rejected")
+                    .invoke(assets, path) as? Number
+                check(cookie?.toInt() != 0) { "module asset path rejected" }
                 assets.open("baidu_more.png").use(BitmapFactory::decodeStream)
-            }.onFailure {
-                log("swipe-map: bundled baidu more.png unavailable: ${it.message}")
-            }.getOrNull()
-            return baiduMoreBitmap
+            }.onFailure { logCritical("swipe-map: candidate symbol load failed: ${it.message}") }
+                .getOrNull()
+            return candidateIcon
         }
     }
 
@@ -594,14 +639,10 @@ internal object SoftKeySwipeMap {
             // 「中文模式下它是对应的一个符号（感叹号），并不是开启候选的一个功能」。
             // 判据必须以**当前页面语言**为准，不能看字符本身。
             if (lang == "en" && (ch == ',' || ch == '\uFF0C')) {
-                val on = readFlag() ?: false
-                mapped = if (on) EN_SUGGEST_MARK_ON else EN_SUGGEST_MARK_OFF
-                log(
-                    "swipe-map: apply comma lang=en keyText=$ch" +
-                        " rawMark=${readString(key, "t") ?: "<null>"}" +
-                        " mappedMarker=${mapped.codePoints().toArray().joinToString(",")}" +
-                        " englishSuggestion=$on"
-                )
+                mapped = EN_SUGGEST_MARK_OFF
+                logThrottled("candidate-marker", 3000L) {
+                    "swipe-map: english candidate marker retained for action key; symbol is drawn black"
+                }
             } else if (lang != "en" && (mapped == "\uFF01" || mapped == "!")) {
                 log(
                     "swipe-map: apply exclamation lang=$lang keyText=$ch" +
@@ -636,7 +677,10 @@ internal object SoftKeySwipeMap {
         // 把类型名交给键盘切换器：返回主键盘、以及"重切当前页让设置生效"都要用它。
         (view as? View)?.let { HostKeyboardSwitch.rememberKeyboardType(it, name) }
         val lang = if (name.startsWith("QWERTY_EN")) "en" else "zh"
-        if (lang != lastLang) lastLang = lang
+        if (lang != lastLang) {
+            appliedLang.clear()
+            lastLang = lang
+        }
         return lang
     }
 
@@ -979,32 +1023,11 @@ internal object SoftKeySwipeMap {
         val written = writeFlag(next, context)
         val actual = readFlag()
         val ok = written && actual == next
-        // 颜色始终服从实际读回结果，即使写入失败也不保留虚假的期望状态。
         if (actual != null) {
-            flagOverride = actual
-            scheduleIconRefresh(actual)
-            SwipeIconLayer.setEnabled(actual)
+            // 只更新宿主设置；不刷新、绘制或维护任何图标颜色状态。
         }
         log("swipe-map: candidates setting key=$KEY_EN_PREDICT before=$before requested=$next actual=$actual writeVerified=$ok after=${readFlagSnapshot()} keyboardSwitch=false")
         return ok
-    }
-
-    private fun scheduleIconRefresh(enabled: Boolean) {
-        appliedLang.clear()
-        val view = lastKeyboardView?.get() ?: return
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        val repaint = Runnable {
-            runCatching {
-                view.invalidate()
-                view.postInvalidateOnAnimation()
-                (view.rootView as? View)?.invalidate()
-                log("swipe-map: icon repaint enabled=$enabled")
-            }
-        }
-        repaint.run()
-        listOf(60L, 160L, 320L, 600L).forEach { delay ->
-            handler.postDelayed(repaint, delay)
-        }
     }
 
     /** 宿主设置读写入口（结构匹配结果，进程内缓存）。 */
@@ -1016,9 +1039,6 @@ internal object SoftKeySwipeMap {
 
     @Volatile
     private var flagResolved = false
-
-    @Volatile
-    private var flagOverride: Boolean? = null
 
     @Volatile
     private var candidateSettingGetter: java.lang.reflect.Method? = null
@@ -1059,9 +1079,28 @@ internal object SoftKeySwipeMap {
             flagReader = readerData.getMethodInstance(loader).apply { isAccessible = true }
             flagWriter = writerData.getMethodInstance(loader).apply { isAccessible = true }
             log("swipe-map: candidates accessors cached getter=$candidateSettingGetter writer=$flagWriter key=$KEY_EN_PREDICT")
-            HookDiagnostics.record(null, "英文候选读写", true,
-                "reader=${flagReader?.declaringClass?.name}#${flagReader?.name}; writer=${flagWriter?.declaringClass?.name}#${flagWriter?.name}")
-        }.onFailure { log("swipe-map: resolve settings accessors failed: ${it.message}") }
+            val readerSignature = flagReader?.let { HookDiagnostics.methodSignature(it) }
+            val writerSignature = flagWriter?.let { HookDiagnostics.methodSignature(it) }
+            HookDiagnostics.recordMatch(
+                "英文候选:读取器",
+                listOfNotNull(readerSignature),
+                "key_en_predict 读取规则已解析",
+            )
+            HookDiagnostics.recordMatch(
+                "英文候选:写入器",
+                listOfNotNull(writerSignature),
+                "key_en_predict 写入规则已解析",
+            )
+            HookDiagnostics.recordMatch(
+                "英文候选读写",
+                listOfNotNull(readerSignature, writerSignature),
+                "同一宿主设置助手的读取/写入方法已解析",
+            )
+        }.onFailure {
+            HookDiagnostics.record(null, "英文候选:读取器", false, "resolve failed: ${it.message}")
+            HookDiagnostics.record(null, "英文候选:写入器", false, "resolve failed: ${it.message}")
+            log("swipe-map: resolve settings accessors failed: ${it.message}")
+        }
         return flagReader != null && flagWriter != null
     }
 

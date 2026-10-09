@@ -13,6 +13,10 @@ internal object HostKeyboardSwitch {
     @Volatile private var switchMethod: Method? = null
     @Volatile private var apiInstance: Any? = null
     @Volatile private var resolved = false
+    @Volatile private var switchSignature: String? = null
+    @Volatile private var accessorSignature: String? = null
+
+    fun diagnosticSignatures(): List<String> = listOfNotNull(switchSignature, accessorSignature)
 
     /** 宿主 `KeyboardType` 枚举的全部常量名（默认打字页要从里面挑）。 */
     @Volatile private var typeNames: List<String> = emptyList()
@@ -148,6 +152,8 @@ internal object HostKeyboardSwitch {
             val switcher = switchData.getMethodInstance(loader).apply { isAccessible = true }
             switchMethod = switcher
             apiInstance = instance
+            switchSignature = HookDiagnostics.methodSignature(switcher)
+            accessorSignature = accessor?.let { HookDiagnostics.methodSignature(it) }
             resolved = true
             log(
                 "keyboard-switch: resolved owner=$ownerName" +

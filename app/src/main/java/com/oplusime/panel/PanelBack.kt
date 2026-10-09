@@ -19,9 +19,11 @@ internal object PanelState {
 
     private val panels = java.util.Collections.synchronizedMap(java.util.WeakHashMap<View, Boolean>())
     private var watchRunning = false
+    @Volatile private var lastRememberedAt: Long = 0L
     @Volatile var closePanel: (() -> Boolean)? = null
 
     fun remember(view: View) {
+        lastRememberedAt = android.os.SystemClock.uptimeMillis()
         if (panels.put(view, true) == null) {
             view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                 override fun onViewAttachedToWindow(v: View) {
@@ -50,6 +52,10 @@ internal object PanelState {
         panels.keys.any { it.isAttachedToWindow && it.isShown }
     }
 
+    fun wasShownRecently(windowMs: Long = 1800L): Boolean {
+        val at = lastRememberedAt
+        return at > 0L && android.os.SystemClock.uptimeMillis() - at <= windowMs
+    }
 }
 
 /**
@@ -65,6 +71,8 @@ internal object PanelBackRouter {
 
     @Volatile
     private var hookedCount = 0
+    private val onKeyDownMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val systemGestureMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
 
     @Volatile
     private var handledCount = 0
@@ -94,6 +102,13 @@ internal object PanelBackRouter {
         }
     }
 
+    fun publishDiagnostics() {
+        HookDiagnostics.recordMatch("返回键:宿主onKeyDown", onKeyDownMatchSignatures,
+            "InputMethodService 子类 onKeyDown 结构匹配；运行时 hook 数量=$hookedCount")
+        HookDiagnostics.recordMatch("返回键:系统手势", systemGestureMatchSignatures,
+            "系统返回生命周期/回调入口结构已解析")
+    }
+
     fun install(bridge: DexKitBridge, hostClassLoader: ClassLoader, backId: Int) {
         backViewId = backId
         installPerformClickHook()
@@ -111,6 +126,13 @@ internal object PanelBackRouter {
             }.toList()
         }.onFailure { log("panel-back: query failed: ${it.message}") }
             .getOrDefault(emptyList())
+
+        onKeyDownMatchSignatures.clear()
+        onKeyDownMatchSignatures.addAll(candidates.mapNotNull { data ->
+            runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+                ?.takeIf { InputMethodService::class.java.isAssignableFrom(it.declaringClass) }
+                ?.let { HookDiagnostics.methodSignature(it) }
+        })
 
         candidates.forEach { data ->
             val cls = runCatching { data.declaredClass?.getInstance(hostClassLoader) }.getOrNull()
@@ -131,6 +153,8 @@ internal object PanelBackRouter {
         }.onFailure { log("panel-back: base hook failed: ${it.message}") }
 
         log("panel-back: candidates=${candidates.size} hooks=$hookedCount")
+        HookDiagnostics.recordMatch("返回键:宿主onKeyDown", onKeyDownMatchSignatures,
+            "候选=${onKeyDownMatchSignatures.size}; 运行时 hook 数量=$hookedCount")
     }
 
     private fun returnToTypingPage(source: String): Boolean {
@@ -173,11 +197,41 @@ internal object PanelBackRouter {
             XposedBridge.hookAllMethods(InputMethodService::class.java, "registerDefaultOnBackInvokedCallback", lifecycle)
             XposedBridge.hookAllMethods(InputMethodService::class.java, "onWindowHidden", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    log("panel-back: window hidden; no re-show fallback panel=${PanelState.anyShown()}")
+                    val service = param.thisObject as? InputMethodService ?: return
+                    val panelWasVisible = PanelState.wasShownRecently()
+                    log("panel-back: window hidden; panelRecentlyVisible=$panelWasVisible")
+                    if (!panelWasVisible) return
+                    // Android 17 的边缘返回有时绕过 IME dispatcher，直接先隐藏窗口；
+                    // 这时前面的 callback/onKeyDown 都没有机会消费返回。恢复链必须在
+                    // onWindowHidden 之后补一次：先关闭宿主面板状态，再重新显示 IME，
+                    // 否则用户看到的就是“编辑页返回后输入法消失”。
+                    service.window?.window?.decorView?.post {
+                        val closed = runCatching { PanelState.closePanel?.invoke() == true }.getOrDefault(false)
+                        val shown = runCatching {
+                            service.showWindow(false)
+                            true
+                        }.getOrDefault(false)
+                        log("panel-back: hidden fallback restored closePanel=$closed showWindow=$shown")
+                        service.window?.window?.decorView?.postDelayed({
+                            syncPanelBackRegistration()
+                        }, 120L)
+                    }
                 }
             })
-            log("panel-back: direct IME back lifecycle installed")
-        }.onFailure { log("panel-back: direct back lifecycle failed ${it.message}") }
+            systemGestureMatchSignatures.clear()
+            systemGestureMatchSignatures.addAll(
+                listOf("onWindowShown", "onStartInputView", "onCreateInputView", "registerDefaultOnBackInvokedCallback", "onWindowHidden")
+                    .flatMap { name ->
+                        InputMethodService::class.java.methods.filter { it.name == name }
+                    }
+                    .map { HookDiagnostics.methodSignature(it) }
+            )
+            HookDiagnostics.recordMatch("返回键:系统手势", systemGestureMatchSignatures,
+                "API ${Build.VERSION.SDK_INT} 生命周期入口已解析；回调注册发生在运行时")
+        }.onFailure {
+            HookDiagnostics.record(null, "返回键:系统手势", false, it.message.orEmpty())
+            log("panel-back: direct back lifecycle failed ${it.message}")
+        }
     }
 
     private fun registerGestureCallback(service: InputMethodService) {

@@ -11,7 +11,6 @@ import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.ref.WeakReference
-import java.util.WeakHashMap
 
 /**
  * 让宿主自绘的候选拼音区域支持字符级光标定位。
@@ -31,7 +30,13 @@ internal object PinyinCursorEditor {
     @Volatile private var engineInstance: Any? = null
     private var engineSetInputMethod: Method? = null
     private var engineRawInputGetter: Method? = null
+    private var engineSetCaretPosMethod: Method? = null
+    private var engineEditCursorChangeMethod: Method? = null
+    private var kernelSetInputMethod: Method? = null
+    private var kernelEditCursorChangeMethod: Method? = null
     private var engineLockGetter: Method? = null
+    @Volatile private var stableProcessorHookInstalled = false
+    private val stableProcessorMatchSignatures = java.util.Collections.synchronizedList(mutableListOf<String>())
     private var textStartMethod: Method? = null
     private var textTopMethod: Method? = null
     private var decorationMethod: Method? = null
@@ -92,6 +97,11 @@ internal object PinyinCursorEditor {
     // 组合文本清空后同时释放显示下标与原始输入下标。
     @Volatile private var caretVisible: Boolean = true
     @Volatile private var blinkRunning: Boolean = false
+
+    fun publishDiagnostics() {
+        HookDiagnostics.recordMatch("候选拼音光标:真实编辑出口", stableProcessorMatchSignatures,
+            "处理器结构匹配；运行时 hook 已安装=$stableProcessorHookInstalled")
+    }
 
     fun install(bridge: DexKitBridge, loader: ClassLoader) {
         if (installed) return
@@ -312,6 +322,8 @@ internal object PinyinCursorEditor {
     }
 
     private fun resolveCompositionEditor(bridge: DexKitBridge, loader: ClassLoader) {
+        // 旧版可以从日志字符串反推调用图；新版去掉了这些字符串，因此最终以
+        // DexKit 的 engine_jni 语义锚点 + JNI 方法形状 + Kernel 锁/单例结构为准。
         runCatching {
             val processing = bridge.findMethod {
                 matcher {
@@ -324,24 +336,66 @@ internal object PinyinCursorEditor {
                 it.paramTypeNames == listOf("int", "int") && it.returnTypeName == "boolean"
             }
             val engineClass = nativeCall.getMethodInstance(loader).declaringClass
-            engineInstance = engineClass.declaredFields.single {
-                Modifier.isStatic(it.modifiers) && it.type == engineClass
-            }.apply { isAccessible = true }.get(null)
             val kernelCall = processing.invokes.single {
                 it.name == "getInput" && it.paramTypeNames.isEmpty() && it.returnTypeName == "java.lang.String"
             }
-            val kernelClass = kernelCall.getMethodInstance(loader).declaringClass
-            kernelInstance = kernelClass.declaredFields.single {
-                Modifier.isStatic(it.modifiers) && it.type == kernelClass
-            }.apply { isAccessible = true }.get(null)
-            engineLockGetter = kernelClass.declaredMethods.single {
-                it.parameterTypes.isEmpty() && java.util.concurrent.locks.ReentrantLock::class.java.isAssignableFrom(it.returnType)
-            }.apply { isAccessible = true }
-            selectedLengthGetter = kernelClass.declaredMethods.single {
-                it.name == "getCurrentSelectedLength" && it.parameterTypes.isEmpty()
-            }.apply { isAccessible = true }
-            log("pinyin-cursor: engine resolved by process-call graph engine=${engineClass.name} lock=$engineLockGetter")
-        }.onFailure { log("pinyin-cursor: composition editor resolve failed: ${it.message}") }
+            configureEngineAndKernel(engineClass, kernelCall.getMethodInstance(loader).declaringClass, loader)
+            log("pinyin-cursor: engine resolved by legacy process graph engine=${engineClass.name}")
+        }.onFailure { log("pinyin-cursor: legacy composition editor resolve skipped: ${it.message}") }
+
+        if (engineInstance == null) {
+            runCatching {
+                val engineClass = bridge.findClass {
+                    matcher { usingStrings(listOf("engine_jni"), org.luckypray.dexkit.query.enums.StringMatchType.Equals) }
+                }.mapNotNull { runCatching { it.getInstance(loader) }.getOrNull() }
+                    .firstOrNull { cls ->
+                        cls.declaredMethods.any { it.name == "getRawInput" && it.parameterTypes.isEmpty() } &&
+                            cls.declaredMethods.any { it.name == "setInput" && it.parameterTypes.contentEquals(arrayOf(String::class.java)) } &&
+                            cls.declaredMethods.any { it.name == "setCaretPos" && it.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType)) }
+                    } ?: error("semantic Engine class unresolved")
+                val inputMethod = bridge.findMethod {
+                    matcher { name("getInput"); paramCount(0); returnType("java.lang.String") }
+                }.mapNotNull { runCatching { it.getMethodInstance(loader) }.getOrNull() }
+                    .firstOrNull() ?: error("Kernel input accessor unresolved")
+                configureEngineAndKernel(engineClass, inputMethod.declaringClass, loader)
+                log("pinyin-cursor: engine resolved by stable JNI shape engine=${engineClass.name} kernel=${inputMethod.declaringClass.name} lock=$engineLockGetter")
+            }.onFailure { log("pinyin-cursor: stable composition editor resolve failed: ${it.message}") }
+        }
+    }
+
+    private fun configureEngineAndKernel(engineClass: Class<*>, kernelClass: Class<*>, loader: ClassLoader) {
+        engineInstance = engineClass.declaredFields.firstOrNull {
+            Modifier.isStatic(it.modifiers) && it.type == engineClass
+        }?.apply { isAccessible = true }?.get(null) ?: error("Engine singleton unresolved")
+        kernelInstance = kernelClass.declaredFields.firstOrNull {
+            Modifier.isStatic(it.modifiers) && it.type == kernelClass
+        }?.apply { isAccessible = true }?.get(null) ?: error("Kernel singleton unresolved")
+        engineLockGetter = kernelClass.declaredMethods.firstOrNull {
+            it.parameterTypes.isEmpty() && java.util.concurrent.locks.ReentrantLock::class.java.isAssignableFrom(it.returnType)
+        }?.apply { isAccessible = true }
+        selectedLengthGetter = kernelClass.declaredMethods.firstOrNull {
+            it.name == "getCurrentSelectedLength" && it.parameterTypes.isEmpty()
+        }?.apply { isAccessible = true }
+        engineRawInputGetter = engineClass.declaredMethods.firstOrNull {
+            it.name == "getRawInput" && it.parameterTypes.isEmpty() && it.returnType == String::class.java
+        }?.apply { isAccessible = true }
+        engineSetInputMethod = engineClass.declaredMethods.firstOrNull {
+            it.name == "setInput" && it.parameterTypes.contentEquals(arrayOf(String::class.java)) &&
+                it.returnType == Boolean::class.javaPrimitiveType
+        }?.apply { isAccessible = true }
+        engineSetCaretPosMethod = engineClass.declaredMethods.firstOrNull {
+            it.name == "setCaretPos" && it.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
+        }?.apply { isAccessible = true }
+        engineEditCursorChangeMethod = engineClass.declaredMethods.firstOrNull {
+            it.name == "editCursorChange" && it.parameterTypes.isEmpty()
+        }?.apply { isAccessible = true }
+        kernelSetInputMethod = kernelClass.declaredMethods.firstOrNull {
+            it.parameterTypes.contentEquals(arrayOf(String::class.java, Boolean::class.javaPrimitiveType)) &&
+                it.returnType == Boolean::class.javaPrimitiveType
+        }?.apply { isAccessible = true }
+        check(engineLockGetter != null && engineRawInputGetter != null && engineSetInputMethod != null) {
+            "stable engine edit methods unresolved"
+        }
     }
 
     private fun clearCaret() {
@@ -366,84 +420,84 @@ internal object PinyinCursorEditor {
      * 已选候选前缀，不能拿它冒充编辑光标。这里只接管字母与退格，保留原候选发布链。
      */
     private fun installKernelProcessorCursorHook(bridge: DexKitBridge, loader: ClassLoader) {
+        if (stableProcessorHookInstalled) return
         runCatching {
-            val processing = bridge.findMethod {
-                matcher {
-                    usingStrings(listOf("nothing process, get words only"), org.luckypray.dexkit.query.enums.StringMatchType.Equals)
-                    paramCount(0)
-                    returnType("void")
-                }
-            }.single()
-            val method = processing.getMethodInstance(loader).apply { isAccessible = true }
-            val cls = method.declaringClass
-            val bind = bridge.findMethod {
-                matcher {
-                    declaredClass(cls.name)
-                    usingStrings(listOf("traceId"), org.luckypray.dexkit.query.enums.StringMatchType.Equals)
-                    returnType("void")
-                }
-            }.map { it.getMethodInstance(loader) }.single {
-                !Modifier.isStatic(it.modifiers) && it.parameterTypes.size >= 15 &&
-                    it.parameterTypes.take(3).all { type -> type == java.lang.Integer::class.java }
-            }
-            val boundKeys = java.util.Collections.synchronizedMap(WeakHashMap<Any, Pair<Int?, Int?>>())
-            XposedBridge.hookMethod(bind, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    boundKeys[param.thisObject] = (param.args[0] as? Int) to (param.args[1] as? Int)
-                }
-            })
+            val kernel = kernelInstance ?: error("kernel instance unavailable")
+            val getRaw = engineRawInputGetter ?: error("raw input getter unavailable")
             val engine = engineInstance ?: error("native engine unavailable")
-            // 只在语义联合匹配出的引擎类中取已实读的原始输入协议；不固定声明类路径。
-            engineRawInputGetter = engine.javaClass.declaredMethods.single {
-                it.name == "getRawInput" && it.parameterTypes.isEmpty() && it.returnType == String::class.java
-            }.apply { isAccessible = true }
-            engineSetInputMethod = engine.javaClass.declaredMethods.single {
-                it.name == "setInput" && it.parameterTypes.contentEquals(arrayOf(String::class.java)) &&
-                    it.returnType == Boolean::class.javaPrimitiveType
-            }.apply { isAccessible = true }
+            val setInput = kernelSetInputMethod ?: error("locked kernel setInput unavailable")
+            // 两版协程参数的类名不同；只用稳定的 key/traceId 语义与参数形状筛选。
+            val filteredCandidates = bridge.findMethod {
+                matcher {
+                    usingStrings(listOf("traceId"), org.luckypray.dexkit.query.enums.StringMatchType.Equals)
+                    paramCount(11)
+                    returnType("void")
+                }
+            }.mapNotNull { runCatching { it.getMethodInstance(loader) }.getOrNull() }
+                .filter { method ->
+                    val p = method.parameterTypes
+                    !Modifier.isStatic(method.modifiers) && p.size == 11 &&
+                        p.take(3).all { it == java.lang.Integer::class.java } &&
+                        p[3] == String::class.java && p[4] == java.lang.Boolean::class.java &&
+                        p[5] == java.lang.Boolean::class.java && p[7] == String::class.java &&
+                        p[10] == Boolean::class.javaPrimitiveType &&
+                        method.declaringClass.declaredFields.any { it.type == java.util.concurrent.atomic.AtomicReference::class.java } &&
+                        method.declaringClass.declaredFields.any { it.type == java.util.concurrent.ConcurrentHashMap::class.java } &&
+                        kernel.javaClass.declaredMethods.any { it.parameterTypes.isEmpty() && it.returnType == method.declaringClass }
+                }
+            stableProcessorMatchSignatures.clear()
+            stableProcessorMatchSignatures.addAll(filteredCandidates.map { HookDiagnostics.methodSignature(it) })
+            val method = filteredCandidates.singleOrNull()?.apply { isAccessible = true }
+                ?: error("kernel input processor shape ambiguous: ${filteredCandidates.map { it.toString() }}")
             XposedBridge.hookMethod(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (caretRawIndex < 0) return
-                    val key = boundKeys[param.thisObject] ?: return
-                    val code = key.first ?: return
-                    if (key.second != null && key.second != 0) return
+                    val code = param.args?.getOrNull(0) as? Int ?: return
+                    val action = param.args?.getOrNull(1) as? Int
+                    if (action != null && action != 0) return
+                    if (code != 8 && code != 0xff08 && code !in 'a'.code..'z'.code &&
+                        code !in 'A'.code..'Z'.code && code != '\''.code) return
                     runCatching edit@{
-                        val before = engineRawInputGetter?.invoke(engine) as? String ?: return@edit
-                        val expected = editingRawInput
-                        if (before.isEmpty() || expected == null || before != expected) {
+                        val before = getRaw.invoke(engine) as? String ?: return@edit
+                        if (before.isEmpty() || before != editingRawInput) {
                             clearCaret()
-                            log("pinyin-cursor: raw session changed; release edit before=$before expected=$expected")
+                            log("pinyin-cursor: raw session changed; release edit before=$before")
                             return@edit
                         }
-                        val edit = CompositionEdit.apply(before, caretRawIndex, code) ?: run {
-                            clearCaret()
+                        val edit = CompositionEdit.apply(before, caretRawIndex, code) ?: return@edit
+                        if (edit.text == before) { // Backspace at the start: do not delete in the target app.
+                            param.result = null
                             return@edit
                         }
-                        if (edit.text != before) {
-                            val accepted = engineSetInputMethod?.invoke(engine, edit.text) == true
-                            val actual = engineRawInputGetter?.invoke(engine) as? String
-                            if (!accepted || actual != edit.text) {
-                                engineSetInputMethod?.invoke(engine, before)
-                                // 消费失败输入，避免已写一部分后又在尾部追加。保留错误证据。
-                                param.result = null
-                                clearCaret()
-                                log("pinyin-cursor: edit rejected before=$before expected=${edit.text} actual=$actual restored=${engineRawInputGetter?.invoke(engine)}")
-                                return@edit
-                            }
+                        val accepted = setInput.invoke(kernel, edit.text, true) == true
+                        val actual = getRaw.invoke(engine) as? String
+                        if (!accepted || actual != edit.text) {
+                            if (actual != before) runCatching { setInput.invoke(kernel, before, true) }
+                            val restored = getRaw.invoke(engine) as? String == before
+                            if (!restored) param.result = null
+                            clearCaret()
+                            log("pinyin-cursor: edit rejected before=$before after=$actual restored=$restored")
+                            return@edit
                         }
                         caretRawIndex = edit.caret
                         editingRawInput = edit.text
+                        caretIndex = displayIndex(edit.text, edit.caret)
                         param.result = null
                         log("pinyin-cursor: raw edit key=$code before=$before after=${edit.text} caret=${edit.caret} verified=true")
-                    }.onFailure {
-                        param.result = null
+                    }.onFailure { error ->
                         clearCaret()
-                        log("pinyin-cursor: raw edit failed ${it.message}")
+                        log("pinyin-cursor: raw edit failed ${error.message}; host processing retained")
                     }
                 }
             })
-            log("pinyin-cursor: raw edit hook installed method=$method bind=$bind")
-        }.onFailure { log("pinyin-cursor: raw edit resolve failed: ${it.message}") }
+            stableProcessorHookInstalled = true
+            HookDiagnostics.record(null, "候选拼音光标:真实编辑出口", true,
+                "${method.declaringClass.name}#${method.name}(${method.parameterTypes.joinToString { it.name }}); kernel=${setInput.declaringClass.name}#${setInput.name}")
+            log("pinyin-cursor: raw edit hook installed method=$method kernelSetInput=$setInput")
+        }.onFailure {
+            HookDiagnostics.record(null, "候选拼音光标:真实编辑出口", false, it.message.orEmpty())
+            log("pinyin-cursor: raw edit resolve failed: ${it.message}")
+        }
     }
 
     private fun applyCompositionCursor(index: Int, text: String): Boolean {

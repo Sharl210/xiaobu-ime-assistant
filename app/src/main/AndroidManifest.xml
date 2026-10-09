@@ -24,8 +24,12 @@
         <provider
             android:name="com.oplusime.panel.HookDiagnosticsProvider"
             android:authorities="com.oplusime.panel.hookdiagnostics"
-            android:exported="true"
-            android:grantUriPermissions="true" />
+            android:exported="false"
+            android:grantUriPermissions="false" />
+
+        <receiver
+            android:name="com.oplusime.panel.HookDiagnosticsReceiver"
+            android:exported="true" />
 
         <meta-data
             android:name="xposedmodule"

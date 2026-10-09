@@ -137,23 +137,42 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     .getMethod("currentApplication")
                     .invoke(null) as? android.content.Context
             }.getOrNull()
-        HookDiagnostics.record(null, "日志开关", true, "enabled=$logOn")
+            HookDiagnostics.beginInstallRound(null, "host=$TARGET_PACKAGE")
+            HookDiagnostics.recordNotApplicable(
+                "日志开关",
+                "这是运行状态项，当前值=$logOn；它不是 DexKit Hook 匹配点",
+            )
             val startedAt = System.currentTimeMillis()
-            val installDetail = "host=${TARGET_PACKAGE}; apk=$apkPath; classLoader=${hostClassLoader.javaClass.name}"
-            HookDiagnostics.record(null, "模块安装入口", true, installDetail)
+            val installDetail = "目标宿主=$TARGET_PACKAGE；apk=$apkPath；classLoader=${hostClassLoader.javaClass.name}"
+            HookDiagnostics.recordNotApplicable(
+                "模块安装入口",
+                "这是宿主进程安装状态项，不是 DexKit Hook 匹配点；$installDetail",
+            )
             runCatching { install(apkPath, hostClassLoader) }
-                .onFailure { log("install failed: ${it.stackTraceToString()}") }
-            log("install finished in ${System.currentTimeMillis() - startedAt} ms (logEnabled=$logOn)")
+                .onFailure { logCritical("install failed: ${it.stackTraceToString()}") }
+                .also { HookDiagnostics.finishInstallRound(null, "install completed or aborted") }
+            logCritical("install finished in ${System.currentTimeMillis() - startedAt} ms (logEnabled=$logOn)")
         }, "oplusime-panel-install").start()
     }
 
     // ---------------------------------------------------------------- install
 
     private fun install(apkPath: String, hostClassLoader: ClassLoader) {
+        // 旧版宿主从新版本回退时可能触发 Room 31->26 无 migration；先挂降级兜底，
+        // 再继续安装其它 Hook。该兜底只作用于真实 onDowngrade，不影响正常升级路径。
+        runCatching { RoomDowngradeGuard.install(hostClassLoader) }
+            .onFailure { logCritical("room-downgrade guard install failed: ${it.stackTraceToString()}") }
+
         // 与面板无关的独立功能：成对符号「自动补全」抑制。
         // 先于面板解析安装，因此即使面板定位失败，符号行为也照常生效。
-        runCatching { QuotePairSuppressor.install(hostClassLoader) }
-            .onFailure { log("quote-pair install failed: ${it.message}") }
+            runCatching { QuotePairSuppressor.install(hostClassLoader) }
+                .onSuccess {
+                    HookDiagnostics.record(null, "引号:输入连接", true, "QuotePairSuppressor install invoked")
+                }
+                .onFailure {
+                    HookDiagnostics.record(null, "引号:输入连接", false, it.message.orEmpty())
+                    log("quote-pair install failed: ${it.message}")
+                }
 
         val ids = PanelIds(
             selectAll = resolveIdentifier(apkPath, "id", NAME_SELECT_ALL),
@@ -190,11 +209,15 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 并处理中文逗号上滑＝切换「英文候选」开关。
             runCatching { SoftKeySwipeMap.install(bridge, hostClassLoader) }
                 .onFailure { log("swipe-map install failed: ${it.message}") }
+            SoftKeySwipeMap.publishDiagnostics()
 
             // 「回到打字主键盘」与「让键盘设置立刻生效」共用的宿主切键盘入口。
             // 必须早于 PanelBackRouter：返回键流程要用它。
             runCatching { HostKeyboardSwitch.install(bridge, hostClassLoader) }
-                .onSuccess { HookDiagnostics.record(null, "键盘类型切换", true, "HostKeyboardSwitch installed") }
+                .onSuccess {
+                    HookDiagnostics.recordMatch("键盘类型切换", HostKeyboardSwitch.diagnosticSignatures(),
+                        "键盘切换协议方法已由 DexKit 解析；不以运行时切换是否发生判定")
+                }
                 .onFailure { HookDiagnostics.record(null, "键盘类型切换", false, it.message.orEmpty()); log("keyboard-switch install failed: ${it.message}") }
 
             // 候选拼音区域字符级光标定位：按自绘候选 View 的结构特征匹配，
@@ -202,6 +225,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             runCatching { PinyinCursorEditor.install(bridge, hostClassLoader) }
                 .onSuccess { HookDiagnostics.record(null, "候选拼音光标", true, "PinyinCursorEditor installed") }
                 .onFailure { HookDiagnostics.record(null, "候选拼音光标", false, it.message.orEmpty()); log("pinyin-cursor install failed: ${it.message}") }
+            PinyinCursorEditor.publishDiagnostics()
 
             // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
             // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
@@ -213,17 +237,20 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             runCatching { QuotePairSuppressor.attachEngineCommit(bridge, hostClassLoader) }
                 .onFailure { log("quote-pair engine commit install failed: ${it.message}") }
                 .onFailure { log("quote-pair dispatcher failed: ${it.message}") }
+            QuotePairSuppressor.publishDiagnostics()
 
             // 「符号」键直达完整符号页：在旁边把符号分档抬到最高档，
             // 于是键盘上的「符号」键一按就是完整符号页，不再先落简洁页。
             runCatching { SymbolPageRedirect.install(bridge, hostClassLoader) }
                 .onSuccess { HookDiagnostics.record(null, "符号键盘切换入口", true, "SymbolPageRedirect installed") }
                 .onFailure { HookDiagnostics.record(null, "符号键盘切换入口", false, it.message.orEmpty()); log("symbol-page install failed: ${it.message}") }
+            SymbolPageRedirect.publishDiagnostics()
 
             // 「返回 = 回键盘主页面」：面板显示期间接管系统返回键。
             runCatching { PanelBackRouter.install(bridge, hostClassLoader, backId) }
                 .onSuccess { HookDiagnostics.record(null, "返回键路由", true, "PanelBackRouter installed") }
                 .onFailure { HookDiagnostics.record(null, "返回键路由", false, it.message.orEmpty()); log("panel-back install failed: ${it.message}") }
+            PanelBackRouter.publishDiagnostics()
 
             val onClick = resolvePanelOnClick(bridge, ids)
             if (onClick == null) {
@@ -231,7 +258,17 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 log("panel onclick unresolved, abort")
                 return@use
             }
-            HookDiagnostics.record(null, "文本编辑面板点击", true, "${onClick.declaredClass?.name ?: "unknown"}#${onClick.name}")
+            val resolvedOnClick = runCatching { onClick.getMethodInstance(hostClassLoader) }.getOrNull()
+            if (resolvedOnClick == null) {
+                HookDiagnostics.record(null, "文本编辑面板点击", false, "DexKit/结构匹配：方法实例解析失败")
+                log("panel onclick instance unresolved, abort")
+                return@use
+            }
+            HookDiagnostics.recordMatch(
+                "文本编辑面板点击",
+                listOf(HookDiagnostics.methodSignature(resolvedOnClick)),
+                "资源 id + InputConnection.performContextMenuAction 结构匹配",
+            )
             val panelClass = runCatching { onClick.declaredClass?.getInstance(hostClassLoader) }
                 .onFailure { log("panel class load failed: ${it.message}") }
                 .getOrNull()
@@ -240,8 +277,15 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 return@use
             }
             val layoutMethod = resolvePanelLayoutMethod(bridge, hostClassLoader)
-            HookDiagnostics.record(null, "文本编辑面板排版", layoutMethod != null,
-                layoutMethod?.let { "${it.declaringClass.name}#${it.name}" } ?: "layout method unresolved")
+            if (layoutMethod != null) {
+                HookDiagnostics.recordMatch(
+                    "文本编辑面板排版",
+                    listOf(HookDiagnostics.methodSignature(layoutMethod)),
+                    "selectAllButton + clipButton + leftContainerView 结构匹配",
+                )
+            } else {
+                HookDiagnostics.record(null, "文本编辑面板排版", false, "DexKit/结构匹配：排版方法未找到")
+            }
             val keyFeedback = resolveKeyFeedback(onClick, hostClassLoader)
             val closePath = resolveClosePath(onClick, hostClassLoader)
             PanelState.closePanel = closePath
@@ -323,7 +367,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     .onSuccess { HookDiagnostics.record(null, "搜索过滤适配器", true, "paging data filter installed") }
                     .onFailure { HookDiagnostics.record(null, "搜索过滤适配器", false, it.message.orEmpty()); log("clip-search paging-data install failed: ${it.message}") }
                 runCatching { clipSearch.installPagingFilter(bridge, hostClassLoader) }
-                    .onSuccess { HookDiagnostics.record(null, "剪贴板写回", true, "paging filter fallback installed") }
+                    .onSuccess { HookDiagnostics.record(null, "搜索过滤适配器", true, "paging filter fallback installed") }
                     .onFailure { log("clip-search paging install failed: ${it.message}") }
                 // 列表行的「超大正文」渲染护栏：只影响看得见的那点文字，不影响复制到的内容。
                 runCatching { ListRenderGuard.install(bridge, hostClassLoader) }
@@ -340,11 +384,19 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                         registerInputTarget = resolveInputTargetRegistrar(bridge, hostClassLoader),
                         clearInputTarget = resolveInputTargetClearer(bridge, hostClassLoader),
                         restoreFocus = resolveFocusRestorer(bridge, hostClassLoader),
+                        rememberRestoreAnchor = { item -> clipSearch.rememberEditingItem(item) },
+                        returnToClipboard = { clipSearch.returnToClipboard() },
                     ) }
                     .onSuccess { HookDiagnostics.record(null, "剪贴板编辑绑定", true, "ClipboardEdit installed") }
                     .onFailure { HookDiagnostics.record(null, "剪贴板编辑绑定", false, it.message.orEmpty()); log("clip-edit install failed: ${it.message}") }
+                ClipboardEdit.publishDiagnostics()
                 val clipPanelClass = resolveClipPanelClass(bridge, hostClassLoader, clipCounterId)
                 if (clipPanelClass != null) {
+                    val panelSignatures = clipPanelClass.constructors.map { ctor ->
+                        "${clipPanelClass.name}::<init>(${ctor.parameterTypes.joinToString(",") { it.name }})"
+                    }
+                    HookDiagnostics.recordMatch("剪贴板面板", panelSignatures,
+                        "容器类按计数资源 id 匹配；分页/分段方法在同一类内解析")
                     XposedBridge.hookAllConstructors(clipPanelClass, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             (param.thisObject as? ViewGroup)?.let {
@@ -426,6 +478,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     }
                     log("clip-search: panel constructor/page-switch hooks installed ${clipPanelClass.name}")
                 } else {
+                    HookDiagnostics.record(null, "剪贴板面板", false, "clipboard panel class unresolved")
                     log("clip-search: clipboard panel class unresolved")
                 }
             } else {
