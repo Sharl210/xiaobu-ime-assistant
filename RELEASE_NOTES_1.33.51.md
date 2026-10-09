@@ -11,7 +11,7 @@
 - 系统返回手势：针对最新日志仍出现 `window hidden; no re-show fallback`，新增最近面板时间记录，并在 `onWindowHidden` 后补执行宿主 closePanel 与 `InputMethodService.showWindow(false)` 恢复输入法窗口。
 - Hook 诊断：安装轮初始化不再把 false 占位落盘覆盖真实结果；跨进程合并跳过初始化占位，无结果统一显示“等待回传”；新增稳定的符号键盘切换诊断点。
 
-## 验证
+- SSH/终端回车兼容：部分终端应用不把输入法提交的单独换行字符当作 Enter 处理；新增兼容链，在 `InputConnection.commitText` 收到单独 `\\n`、`\\r` 或 `\\r\\n` 时优先发送 `KEYCODE_ENTER` 按下/抬起事件，失败时保留原始换行提交。普通文本和多字符内容不改动。
 
 - `:app:compileDebugKotlin`：PASS
 - `:app:assembleDebug`：PASS
