@@ -116,7 +116,7 @@ Android/Java 平台公开 API 的生命周期、输入窗口和视图事件 Hook
 仓库发布脚本为：
 
 ```bash
-GITHUB_TOKEN=你的Token ./tools/publish-github.sh Sharl210/xiaobu-ime-assistant 1.33.50
+GITHUB_TOKEN=你的Token ./tools/publish-github.sh Sharl210/xiaobu-ime-assistant 1.33.51
 ```
 
 脚本只负责基于已存在的仓库创建 Release 并上传正式 APK，不创建仓库、不提交未审核改动、不强制推送分支或标签。当前环境没有 GitHub Token，因此本轮只完成本地 Release 产物和发布脚本准备，没有执行远程上传。

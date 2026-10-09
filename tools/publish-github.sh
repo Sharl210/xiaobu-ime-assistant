@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SLUG="${1:-}"
-VERSION="${2:-1.33.50}"
+VERSION="${2:-1.33.51}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APK="$ROOT/app/build/outputs/apk/release/app-release.apk"
 NOTES="$ROOT/RELEASE_NOTES_${VERSION}.md"
