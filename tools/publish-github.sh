@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 # Build and publish a signed GitHub Release for this existing repository.
-# Usage: GITHUB_TOKEN=... tools/publish-github.sh OWNER/REPO [VERSION]
+# Usage: GITHUB_TOKEN=... tools/publish-github.sh OWNER/REPO VERSION HOST_INPUT_METHOD_APK
 # This script does not create repositories, commit files, or force-push branches/tags.
 set -euo pipefail
 
 SLUG="${1:-}"
-VERSION="${2:-1.33.51}"
+VERSION="${2:-1.33.60}"
+HOST_APK="${3:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APK="$ROOT/app/build/outputs/apk/release/app-release.apk"
 NOTES="$ROOT/RELEASE_NOTES_${VERSION}.md"
 TOKEN="${GITHUB_TOKEN:-}"
 
-if [[ -z "$SLUG" || "$SLUG" != */* ]]; then
-  echo "Usage: GITHUB_TOKEN=... $0 OWNER/REPO [VERSION]" >&2
+if [[ -z "$SLUG" || "$SLUG" != */* || -z "$HOST_APK" ]]; then
+  echo "Usage: GITHUB_TOKEN=... $0 OWNER/REPO VERSION HOST_INPUT_METHOD_APK" >&2
   exit 2
 fi
 if [[ -z "$TOKEN" ]]; then
   echo "GITHUB_TOKEN is required (repo permission). No repository changes were made." >&2
+  exit 2
+fi
+if [[ -z "$HOST_APK" || ! -f "$HOST_APK" ]]; then
+  echo "对应宿主输入法 APK 是 Release 必需资产：请传入 HOST_INPUT_METHOD_APK 的现有文件路径。" >&2
   exit 2
 fi
 if [[ ! -f "$NOTES" ]]; then
@@ -61,4 +66,16 @@ curl -fsS -X POST "${UPLOAD_URL}?name=OplusImePanel-${VERSION}-release.apk" \
   -H "Content-Type: application/vnd.android.package-archive" \
   --data-binary "@$APK" >/dev/null
 
-echo "Release uploaded: https://github.com/$SLUG/releases/tag/$TAG"
+HOST_NAME="$(basename -- "$HOST_APK")"
+HOST_NAME_ENCODED="$(python3 - "$HOST_NAME" <<'PY'
+from urllib.parse import quote
+import sys
+print(quote(sys.argv[1], safe=""))
+PY
+)"
+curl -fsS -X POST "${UPLOAD_URL}?name=${HOST_NAME_ENCODED}" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.android.package-archive" \
+  --data-binary "@$HOST_APK" >/dev/null
+
+echo "Release uploaded with module APK and host input-method APK: https://github.com/$SLUG/releases/tag/$TAG"

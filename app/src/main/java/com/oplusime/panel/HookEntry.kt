@@ -68,14 +68,6 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         /** 剪贴板计数的格式化串（`%1$d/%2$d`），用于把上限显示改成 ∞。 */
         private const val NAME_CLIP_LENGTH = "clip_length"
 
-        /**
-         * 主键盘回车键上的文字（宿主为 `换行`）。
-         *
-         * 用户要求把它换成回车**箭头符号**。这里按资源名定位（不是数字 id），
-         * 由 [HostTweaks] 只改这一个字符串的结果，其它文案一律原样放行。
-         */
-        private const val NAME_ENTER_TITLE = "enter_btn_title_enter"
-
         /** 剪贴板面板底部的计数控件与列表（搜索按钮挂在计数行最右侧）。 */
         private const val NAME_CLIP_COUNTER = "tv_clip_count"
 
@@ -163,6 +155,7 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         runCatching { RoomDowngradeGuard.install(hostClassLoader) }
             .onFailure { logCritical("room-downgrade guard install failed: ${it.stackTraceToString()}") }
 
+        // 回车兼容必须先于 DexKit 和面板解析安装；无关点位失败不能阻断它。
         runCatching { ReturnKeyCompatibility.install(hostClassLoader) }
             .onFailure { log("return-key compatibility install failed: ${it.message}") }
 
@@ -199,7 +192,6 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         log("resolved panel back id=$backId")
         val labelId = resolveIdentifier(apkPath, "string", NAME_CLIPBOARD_LABEL)
         val clipLengthId = resolveIdentifier(apkPath, "string", NAME_CLIP_LENGTH)
-        val enterTitleId = resolveIdentifier(apkPath, "string", NAME_ENTER_TITLE)
         val clipCounterId = resolveIdentifier(apkPath, "id", NAME_CLIP_COUNTER)
         val clipListId = resolveIdentifier(apkPath, "id", NAME_CLIP_LIST)
         val phraseCounterId = resolveIdentifier(apkPath, "id", NAME_PHRASE_COUNTER)
@@ -229,6 +221,13 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 .onSuccess { HookDiagnostics.record(null, "候选拼音光标", true, "PinyinCursorEditor installed") }
                 .onFailure { HookDiagnostics.record(null, "候选拼音光标", false, it.message.orEmpty()); log("pinyin-cursor install failed: ${it.message}") }
             PinyinCursorEditor.publishDiagnostics()
+
+            runCatching { ReturnKeyCompatibility.attachHostConnectionProviders(bridge, hostClassLoader) }
+                .onFailure { logCritical("return-key host connection provider attach failed: ${it.stackTraceToString()}") }
+            runCatching { ReturnKeyCompatibility.attachHostDispatchers(bridge, hostClassLoader) }
+                .onFailure { logCritical("return-key host dispatcher attach failed: ${it.stackTraceToString()}") }
+            runCatching { ReturnKeyCompatibility.attachKeyboardRelease(bridge, hostClassLoader) }
+                .onFailure { logCritical("return-key keyboard release attach failed: ${it.stackTraceToString()}") }
 
             // 引号抑制的宿主实现类：宿主的 InputConnection 由它自己实现、不经过框架代理，
             // 必须等 APK 解析出「谁产出 InputConnection」之后才能挂上。
@@ -305,12 +304,9 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             // 容量与计数相关修正（计数显示改 ∞、剪切/粘贴条件返回键盘）。
             val tweaks = HostTweaks(
                 clipLengthId = clipLengthId,
-                enterTitleId = enterTitleId,
                 closePanel = closePath,
             )
-            tweaks.bindHost(bridge, hostClassLoader)
             tweaks.install()
-            HookDiagnostics.record(null, "输入提交拦截", true, "HostTweaks installed")
 
             // 解除宿主的两处容量上限（记录表到顶裁剪、正文长度上限），全部结构匹配。
             runCatching { HostLimits.install(bridge, hostClassLoader) }

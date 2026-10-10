@@ -641,7 +641,7 @@ internal object SoftKeySwipeMap {
             if (lang == "en" && (ch == ',' || ch == '\uFF0C')) {
                 mapped = EN_SUGGEST_MARK_OFF
                 logThrottled("candidate-marker", 3000L) {
-                    "swipe-map: english candidate marker retained for action key; symbol is drawn black"
+                    "swipe-map: english candidate action marker retained; host icon remains unchanged"
                 }
             } else if (lang != "en" && (mapped == "\uFF01" || mapped == "!")) {
                 log(
@@ -915,7 +915,11 @@ internal object SoftKeySwipeMap {
         }.forEach { method ->
             XposedBridge.hookMethod(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (param.args.firstOrNull() != "\u21B5") return
+                    val label = param.args.firstOrNull() as? String ?: return
+                    // 保留宿主资源字符串“换行”，只在 Canvas 绘制层投影为回车符号。
+                    // 不能在 Resources.getString/getText 层全局改写，否则宿主可能用
+                    // 原始文案或资源结果判断主键盘动作，导致显示正常但点击链失效。
+                    if (label != "换行" && label != "\u21B5") return
                     val key = drawingKey.get() ?: return
                     val box = boundsOf(key) ?: return
                     val hostPaint = param.args.lastOrNull() as? Paint ?: return

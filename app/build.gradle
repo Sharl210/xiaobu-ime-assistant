@@ -11,10 +11,9 @@ android {
         applicationId 'com.oplusime.panel'
         minSdk 23
         targetSdk 34
-        // 1.33.51：修复英文候选图标进入页面残留旧状态、剪贴板编辑按钮在新版分页适配器中消失，
-        // 并扩展 Hook 诊断为逐点明细与一键复制；引号手动成对输入不再误删。
-        versionCode 90
-        versionName '1.33.51'
+        // 1.33.60：主键盘 body.*.z/y 的抬起方法把 SoftKey 作为内部指针表项保存，调用参数末位可能为 null；在 before hook 中从宿主指针表恢复 SoftKey.a=66。
+        versionCode 99
+        versionName '1.33.60'
     }
 
     // 本模块自带的签名库（自建，与宿主无关）。如要换成自己的，替换下面四项即可。

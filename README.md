@@ -40,7 +40,7 @@
 - 中文逗号上滑输入中文感叹号。
 - 英文键盘书册图标切换宿主“英文候选”设置；图标状态按设置值显示。
 - 中文、英文、数字键盘的“符号”入口目标为宿主完整符号页。
-- 回车兼容：对部分 SSH/终端应用，单独的换行提交会优先转换为 `KEYCODE_ENTER` 按键事件；如果目标应用拒绝该事件，则回退为原始换行提交。普通文本输入不受影响。
+- 回车兼容：按宿主真实 `input.event` 回车分发链匹配 `q0/t0`、`r0/u0` 及直接调用 `InputConnection.sendKeyEvent()` 的结构入口；模块只观察并保留宿主原生按下/抬起链，单独换行文本仍保留兜底。当前发布版本已由用户在目标 SSH/终端场景中确认主键盘回车可用。
 - 抑制宿主对引号、括号等输入字符自动补出闭合字符的行为。
 
 ### 候选拼音光标
@@ -116,10 +116,10 @@ Android/Java 平台公开 API 的生命周期、输入窗口和视图事件 Hook
 仓库发布脚本为：
 
 ```bash
-GITHUB_TOKEN=你的Token ./tools/publish-github.sh Sharl210/xiaobu-ime-assistant 1.33.51
+GITHUB_TOKEN=你的Token ./tools/publish-github.sh Sharl210/xiaobu-ime-assistant 1.33.60 /path/to/XiaobuInputMethod-1.8.33.17-mkt-host.apk
 ```
 
-脚本只负责基于已存在的仓库创建 Release 并上传正式 APK，不创建仓库、不提交未审核改动、不强制推送分支或标签。当前环境没有 GitHub Token，因此本轮只完成本地 Release 产物和发布脚本准备，没有执行远程上传。
+发布脚本现在要求传入对应宿主输入法 APK 路径，并会在同一 Release 中上传模块 APK 与宿主 APK；宿主 APK 会保留其真实文件名，便于识别它对应的宿主版本。没有真实宿主 APK 时流程会停止，不会用占位文件代替。当前版本仍属于开发阶段适配版本，不能据此承诺兼容所有宿主版本。
 
 ## 许可
 
