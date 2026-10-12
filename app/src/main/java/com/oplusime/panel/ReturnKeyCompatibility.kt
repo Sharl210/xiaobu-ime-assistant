@@ -30,6 +30,7 @@ internal object ReturnKeyCompatibility {
     private val hookedConnectionProviders = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val hookedServiceClasses = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val hookedKeyboardReleaseMethods = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+    private val hookedKeyboardTouchMethods = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     @Volatile
     private var providerInstalled = false
@@ -55,6 +56,25 @@ internal object ReturnKeyCompatibility {
     @Volatile
     private var convertedCount = 0
 
+    /**
+     * 当前编辑器是否仍处于候选/组合文本阶段。
+     *
+     * 主键盘回车的宿主原生链负责“选择候选”；模块自己的兜底只允许在没有候选时
+     * 补发真正的 Enter。否则第一次点击会变成“候选上屏 + 额外回车”两步。
+     */
+    @Volatile
+    private var composingActive = false
+
+    /** 最近一次组合文本变化的时间，用于覆盖候选提交和回车抬起之间的短暂时序差。 */
+    @Volatile
+    private var lastComposingTextAt = 0L
+
+    /** 最近一次非换行文本实际提交的时间；用于识别“回车抬起后才到达的候选上屏”。 */
+    @Volatile
+    private var lastCommittedTextAt = 0L
+
+    private const val COMPOSITION_RELEASE_GRACE_MS = 180L
+
     fun install(hostClassLoader: ClassLoader) {
         if (providerInstalled) return
         synchronized(this) {
@@ -74,7 +94,7 @@ internal object ReturnKeyCompatibility {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             captureService(param.thisObject)
                             val connection = param.result as? InputConnection ?: return
-                            currentConnection = connection
+                            updateCurrentConnection(connection)
                             hookConnection(connection)
                             logCritical(
                                 "return-key: framework connection observed class=${connection.javaClass.name}",
@@ -103,6 +123,9 @@ internal object ReturnKeyCompatibility {
                     object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             captureService(param.thisObject)
+                            if (name == "onStartInput" || name == "onStartInputView") {
+                                resetCompositionState()
+                            }
                         }
                     },
                 )
@@ -150,7 +173,7 @@ internal object ReturnKeyCompatibility {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val connection = param.result as? InputConnection ?: return
-                        currentConnection = connection
+                        updateCurrentConnection(connection)
                         hookConnection(connection)
                         logCritical(
                             "return-key: host provider hit ${method.declaringClass.name}#${method.name}" +
@@ -175,16 +198,77 @@ internal object ReturnKeyCompatibility {
         }
     }
 
+    fun attachKeyboardTouchLogging(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
+        val candidates = runCatching {
+            val fourArg = bridge.findMethod {
+                matcher {
+                    paramCount(4)
+                    returnType("void")
+                }
+            }.toList()
+            val fiveArg = bridge.findMethod {
+                matcher {
+                    paramCount(5)
+                    returnType("void")
+                }
+            }.toList()
+            (fourArg + fiveArg).distinctBy {
+                "${it.declaredClassName}#${it.name}#${it.paramTypeNames.joinToString(",")}#${it.returnTypeName}"
+            }
+        }.onFailure {
+            logCritical("return-key: keyboard touch logging query failed: ${it.stackTraceToString()}")
+        }.getOrDefault(emptyList())
+
+        val methods = candidates.mapNotNull { data ->
+            runCatching { data.getMethodInstance(hostClassLoader) }.getOrNull()
+        }.filter { method ->
+            val params = method.parameterTypes
+            val shape = when (params.size) {
+                4 -> params[0] == Int::class.javaPrimitiveType &&
+                    params[1] == Float::class.javaPrimitiveType &&
+                    params[2] == Float::class.javaPrimitiveType
+                5 -> params[0] == Int::class.javaPrimitiveType &&
+                    params[1] == Float::class.javaPrimitiveType &&
+                    params[2] == Float::class.javaPrimitiveType &&
+                    params[3] == Long::class.javaPrimitiveType
+                else -> false
+            }
+            shape && method.declaringClass.name.startsWith("com.oplus.keyboard.input.view.body.")
+        }.distinctBy { it.toGenericString() }
+
+        var hooks = 0
+        methods.forEach { method ->
+            if (!hookedKeyboardTouchMethods.add(method.toGenericString())) return@forEach
+            runCatching {
+                method.isAccessible = true
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val key = resolveReleaseSoftKey(param)
+                        val keyCode = key?.let { softKeyCode(it) }
+                        logCritical(
+                            "return-key: keyboard touch edge method=${method.declaringClass.name}#${method.name}" +
+                                " phase=before args=${param.args.orEmpty().contentToString()}" +
+                                " keyCode=$keyCode candidatePending=${candidatePendingAtEnter()}" +
+                                " composing=$composingActive",
+                        )
+                    }
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        logCritical(
+                            "return-key: keyboard touch edge method=${method.declaringClass.name}#${method.name}" +
+                                " phase=after result=${param.result}",
+                        )
+                    }
+                })
+                hooks++
+            }.onFailure {
+                logCritical("return-key: keyboard touch logging hook failed ${method.toGenericString()}: ${it.stackTraceToString()}")
+            }
+        }
+        logCritical("return-key: keyboard touch logging hooks=$hooks candidates=${methods.size}")
+    }
+
     /**
-     * 主键盘回车的独立触摸收尾链。
-     *
-     * 文本编辑面板会直接调用 input.event 的 `(int,int)` 分发器；主键盘则先在
-     * `body.*` 的触摸状态里保存 SoftKey，抬起时进入收尾方法。两版宿主的形状不同：
-     * 旧版是 `body.s.y(int,float,float,SoftKey)->void`，新版是
-     * `body.t.z(int,float,float,long,SoftKey)->void`。当前键位实体中的整数键码为
-     * ENTER(66) 时，宿主某些版本只更新内部状态却没有把 Enter 送到 SSH 目标。
-     * 这里仅观察收尾点、保留宿主原始执行；如果原生链在短窗口内没有观察到 66，再通过
-     * 宿主服务发送一次 `sendDownUpKeyEvents(KEYCODE_ENTER)`，避免修改删除、方向键和普通字符路径。
+     * 主键盘按键抬起链：只记录真实点击，不修改参数、不改变返回值。
      */
     fun attachKeyboardRelease(bridge: DexKitBridge, hostClassLoader: ClassLoader) {
         val candidates = runCatching {
@@ -250,15 +334,30 @@ internal object ReturnKeyCompatibility {
                         val keyCode = softKeyCode(key) ?: return
                         if (keyCode != KeyEvent.KEYCODE_ENTER) return
                         val observedBefore = lastNativeEnterAt
+                        val releaseObservedAt = SystemClock.uptimeMillis()
+                        val observedCommitAt = lastCommittedTextAt
+                        val candidatePending = candidatePendingAtEnter()
                         logCritical(
                             "return-key: keyboard release ENTER keyCode=$keyCode key=${key.javaClass.name}" +
-                                " method=${method.declaringClass.name}#${method.name}",
+                                " method=${method.declaringClass.name}#${method.name}" +
+                                " candidatePending=$candidatePending composing=$composingActive" +
+                                " commitAt=$observedCommitAt",
                         )
                         Handler(Looper.getMainLooper()).postDelayed({
                             if (lastNativeEnterAt > observedBefore) {
                                 logCritical(
                                     "return-key: keyboard release native ENTER observed" +
                                         " method=${method.declaringClass.name}#${method.name}",
+                                )
+                                return@postDelayed
+                            }
+                            if (candidatePending ||
+                                (lastCommittedTextAt > observedCommitAt && lastCommittedTextAt >= releaseObservedAt)
+                            ) {
+                                logCritical(
+                                    "return-key: candidate commit only; suppress automatic ENTER fallback" +
+                                        " method=${method.declaringClass.name}#${method.name}" +
+                                        " commitAt=$lastCommittedTextAt",
                                 )
                                 return@postDelayed
                             }
@@ -535,6 +634,63 @@ internal object ReturnKeyCompatibility {
         return false
     }
 
+    private fun updateCurrentConnection(connection: InputConnection) {
+        currentConnection = connection
+    }
+
+    private fun resetCompositionState() {
+        composingActive = false
+        lastComposingTextAt = 0L
+    }
+
+    /**
+     * 只在回车抬起的这一刻判断是否仍有候选/组合文本，不把候选状态永久带到下一次点击。
+     * 这样第一次回车可以只完成候选上屏，而用户稍后再次点击回车仍能正常换行。
+     */
+    private fun candidatePendingAtEnter(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        return composingActive ||
+            (lastComposingTextAt > 0L && now - lastComposingTextAt <= COMPOSITION_RELEASE_GRACE_MS)
+    }
+
+    private fun noteComposingText(text: CharSequence?) {
+        val now = SystemClock.uptimeMillis()
+        val active = !text.isNullOrEmpty()
+        if (active || composingActive) lastComposingTextAt = now
+        composingActive = active
+        logCritical(
+            "return-key: composing state active=$composingActive" +
+                " length=${text?.length ?: 0}",
+        )
+    }
+
+    private fun noteCompositionFinished() {
+        val wasActive = composingActive
+        if (wasActive) lastComposingTextAt = SystemClock.uptimeMillis()
+        composingActive = false
+        if (wasActive) {
+            logCritical("return-key: composing finished; candidate-only window armed")
+        }
+    }
+
+    private fun noteCommittedText(text: CharSequence?) {
+        if (text.isNullOrEmpty() || isStandaloneNewline(text)) return
+        lastCommittedTextAt = SystemClock.uptimeMillis()
+        if (!composingActive) {
+            logCritical(
+                "return-key: non-composing text committed; candidate fallback guard armed" +
+                    " length=${text.length}",
+            )
+            return
+        }
+        lastComposingTextAt = SystemClock.uptimeMillis()
+        composingActive = false
+        logCritical(
+            "return-key: composing committed; candidate-only window armed" +
+                " length=${text.length}",
+        )
+    }
+
     private fun hookConnection(connection: InputConnection) {
         var cls: Class<*>? = connection.javaClass
         val chain = mutableListOf<Class<*>>()
@@ -550,6 +706,10 @@ internal object ReturnKeyCompatibility {
                         "commitText" -> method.parameterTypes.contentEquals(
                             arrayOf(CharSequence::class.java, Int::class.javaPrimitiveType),
                         )
+                        "setComposingText" -> method.parameterTypes.contentEquals(
+                            arrayOf(CharSequence::class.java, Int::class.javaPrimitiveType),
+                        )
+                        "finishComposingText" -> method.parameterTypes.isEmpty()
                         "performEditorAction" -> method.parameterTypes.contentEquals(
                             arrayOf(Int::class.javaPrimitiveType),
                         )
@@ -579,7 +739,7 @@ internal object ReturnKeyCompatibility {
             android.view.inputmethod.BaseInputConnection::class.java,
             android.view.inputmethod.InputConnectionWrapper::class.java,
         ).forEach { cls ->
-            listOf("commitText", "performEditorAction", "sendKeyEvent").forEach { name ->
+            listOf("commitText", "setComposingText", "finishComposingText", "performEditorAction", "sendKeyEvent").forEach { name ->
                 runCatching {
                     XposedBridge.hookAllMethods(cls, name, inputConnectionHook("framework:$name"))
                 }.onFailure {
@@ -603,10 +763,44 @@ internal object ReturnKeyCompatibility {
                 }
                 return
             }
-            if (!source.endsWith("commitText")) return
-            val text = param.args?.getOrNull(0) as? CharSequence ?: return
-            if (!isStandaloneNewline(text)) return
-            if (sendEnter(connection, source)) param.result = true
+
+            if (source.endsWith("commitText")) {
+                val text = param.args?.getOrNull(0) as? CharSequence
+                logCritical(
+                    "return-key: commitText source=$source text=${text?.toString()?.replace("\\n", "\\\\n")}" +
+                        " length=${text?.length ?: -1} candidatePending=${candidatePendingAtEnter()}" +
+                        " composing=$composingActive",
+                )
+            }
+
+            when {
+                source.endsWith("setComposingText") -> {
+                    noteComposingText(param.args?.getOrNull(0) as? CharSequence)
+                }
+                source.endsWith("finishComposingText") -> {
+                    noteCompositionFinished()
+                }
+                source.endsWith("commitText") -> {
+                    val text = param.args?.getOrNull(0) as? CharSequence ?: return
+                    if (isStandaloneNewline(text)) {
+                        // 候选提交链有时会先把候选上屏，再向同一个 InputConnection
+                        // 送一个单独的换行文本。这个换行不是用户第二次点击产生的，
+                        // 不能再转换成 Enter，否则就会出现“候选上屏后自动多换一行”。
+                        if (candidatePendingAtEnter()) {
+                            logCritical(
+                                "return-key: suppress standalone newline after candidate commit" +
+                                    " source=$source",
+                            )
+                            resetCompositionState()
+                            param.result = true
+                            return
+                        }
+                        if (sendEnter(connection, source)) param.result = true
+                    } else {
+                        noteCommittedText(text)
+                    }
+                }
+            }
         }
     }
 

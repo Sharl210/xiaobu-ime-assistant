@@ -226,6 +226,8 @@ class HookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 .onFailure { logCritical("return-key host connection provider attach failed: ${it.stackTraceToString()}") }
             runCatching { ReturnKeyCompatibility.attachHostDispatchers(bridge, hostClassLoader) }
                 .onFailure { logCritical("return-key host dispatcher attach failed: ${it.stackTraceToString()}") }
+            runCatching { ReturnKeyCompatibility.attachKeyboardTouchLogging(bridge, hostClassLoader) }
+                .onFailure { logCritical("return-key keyboard touch logging attach failed: ${it.stackTraceToString()}") }
             runCatching { ReturnKeyCompatibility.attachKeyboardRelease(bridge, hostClassLoader) }
                 .onFailure { logCritical("return-key keyboard release attach failed: ${it.stackTraceToString()}") }
 
