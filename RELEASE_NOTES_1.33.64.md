@@ -22,7 +22,7 @@
 - `:app:assembleRelease`：PASS
 - `git diff --check`：PASS
 - Debug APK：`dist/OplusImePanel-1.33.64-debug.apk`，2,970,444 bytes，SHA-256 `c949cc4b38e0c00bff605d4e478e5821b028ca4c4ef5af9f9bb5bc0ac831fdee`
-- Release APK：`dist/OplusImePanel-1.33.64-release.apk`，2,577,535 bytes，SHA-256 `f7667bab7fe1c9b33954a3cca6e05fa7b869b20cfba64644c961d96b7229891d`
+- Release APK：`dist/OplusImePanel-1.33.64-release.apk`，2,577,535 bytes，SHA-256 `ea57ab914bc314102b1198a17c1269a2b40a3442f2f2b1e6742bd347c22e1bce`
 - Release 版本配置：`versionName=1.33.64`、`versionCode=103`
 - 中文候选真机验证：用户已确认本轮安装包可正常使用，第一次回车只上屏候选，不自动追加换行
 - 英文候选真机验证：用户已确认本轮安装包可正常使用，第一次回车只上屏候选，不自动追加换行
